@@ -20,14 +20,15 @@ jobs:
           msystem: MINGW64
           update: true
           install: >-
-            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-g++
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-ffmpeg
             mingw-w64-x86_64-lua
             mingw-w64-x86_64-python
-            mingw-w64-x86_64-sdl2
+            mingw-w64-x86_64-SDL2
 
       - name: Clean Cache & Configure CMake
         shell: msys2 {0}
