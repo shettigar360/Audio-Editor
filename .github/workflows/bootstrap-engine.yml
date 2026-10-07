@@ -1,0 +1,187 @@
+name: Bootstrap and Build Engine
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+
+permissions:
+  contents: write    # Grants permission to commit the created files back to the repo
+
+jobs:
+  scaffold-and-build:
+    name: Generate Code & Compile Core
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Tools, FFmpeg, Lua, and Python Dev Headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            build-essential \
+            pkg-config \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswresample-dev \
+            liblua5.4-dev \
+            python3-dev
+
+      - name: Scaffold Project Directory Structure
+        run: |
+          mkdir -p src
+          mkdir -p include
+          mkdir -p scripts/lua
+          mkdir -p scripts/python
+          mkdir -p assets
+
+      - name: Generate CMakeLists.txt
+        run: |
+          cat << 'EOF' > CMakeLists.txt
+          cmake_minimum_required(VERSION 3.20)
+          project(AudioDawEngine C CXX)
+
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_CXX_STANDARD 17)
+
+          find_package(PkgConfig REQUIRED)
+          pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswresample)
+          pkg_check_modules(LUA REQUIRED IMPORTED_TARGET lua5.4)
+
+          find_package(Python3 COMPONENTS Development REQUIRED)
+
+          add_executable(audio_engine src/main.c)
+
+          target_include_directories(audio_engine PRIVATE
+              include
+              ${Python3_INCLUDE_DIRS}
+          )
+
+          target_link_libraries(audio_engine PRIVATE
+              PkgConfig::FFMPEG
+              PkgConfig::LUA
+              Python3::Python
+          )
+          EOF
+
+      - name: Generate C Core (src/main.c)
+        run: |
+          cat << 'EOF' > src/main.c
+          #include <stdio.h>
+          #include <stdlib.h>
+
+          // FFmpeg Headers
+          #include <libavformat/avformat.h>
+          #include <libavcodec/avcodec.h>
+          #include <libavutil/avutil.h>
+
+          // Lua Headers
+          #include <lua.h>
+          #include <lauxlib.h>
+          #include <lualib.h>
+
+          // Python Embedded Header
+          #define PY_SSIZE_T_CLEAN
+          #include <Python.h>
+
+          int main(int argc, char *argv[]) {
+              printf("========================================\n");
+              printf("  Custom Audio DAW Core Initializing... \n");
+              printf("========================================\n");
+
+              // 1. FFmpeg Init & Version Check
+              printf("[Core] FFmpeg avformat version: %u\n", avformat_version());
+              printf("[Core] FFmpeg avcodec version:  %u\n", avcodec_version());
+
+              // 2. Lua VM Initialization
+              lua_State *L = luaL_newstate();
+              if (L) {
+                  luaL_openlibs(L);
+                  printf("[Core] Embedded Lua VM successfully booted.\n");
+                  luaL_dostring(L, "print('  [Lua Engine] ReaScript-style Lua runtime active.')");
+                  lua_close(L);
+              } else {
+                  fprintf(stderr, "[Core Error] Failed to initialize Lua runtime.\n");
+              }
+
+              // 3. Python Subsystem Initialization
+              Py_Initialize();
+              if (Py_IsInitialized()) {
+                  printf("[Core] Embedded Python runtime active.\n");
+                  PyRun_SimpleString("print('  [Python Engine] Pipeline worker bridge active.')");
+                  Py_Finalize();
+              } else {
+                  fprintf(stderr, "[Core Error] Failed to initialize Python runtime.\n");
+              }
+
+              printf("[Core] Engine initialization check passed.\n");
+              return 0;
+          }
+          EOF
+
+      - name: Generate Lua Script Template (scripts/lua/automation.lua)
+        run: |
+          cat << 'EOF' > scripts/lua/automation.lua
+          -- Automation / ReaScript style track actions
+          function main()
+              print("[Lua Automation] Processing stem timeline...")
+          end
+
+          main()
+          EOF
+
+      - name: Generate Python Script Template (scripts/python/batch_align.py)
+        run: |
+          cat << 'EOF' > scripts/python/batch_align.py
+          import sys
+
+          def run_batch():
+              print(f"[Python Runner] Python {sys.version.split()[0]} audio task initialized.")
+
+          if __name__ == "__main__":
+              run_batch()
+          EOF
+
+      - name: Generate Readme (README.md)
+        run: |
+          cat << 'EOF' > README.md
+          # Custom Audio DAW Engine
+
+          Automated hybrid pipeline:
+          - **Core**: C (FFmpeg + Lua 5.4 + Python 3 C API)
+          - **Build**: CMake
+          - **CI/CD**: GitHub Actions
+          EOF
+
+      - name: Build Engine
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j$(nproc)
+
+      - name: Test Execute Engine
+        run: |
+          ./build/audio_engine
+
+      - name: Package Distributable Binaries
+        run: |
+          mkdir -p dist/bin dist/scripts
+          cp build/audio_engine dist/bin/
+          cp -r scripts/* dist/scripts/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-daw-engine-linux
+          path: dist/
+
+      - name: Commit and Push Scaffolded Files to GitHub
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git status
+          # Only commit if changes exist
+          git diff-index --quiet HEAD || git commit -m "Auto-scaffold DAW pipeline structure [skip ci]"
+          git push
