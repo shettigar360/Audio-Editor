@@ -15,7 +15,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavut
 # 2. Lua
 find_package(Lua REQUIRED)
 
-# 3. SDL2 (Exclude SDL2main so standard main compiles cleanly)
+# 3. SDL2 (Exclude SDL2main)
 find_package(SDL2 REQUIRED)
 list(FILTER SDL2_LIBRARIES EXCLUDE REGEX "SDL2main")
 
@@ -23,6 +23,11 @@ list(FILTER SDL2_LIBRARIES EXCLUDE REGEX "SDL2main")
 find_package(Python3 COMPONENTS Development REQUIRED)
 
 add_executable(audio_editor src/main.c)
+
+# Hide the black backend terminal window on Windows
+if(WIN32)
+    target_link_options(audio_editor PRIVATE -mwindows)
+endif()
 
 target_include_directories(audio_editor PRIVATE
     include
