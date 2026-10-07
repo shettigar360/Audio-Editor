@@ -1,4 +1,4 @@
-name: Build Clean Windows Bundle
+name: Build Multitrack Windows Bundle
 
 on:
   workflow_dispatch:
@@ -7,14 +7,14 @@ on:
 
 jobs:
   build-windows:
-    name: Build Windows x64 Bundle
+    name: Build Ready-To-Use Windows App
     runs-on: windows-latest
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 MinGW-w64 Environment
+      - name: Setup MSYS2 Toolchain & Libraries
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -27,56 +27,48 @@ jobs:
             mingw-w64-x86_64-ffmpeg
             mingw-w64-x86_64-lua
             mingw-w64-x86_64-python
+            mingw-w64-x86_64-sdl2
 
-      - name: Configure CMake
+      - name: Clean Cache & Configure CMake
         shell: msys2 {0}
         run: |
+          rm -rf build
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-      - name: Compile Core
+      - name: Compile Executable
         shell: msys2 {0}
         run: |
           cmake --build build
 
-      - name: Assemble Clean App Directory
+      - name: Package Complete Windows Application
         shell: msys2 {0}
         run: |
-          # 1. Create clean folder layout
-          mkdir -p release/AudioEngine
-          mkdir -p release/AudioEngine/bin
-          mkdir -p release/AudioEngine/scripts/lua
-          mkdir -p release/AudioEngine/scripts/python
+          mkdir -p dist/scripts/lua
+          mkdir -p dist/scripts/python
 
-          # 2. Move main executable
-          cp build/audio_engine.exe release/AudioEngine/AudioEngine.exe
+          cp build/*.exe dist/
 
-          # 3. Collect all native DLLs (FFmpeg, Lua, MinGW runtimes) into bin/
-          ldd build/audio_engine.exe | grep '/mingw64/bin/' | awk '{print $3}' | while read -r dll; do
-            cp "$dll" release/AudioEngine/bin/ 2>/dev/null || true
-          done
-          # Also copy standard dynamic dependencies to bin
-          cp /mingw64/bin/av*.dll release/AudioEngine/bin/ 2>/dev/null || true
-          cp /mingw64/bin/swresample*.dll release/AudioEngine/bin/ 2>/dev/null || true
-          cp /mingw64/bin/lua*.dll release/AudioEngine/bin/ 2>/dev/null || true
-          cp /mingw64/bin/libwinpthread*.dll release/AudioEngine/bin/ 2>/dev/null || true
-          cp /mingw64/bin/libgcc*.dll release/AudioEngine/bin/ 2>/dev/null || true
-          cp /mingw64/bin/libstdc++*.dll release/AudioEngine/bin/ 2>/dev/null || true
+          cp /mingw64/bin/avcodec-*.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/avformat-*.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/avutil-*.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/swresample-*.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/swscale-*.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/SDL2.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/lua5*.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/libwinpthread-1.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/libgcc_s_seh-1.dll dist/ 2>/dev/null || true
+          cp /mingw64/bin/libstdc++-6.dll dist/ 2>/dev/null || true
 
-          # 4. Copy all DLLs to root so Windows finds them without manual PATH setup
-          cp release/AudioEngine/bin/*.dll release/AudioEngine/
-
-          # 5. Download official Python Embeddable runtime for zero-dependency execution
           curl -sSL -o python-embed.zip https://www.python.org/ftp/python/3.11.8/python-3.11.8-embed-amd64.zip
-          unzip -q -o python-embed.zip -d release/AudioEngine/bin/python/
+          unzip -q -o python-embed.zip -d dist/python/
           rm python-embed.zip
 
-          # 6. Copy user scripts
           if [ -d "scripts" ]; then
-            cp -r scripts/* release/AudioEngine/scripts/ 2>/dev/null || true
+            cp -r scripts/* dist/scripts/ 2>/dev/null || true
           fi
 
-      - name: Upload Clean Package
+      - name: Upload Ready-to-Use Zip
         uses: actions/upload-artifact@v4
         with:
-          name: AudioEngine-Windows-Clean
-          path: release/AudioEngine/
+          name: Multitrack-Editor-Windows
+          path: dist/
