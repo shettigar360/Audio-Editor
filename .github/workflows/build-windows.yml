@@ -17,18 +17,17 @@ jobs:
       - name: Setup MSYS2 Toolchain & Libraries
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-g++
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-ffmpeg
-            mingw-w64-x86_64-lua
-            mingw-w64-x86_64-python
-            mingw-w64-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-lua
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-SDL2
 
       - name: Clean Cache & Configure CMake
         shell: msys2 {0}
@@ -47,23 +46,27 @@ jobs:
           mkdir -p dist/scripts/lua
           mkdir -p dist/scripts/python
 
-          cp build/*.exe dist/
+          # Copy compiled binary
+          find build -maxdepth 2 -type f -name "*.exe" -exec cp {} dist/ \;
 
-          cp /mingw64/bin/avcodec-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/avformat-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/avutil-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/swresample-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/swscale-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/SDL2.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/lua5*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/libwinpthread-1.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/libgcc_s_seh-1.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/libstdc++-6.dll dist/ 2>/dev/null || true
+          # Bundle all media, video window, scripting, and runtime DLLs
+          cp /ucrt64/bin/avcodec-*.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/avformat-*.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/avutil-*.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/swresample-*.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/swscale-*.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/SDL2.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/lua5*.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/libwinpthread-1.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/libgcc_s_seh-1.dll dist/ 2>/dev/null || true
+          cp /ucrt64/bin/libstdc++-6.dll dist/ 2>/dev/null || true
 
+          # Embed standalone Python runtime
           curl -sSL -o python-embed.zip https://www.python.org/ftp/python/3.11.8/python-3.11.8-embed-amd64.zip
           unzip -q -o python-embed.zip -d dist/python/
           rm python-embed.zip
 
+          # Copy scripts directory if present
           if [ -d "scripts" ]; then
             cp -r scripts/* dist/scripts/ 2>/dev/null || true
           fi
