@@ -1,4 +1,4 @@
-name: Build Windows Executable
+name: Build Clean Windows Bundle
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-windows:
-    name: Build Windows x64 Executable
+    name: Build Windows x64 Bundle
     runs-on: windows-latest
 
     steps:
@@ -31,37 +31,52 @@ jobs:
       - name: Configure CMake
         shell: msys2 {0}
         run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-      - name: Compile Executable
+      - name: Compile Core
         shell: msys2 {0}
         run: |
           cmake --build build
 
-      - name: Package .EXE and Runtime DLLs
+      - name: Assemble Clean App Directory
         shell: msys2 {0}
         run: |
-          mkdir -p dist
-          # Copy the compiled binary
-          cp build/audio_engine.exe dist/
+          # 1. Create clean folder layout
+          mkdir -p release/AudioEngine
+          mkdir -p release/AudioEngine/bin
+          mkdir -p release/AudioEngine/scripts/lua
+          mkdir -p release/AudioEngine/scripts/python
 
-          # Bundle required FFmpeg, Lua, and MinGW dependency DLLs
-          cp /mingw64/bin/avcodec-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/avformat-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/avutil-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/swresample-*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/lua5*.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/libwinpthread-1.dll dist/ 2>/dev/null || true
-          cp /mingw64/bin/libgcc_s_seh-1.dll dist/ 2>/dev/null || true
+          # 2. Move main executable
+          cp build/audio_engine.exe release/AudioEngine/AudioEngine.exe
 
-          # Include script directories if present
+          # 3. Collect all native DLLs (FFmpeg, Lua, MinGW runtimes) into bin/
+          ldd build/audio_engine.exe | grep '/mingw64/bin/' | awk '{print $3}' | while read -r dll; do
+            cp "$dll" release/AudioEngine/bin/ 2>/dev/null || true
+          done
+          # Also copy standard dynamic dependencies to bin
+          cp /mingw64/bin/av*.dll release/AudioEngine/bin/ 2>/dev/null || true
+          cp /mingw64/bin/swresample*.dll release/AudioEngine/bin/ 2>/dev/null || true
+          cp /mingw64/bin/lua*.dll release/AudioEngine/bin/ 2>/dev/null || true
+          cp /mingw64/bin/libwinpthread*.dll release/AudioEngine/bin/ 2>/dev/null || true
+          cp /mingw64/bin/libgcc*.dll release/AudioEngine/bin/ 2>/dev/null || true
+          cp /mingw64/bin/libstdc++*.dll release/AudioEngine/bin/ 2>/dev/null || true
+
+          # 4. Copy all DLLs to root so Windows finds them without manual PATH setup
+          cp release/AudioEngine/bin/*.dll release/AudioEngine/
+
+          # 5. Download official Python Embeddable runtime for zero-dependency execution
+          curl -sSL -o python-embed.zip https://www.python.org/ftp/python/3.11.8/python-3.11.8-embed-amd64.zip
+          unzip -q -o python-embed.zip -d release/AudioEngine/bin/python/
+          rm python-embed.zip
+
+          # 6. Copy user scripts
           if [ -d "scripts" ]; then
-            cp -r scripts dist/
+            cp -r scripts/* release/AudioEngine/scripts/ 2>/dev/null || true
           fi
 
-      - name: Upload Windows Distributable
+      - name: Upload Clean Package
         uses: actions/upload-artifact@v4
         with:
-          name: audio-daw-engine-windows-x64
-          path: dist/
+          name: AudioEngine-Windows-Clean
+          path: release/AudioEngine/
