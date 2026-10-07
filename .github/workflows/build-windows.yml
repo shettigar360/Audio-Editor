@@ -28,6 +28,7 @@ jobs:
             mingw-w64-ucrt-x86_64-lua
             mingw-w64-ucrt-x86_64-python
             mingw-w64-ucrt-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-ntldd
 
       - name: Clean Cache & Configure CMake
         shell: msys2 {0}
@@ -40,34 +41,36 @@ jobs:
         run: |
           cmake --build build
 
-      - name: Package Complete Windows Application
+      - name: Package Executable with Complete Dependency Tree
         shell: msys2 {0}
         run: |
           mkdir -p dist
           mkdir -p dist/scripts/lua
           mkdir -p dist/scripts/python
 
-          # Copy executable
+          # 1. Copy the compiled executable
           cp build/*.exe dist/
 
-          # Copy all required dynamic libraries directly from ucrt64
-          cp /ucrt64/bin/avcodec-*.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/avformat-*.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/avutil-*.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/swresample-*.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/swscale-*.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/SDL2.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/lua5*.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/libwinpthread-1.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/libgcc_s_seh-1.dll dist/ 2>/dev/null || true
-          cp /ucrt64/bin/libstdc++-6.dll dist/ 2>/dev/null || true
+          # 2. Recursively trace and copy EVERY required DLL (FFmpeg, SDL2, codecs, runtimes)
+          cd dist
+          TARGET_EXE=$(ls *.exe | head -n 1)
 
-          # Embedded standalone Python runtime
+          # Run ntldd recursively until all sub-dependencies are copied
+          for i in {1..4}; do
+            ntldd -R *.exe *.dll 2>/dev/null | grep -i "/ucrt64/bin/" | awk '{print $3}' | sort -u | while read -r dll; do
+              if [ -f "$dll" ] && [ ! -f "$(basename "$dll")" ]; then
+                cp "$dll" .
+              fi
+            done
+          done
+          cd ..
+
+          # 3. Embed official standalone Python runtime
           curl -sSL -o python-embed.zip https://www.python.org/ftp/python/3.11.8/python-3.11.8-embed-amd64.zip
           unzip -q -o python-embed.zip -d dist/python/
           rm python-embed.zip
 
-          # Copy script templates if they exist
+          # 4. Copy scripts if present
           if [ -d "scripts" ]; then
             cp -r scripts/* dist/scripts/ 2>/dev/null || true
           fi
