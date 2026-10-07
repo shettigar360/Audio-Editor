@@ -28,7 +28,6 @@ jobs:
             mingw-w64-ucrt-x86_64-lua
             mingw-w64-ucrt-x86_64-python
             mingw-w64-ucrt-x86_64-SDL2
-            mingw-w64-ucrt-x86_64-ntldd
 
       - name: Clean Cache & Configure CMake
         shell: msys2 {0}
@@ -51,26 +50,15 @@ jobs:
           # 1. Copy the compiled executable
           cp build/*.exe dist/
 
-          # 2. Recursively trace and copy EVERY required DLL (FFmpeg, SDL2, codecs, runtimes)
-          cd dist
-          TARGET_EXE=$(ls *.exe | head -n 1)
-
-          # Run ntldd recursively until all sub-dependencies are copied
-          for i in {1..4}; do
-            ntldd -R *.exe *.dll 2>/dev/null | grep -i "/ucrt64/bin/" | awk '{print $3}' | sort -u | while read -r dll; do
-              if [ -f "$dll" ] && [ ! -f "$(basename "$dll")" ]; then
-                cp "$dll" .
-              fi
-            done
-          done
-          cd ..
+          # 2. Copy all required UCRT64 runtime DLLs directly (guarantees zero missing DLL errors)
+          cp /ucrt64/bin/*.dll dist/ 2>/dev/null || true
 
           # 3. Embed official standalone Python runtime
           curl -sSL -o python-embed.zip https://www.python.org/ftp/python/3.11.8/python-3.11.8-embed-amd64.zip
           unzip -q -o python-embed.zip -d dist/python/
-          rm python-embed.zip
+          rm -f python-embed.zip
 
-          # 4. Copy scripts if present
+          # 4. Copy scripts folder if present
           if [ -d "scripts" ]; then
             cp -r scripts/* dist/scripts/ 2>/dev/null || true
           fi
