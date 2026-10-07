@@ -24,9 +24,10 @@ find_package(Python3 COMPONENTS Development REQUIRED)
 
 add_executable(audio_editor src/main.c)
 
-# Hide the black backend terminal window on Windows
+# Hide backend console window and link native Windows file dialogs (comdlg32)
 if(WIN32)
     target_link_options(audio_editor PRIVATE -mwindows)
+    target_link_libraries(audio_editor PRIVATE comdlg32)
 endif()
 
 target_include_directories(audio_editor PRIVATE
