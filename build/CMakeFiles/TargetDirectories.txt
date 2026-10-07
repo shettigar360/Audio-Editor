@@ -1,0 +1,3 @@
+/home/runner/work/Audio-Editor/Audio-Editor/build/CMakeFiles/audio_engine.dir
+/home/runner/work/Audio-Editor/Audio-Editor/build/CMakeFiles/edit_cache.dir
+/home/runner/work/Audio-Editor/Audio-Editor/build/CMakeFiles/rebuild_cache.dir
