@@ -19,10 +19,10 @@
 #include "video_player.h"
 #include "audio_engine.h"
 
-#define TABBAR_HEIGHT 28
+#define TABBAR_HEIGHT 30
 #define TOPBAR_HEIGHT 36
 #define RULER_HEIGHT 28
-#define MARKER_BAR_HEIGHT 22
+#define MARKER_BAR_HEIGHT 24
 #define SCROLLBAR_SIZE 16
 #define MAX_UNDO_STACK 32
 #define MAX_SCRIPTS 32
@@ -100,7 +100,7 @@ typedef struct {
     bool script_manager_open;
     bool script_manager_is_python;
     int script_selected_idx;
-    SDL_Rect script_win_rect; // Freely draggable window rect
+    SDL_Rect script_win_rect;
     bool script_win_dragging;
     int script_drag_offset_x;
     int script_drag_offset_y;
@@ -111,7 +111,7 @@ typedef struct {
     bool submenu_export_audio_open;
     bool submenu_export_video_open;
 
-    // Exclusive Input Focus State
+    // Exclusive Text Box Input State
     InputFocusType input_focus;
     int editing_track_name_idx;
     char editing_name_buf[64];
@@ -122,6 +122,8 @@ typedef struct {
 extern DawEngine g_daw;
 
 static inline ProjectTab* get_cur_tab(void) {
+    if (g_daw.active_tab < 0) g_daw.active_tab = 0;
+    if (g_daw.active_tab >= g_daw.num_tabs) g_daw.active_tab = g_daw.num_tabs - 1;
     return &g_daw.tabs[g_daw.active_tab];
 }
 
