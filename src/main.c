@@ -42,6 +42,8 @@ typedef struct {
     char label[128];
     PeakBin *peaks;
     int peak_count;
+    float *audio_samples;       // Interleaved stereo 32-bit float PCM
+    int64_t total_sample_pairs; // Total frames
     bool is_selected;
 } AudioItem;
 
@@ -90,8 +92,8 @@ typedef struct {
 
 static DawEngine g_daw;
 
-// ----------------- 1. REAL PEAK EXTRACTION (LITE: NO PCM IN RAM) -----------------
-int extract_real_peaks(const char *filepath, AudioItem *item) {
+// Decode audio cleanly once into memory and build real peaks
+int load_audio_and_generate_peaks(const char *filepath, AudioItem *item) {
     AVFormatContext *fmt = NULL;
     if (avformat_open_input(&fmt, filepath, NULL, NULL) < 0) return -1;
     if (avformat_find_stream_info(fmt, NULL) < 0) {
@@ -123,45 +125,35 @@ int extract_real_peaks(const char *filepath, AudioItem *item) {
     }
 
     SwrContext *swr = swr_alloc();
-    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
+    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
     swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, SAMPLE_RATE,
                         &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, 0, NULL);
     swr_init(swr);
 
-    double total_sec = (fmt->duration != AV_NOPTS_VALUE) ? ((double)fmt->duration / AV_TIME_BASE) : 10.0;
-    int estimated_bins = (int)((total_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN) + 2000;
-    PeakBin *peak_cache = (PeakBin *)calloc(estimated_bins, sizeof(PeakBin));
-    int current_bin = 0;
+    int64_t capacity = (int64_t)SAMPLE_RATE * 2 * 60; // 60s initial capacity
+    float *pcm_buffer = (float *)malloc(capacity * sizeof(float));
+    int64_t total_frames = 0;
 
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    float temp_pcm[4096];
-    float cur_min = 0.0f, cur_max = 0.0f;
-    int samples_in_bin = 0;
 
     while (av_read_frame(fmt, pkt) >= 0) {
         if (pkt->stream_index == a_idx) {
             if (avcodec_send_packet(ctx, pkt) == 0) {
                 while (avcodec_receive_frame(ctx, frame) == 0) {
-                    uint8_t *out_d[1] = { (uint8_t *)temp_pcm };
-                    int converted = swr_convert(swr, out_d, 4096, (const uint8_t **)frame->extended_data, frame->nb_samples);
-                    for (int s = 0; s < converted; s++) {
-                        float v = temp_pcm[s];
-                        if (v < cur_min) cur_min = v;
-                        if (v > cur_max) cur_max = v;
-                        samples_in_bin++;
+                    int dst_nb_samples = av_rescale_rnd(
+                        swr_get_delay(swr, ctx->sample_rate) + frame->nb_samples,
+                        SAMPLE_RATE, ctx->sample_rate, AV_ROUND_UP);
 
-                        if (samples_in_bin >= PEAK_SAMPLES_PER_BIN) {
-                            if (current_bin < estimated_bins) {
-                                peak_cache[current_bin].min_val = cur_min;
-                                peak_cache[current_bin].max_val = cur_max;
-                                current_bin++;
-                            }
-                            cur_min = 0.0f;
-                            cur_max = 0.0f;
-                            samples_in_bin = 0;
-                        }
+                    if ((total_frames + dst_nb_samples) * 2 > capacity) {
+                        capacity = (total_frames + dst_nb_samples) * 4;
+                        pcm_buffer = (float *)realloc(pcm_buffer, capacity * sizeof(float));
                     }
+
+                    uint8_t *out_d[2] = { (uint8_t *)(pcm_buffer + total_frames * 2), NULL };
+                    int converted = swr_convert(swr, out_d, dst_nb_samples,
+                                                (const uint8_t **)frame->extended_data, frame->nb_samples);
+                    if (converted > 0) total_frames += converted;
                 }
             }
         }
@@ -174,13 +166,33 @@ int extract_real_peaks(const char *filepath, AudioItem *item) {
     avcodec_free_context(&ctx);
     avformat_close_input(&fmt);
 
-    item->peaks = peak_cache;
-    item->peak_count = current_bin;
-    item->file_total_duration = total_sec;
-    item->duration = total_sec;
+    item->audio_samples = pcm_buffer;
+    item->total_sample_pairs = total_frames;
+    double duration_sec = (double)total_frames / SAMPLE_RATE;
+    item->file_total_duration = duration_sec;
+    item->duration = duration_sec;
     item->offset_in_file = 0.0;
     item->is_selected = false;
     strncpy(item->file_path, filepath, sizeof(item->file_path) - 1);
+
+    // Build real peak cache for instant visual waveform rendering
+    int bin_count = (int)(total_frames / PEAK_SAMPLES_PER_BIN) + 1;
+    item->peaks = (PeakBin *)malloc(bin_count * sizeof(PeakBin));
+    item->peak_count = bin_count;
+
+    for (int b = 0; b < bin_count; b++) {
+        float mn = 0.0f, mx = 0.0f;
+        int64_t start_f = (int64_t)b * PEAK_SAMPLES_PER_BIN;
+        for (int s = 0; s < PEAK_SAMPLES_PER_BIN; s++) {
+            int64_t idx = start_f + s;
+            if (idx >= total_frames) break;
+            float mono = (pcm_buffer[idx * 2] + pcm_buffer[idx * 2 + 1]) * 0.5f;
+            if (mono < mn) mn = mono;
+            if (mono > mx) mx = mono;
+        }
+        item->peaks[b].min_val = mn;
+        item->peaks[b].max_val = mx;
+    }
 
     const char *name = strrchr(filepath, '\\');
     if (!name) name = strrchr(filepath, '/');
@@ -188,7 +200,51 @@ int extract_real_peaks(const char *filepath, AudioItem *item) {
     return 0;
 }
 
-// ----------------- 2. SAFE HARDWARE VIDEO ENGINE -----------------
+// Low-latency stutter-free mixer loop
+void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
+    DawEngine *eng = (DawEngine *)userdata;
+    float *out = (float *)stream;
+    int frames_needed = len / (sizeof(float) * 2);
+    memset(stream, 0, len);
+
+    if (!eng->is_playing) return;
+
+    bool any_solo = false;
+    for (int t = 0; t < eng->num_tracks; t++) {
+        if (eng->tracks[t].solo) { any_solo = true; break; }
+    }
+
+    double st = eng->playhead_seconds;
+    double et = st + ((double)frames_needed / SAMPLE_RATE);
+
+    for (int i = 0; i < eng->num_items; i++) {
+        AudioItem *it = &eng->items[i];
+        if (!it->audio_samples) continue;
+
+        Track *tr = &eng->tracks[it->track_idx];
+        if (tr->mute) continue;
+        if (any_solo && !tr->solo) continue;
+
+        double it_s = it->start_time;
+        double it_e = it->start_time + it->duration;
+
+        if (it_e > st && it_s < et) {
+            for (int f = 0; f < frames_needed; f++) {
+                double cur_t = st + ((double)f / SAMPLE_RATE);
+                if (cur_t >= it_s && cur_t < it_e) {
+                    double rel_time = (cur_t - it_s) + it->offset_in_file;
+                    int64_t sample_pos = (int64_t)(rel_time * SAMPLE_RATE);
+                    if (sample_pos >= 0 && sample_pos < it->total_sample_pairs) {
+                        out[f * 2]     += it->audio_samples[sample_pos * 2] * tr->volume;
+                        out[f * 2 + 1] += it->audio_samples[sample_pos * 2 + 1] * tr->volume;
+                    }
+                }
+            }
+        }
+    }
+    eng->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
+}
+
 void close_video_stream() {
     if (g_daw.video.texture) { SDL_DestroyTexture(g_daw.video.texture); g_daw.video.texture = NULL; }
     if (g_daw.video.sws_ctx) { sws_freeContext(g_daw.video.sws_ctx); g_daw.video.sws_ctx = NULL; }
@@ -228,7 +284,6 @@ int open_video_stream(const char *filepath, SDL_Renderer *ren) {
         return -1;
     }
 
-    // Safety checks for pixel format & dimensions
     enum AVPixelFormat src_pix_fmt = (ctx->pix_fmt == AV_PIX_FMT_NONE) ? AV_PIX_FMT_YUV420P : ctx->pix_fmt;
     if (ctx->width <= 0 || ctx->height <= 0) {
         avcodec_free_context(&ctx);
@@ -252,7 +307,6 @@ int open_video_stream(const char *filepath, SDL_Renderer *ren) {
     av_image_fill_arrays(g_daw.video.frame_rgb->data, g_daw.video.frame_rgb->linesize,
                          g_daw.video.rgb_buffer, AV_PIX_FMT_RGB24, ctx->width, ctx->height, 1);
 
-    // Correct pix_fmt conversion (preventing segmentation fault)
     g_daw.video.sws_ctx = sws_getContext(ctx->width, ctx->height, src_pix_fmt,
                                          ctx->width, ctx->height, AV_PIX_FMT_RGB24,
                                          SWS_FAST_BILINEAR, NULL, NULL, NULL);
@@ -266,7 +320,7 @@ int open_video_stream(const char *filepath, SDL_Renderer *ren) {
 void render_video_frame(double target_seconds) {
     if (!g_daw.video.fmt_ctx || g_daw.video.video_stream_idx == -1 || !g_daw.video.sws_ctx) return;
 
-    if (fabs(target_seconds - g_daw.video.last_seek_time) > 0.03) {
+    if (fabs(target_seconds - g_daw.video.last_seek_time) > 0.04) {
         int64_t target_ts = (int64_t)(target_seconds * AV_TIME_BASE);
         av_seek_frame(g_daw.video.fmt_ctx, -1, target_ts, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(g_daw.video.codec_ctx);
@@ -296,95 +350,6 @@ void render_video_frame(double target_seconds) {
         av_packet_free(&pkt);
         g_daw.video.last_seek_time = target_seconds;
     }
-}
-
-// ----------------- 3. REALTIME STREAMING AUDIO PLAYBACK -----------------
-// Opens audio only when needed to play the current section, keeping RAM usage low
-void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
-    DawEngine *eng = (DawEngine *)userdata;
-    float *out = (float *)stream;
-    int frames_needed = len / (sizeof(float) * 2);
-    memset(stream, 0, len);
-
-    if (!eng->is_playing) return;
-
-    bool any_solo = false;
-    for (int t = 0; t < eng->num_tracks; t++) {
-        if (eng->tracks[t].solo) { any_solo = true; break; }
-    }
-
-    double st = eng->playhead_seconds;
-    double et = st + ((double)frames_needed / SAMPLE_RATE);
-
-    for (int i = 0; i < eng->num_items; i++) {
-        AudioItem *it = &eng->items[i];
-        Track *tr = &eng->tracks[it->track_idx];
-        if (tr->mute) continue;
-        if (any_solo && !tr->solo) continue;
-
-        double it_s = it->start_time;
-        double it_e = it->start_time + it->duration;
-
-        if (it_e > st && it_s < et) {
-            // Stream audio samples on-demand using FFmpeg
-            AVFormatContext *afmt = NULL;
-            if (avformat_open_input(&afmt, it->file_path, NULL, NULL) == 0) {
-                if (avformat_find_stream_info(afmt, NULL) >= 0) {
-                    int a_idx = -1;
-                    for (unsigned int s = 0; s < afmt->nb_streams; s++) {
-                        if (afmt->streams[s]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                            a_idx = s;
-                            break;
-                        }
-                    }
-                    if (a_idx >= 0) {
-                        AVCodecParameters *cpar = afmt->streams[a_idx]->codecpar;
-                        const AVCodec *codec = avcodec_find_decoder(cpar->codec_id);
-                        AVCodecContext *actx = avcodec_alloc_context3(codec);
-                        avcodec_parameters_to_context(actx, cpar);
-                        if (avcodec_open2(actx, codec, NULL) == 0) {
-                            SwrContext *swr = swr_alloc();
-                            AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
-                            swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, SAMPLE_RATE,
-                                                &actx->ch_layout, actx->sample_fmt, actx->sample_rate, 0, NULL);
-                            swr_init(swr);
-
-                            int64_t seek_pts = (int64_t)((st - it_s + it->offset_in_file) * AV_TIME_BASE);
-                            av_seek_frame(afmt, -1, seek_pts, AVSEEK_FLAG_BACKWARD);
-
-                            AVPacket *pkt = av_packet_alloc();
-                            AVFrame *frm = av_frame_alloc();
-                            float temp_buf[2048];
-                            int filled = 0;
-
-                            while (av_read_frame(afmt, pkt) >= 0 && filled < frames_needed) {
-                                if (pkt->stream_index == a_idx) {
-                                    if (avcodec_send_packet(actx, pkt) == 0) {
-                                        while (avcodec_receive_frame(actx, frm) == 0 && filled < frames_needed) {
-                                            uint8_t *out_p[2] = { (uint8_t *)temp_buf, NULL };
-                                            int conv = swr_convert(swr, out_p, 1024, (const uint8_t **)frm->extended_data, frm->nb_samples);
-                                            for (int f = 0; f < conv && filled < frames_needed; f++) {
-                                                out[filled * 2]     += temp_buf[f * 2] * tr->volume;
-                                                out[filled * 2 + 1] += temp_buf[f * 2 + 1] * tr->volume;
-                                                filled++;
-                                            }
-                                        }
-                                    }
-                                }
-                                av_packet_unref(pkt);
-                            }
-                            av_frame_free(&frm);
-                            av_packet_free(&pkt);
-                            swr_free(&swr);
-                            avcodec_free_context(&actx);
-                        }
-                    }
-                }
-                avformat_close_input(&afmt);
-            }
-        }
-    }
-    eng->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
 }
 
 void open_file_dialog(char *out_path, int max_len) {
@@ -424,7 +389,7 @@ int main(int argc, char *argv[]) {
         g_daw.tracks[i].volume = 0.8f;
     }
 
-    // Initialize low-latency audio device
+    // Configure 48kHz audio output
     SDL_AudioSpec want, have;
     SDL_zero(want);
     want.freq = SAMPLE_RATE;
@@ -511,7 +476,7 @@ int main(int argc, char *argv[]) {
                     AudioItem *it = &g_daw.items[g_daw.num_items];
                     it->track_idx = trk;
                     it->start_time = g_daw.playhead_seconds;
-                    if (extract_real_peaks(file, it) == 0) {
+                    if (load_audio_and_generate_peaks(file, it) == 0) {
                         g_daw.num_items++;
                     }
                 }
@@ -554,7 +519,7 @@ int main(int argc, char *argv[]) {
             else if (e.type == SDL_MOUSEBUTTONDOWN) {
                 int mx = e.button.x, my = e.button.y;
 
-                // 1. Video Window Dragging & Close
+                // Video Window Dragging & Close
                 if (g_daw.video.is_open && mx >= g_daw.video.rect.x && mx <= g_daw.video.rect.x + g_daw.video.rect.w &&
                     my >= g_daw.video.rect.y && my <= g_daw.video.rect.y + g_daw.video.rect.h) {
                     if (mx >= g_daw.video.rect.x + g_daw.video.rect.w - 24 && my <= g_daw.video.rect.y + 24) {
@@ -567,7 +532,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // 2. Topbar Actions
+                // Topbar Actions
                 if (my <= TOPBAR_HEIGHT) {
                     if (mx >= 115 && mx <= 200) {
                         g_daw.video.is_open = !g_daw.video.is_open;
@@ -576,7 +541,7 @@ int main(int argc, char *argv[]) {
                         if (strlen(p) > 0 && g_daw.num_items < MAX_ITEMS) {
                             AudioItem *it = &g_daw.items[g_daw.num_items];
                             it->track_idx = 0; it->start_time = g_daw.playhead_seconds;
-                            if (extract_real_peaks(p, it) == 0) g_daw.num_items++;
+                            if (load_audio_and_generate_peaks(p, it) == 0) g_daw.num_items++;
                             open_video_stream(p, ren);
                         }
                     } else if (mx >= 560 && mx <= 650 && g_daw.num_tracks < MAX_TRACKS) {
@@ -587,7 +552,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // 3. Compact Horizontal Scrollbar Click
+                // Horizontal Scrollbar Click
                 if (my >= win_h - SCROLLBAR_SIZE && mx >= TCP_WIDTH && mx < win_w - SCROLLBAR_SIZE) {
                     float thumb_w = fminf(120.0f, fmaxf(48.0f, (float)view_w * (40.0f / g_daw.pixels_per_second)));
                     float thumb_x = TCP_WIDTH + (float)(g_daw.scroll_x_sec / 300.0f) * (view_w - thumb_w);
@@ -603,7 +568,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // 4. Vertical Scrollbar Click
+                // Vertical Scrollbar Click
                 if (mx >= win_w - SCROLLBAR_SIZE && my >= TOPBAR_HEIGHT + RULER_HEIGHT && my < win_h - SCROLLBAR_SIZE) {
                     dragging_scrollbar_v = true;
                     scrollbar_v_start_my = my;
@@ -611,7 +576,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // 5. TCP Controls
+                // TCP Volume & Mute/Solo
                 if (mx < TCP_WIDTH && my > TOPBAR_HEIGHT + RULER_HEIGHT) {
                     int trk = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) / g_daw.track_height;
                     if (trk >= 0 && trk < g_daw.num_tracks) {
@@ -626,7 +591,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // 6. Multitrack Items Selection & Dragging
+                // Item Selection & Dragging
                 if (mx >= TCP_WIDTH && my > TOPBAR_HEIGHT + RULER_HEIGHT && my < win_h - SCROLLBAR_SIZE) {
                     double click_time = g_daw.scroll_x_sec + (double)(mx - TCP_WIDTH) / g_daw.pixels_per_second;
                     int click_track = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) / g_daw.track_height;
@@ -660,7 +625,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // 7. Ruler Click
+                // Ruler Click
                 if (mx >= TCP_WIDTH && my >= TOPBAR_HEIGHT && my <= TOPBAR_HEIGHT + RULER_HEIGHT) {
                     scrubbing = true;
                     g_daw.playhead_seconds = fmax(0.0, g_daw.scroll_x_sec + (double)(mx - TCP_WIDTH) / g_daw.pixels_per_second);
@@ -725,7 +690,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Keep hardware video frame in sync with playhead
+        // Render video frame synchronized with playhead
         if (g_daw.video.is_open && g_daw.video.video_stream_idx != -1) {
             render_video_frame(g_daw.playhead_seconds);
         }
@@ -738,7 +703,7 @@ int main(int argc, char *argv[]) {
         SDL_Color c_muted = { 130, 130, 130, 255 };
         SDL_Color c_teal  = { 0, 210, 170, 255 };
 
-        // 1. Top Bar
+        // Top Bar
         SDL_Rect bar = { 0, 0, win_w, TOPBAR_HEIGHT };
         SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
         SDL_RenderFillRect(ren, &bar);
@@ -764,13 +729,13 @@ int main(int argc, char *argv[]) {
         SDL_RenderFillRect(ren, &btn_play);
         draw_text(ren, g_daw.is_playing ? "Stop" : "Play", 675, 12, c_white);
 
-        draw_text(ren, "[Real Peaks | Audio Streaming | Video Active]", win_w - 380, 12, c_muted);
+        draw_text(ren, "[Low-Latency Realtime Audio Output]", win_w - 320, 12, c_muted);
 
         // Timeline Clip Region
         SDL_Rect timeline_clip = { TCP_WIDTH, TOPBAR_HEIGHT + RULER_HEIGHT, view_w, view_h };
         SDL_RenderSetClipRect(ren, &timeline_clip);
 
-        // 2. Grid Lines
+        // Grid Lines
         int sec_step = (g_daw.pixels_per_second < 40) ? 2 : 1;
         for (int s = 0; s < 3600; s += sec_step) {
             int gx = TCP_WIDTH + (int)((s - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
@@ -786,7 +751,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderDrawLine(ren, TCP_WIDTH, ty, TCP_WIDTH + view_w, ty);
         }
 
-        // 3. Render Real Audio Waveforms
+        // Render Audio Waveforms
         for (int i = 0; i < g_daw.num_items; i++) {
             AudioItem *it = &g_daw.items[i];
             int ix = TCP_WIDTH + (int)((it->start_time - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
@@ -826,7 +791,7 @@ int main(int argc, char *argv[]) {
             draw_text(ren, it->label, ix + 6, iy + 6, c_white);
         }
 
-        // 4. Playhead Line
+        // Playhead Line
         int cur_px = TCP_WIDTH + (int)((g_daw.playhead_seconds - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
         if (cur_px >= TCP_WIDTH && cur_px <= TCP_WIDTH + view_w) {
             SDL_SetRenderDrawColor(ren, 0, 220, 170, 255);
@@ -835,7 +800,7 @@ int main(int argc, char *argv[]) {
 
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 5. Timeline Ruler
+        // Timeline Ruler
         SDL_Rect ruler = { TCP_WIDTH, TOPBAR_HEIGHT, view_w, RULER_HEIGHT };
         SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
         SDL_RenderFillRect(ren, &ruler);
@@ -852,7 +817,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderDrawLine(ren, rx, TOPBAR_HEIGHT, rx, TOPBAR_HEIGHT + RULER_HEIGHT);
         }
 
-        // 6. Track Control Panels
+        // TCP Sidebar
         SDL_Rect tcp_clip = { 0, TOPBAR_HEIGHT + RULER_HEIGHT, TCP_WIDTH, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
 
@@ -891,7 +856,7 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 7. Compact Horizontal Scrollbar
+        // Compact Horizontal Scrollbar
         SDL_Rect bar_h = { TCP_WIDTH, win_h - SCROLLBAR_SIZE, view_w, SCROLLBAR_SIZE };
         SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
         SDL_RenderFillRect(ren, &bar_h);
@@ -902,7 +867,7 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(ren, 85, 85, 85, 255);
         SDL_RenderFillRect(ren, &thumb_h);
 
-        // 8. Vertical Scrollbar
+        // Vertical Scrollbar
         SDL_Rect bar_v = { win_w - SCROLLBAR_SIZE, TOPBAR_HEIGHT + RULER_HEIGHT, SCROLLBAR_SIZE, view_h };
         SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
         SDL_RenderFillRect(ren, &bar_v);
@@ -913,7 +878,7 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(ren, 75, 75, 75, 255);
         SDL_RenderFillRect(ren, &thumb_v);
 
-        // 9. Floating Video Window
+        // Floating Video Window
         if (g_daw.video.is_open) {
             SDL_Rect s_rect = { g_daw.video.rect.x + 4, g_daw.video.rect.y + 4, g_daw.video.rect.w, g_daw.video.rect.h };
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
@@ -945,6 +910,7 @@ int main(int argc, char *argv[]) {
     if (g_daw.audio_device > 0) SDL_CloseAudioDevice(g_daw.audio_device);
     close_video_stream();
     for (int i = 0; i < g_daw.num_items; i++) {
+        if (g_daw.items[i].audio_samples) free(g_daw.items[i].audio_samples);
         if (g_daw.items[i].peaks) free(g_daw.items[i].peaks);
     }
     SDL_DestroyRenderer(ren);
