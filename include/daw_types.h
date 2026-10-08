@@ -29,10 +29,15 @@
 #define MAX_TABS 8
 #define MAX_MARKERS 64
 
+typedef enum {
+    INPUT_FOCUS_NONE = 0,
+    INPUT_FOCUS_TRACK_NAME,
+    INPUT_FOCUS_MARKER
+} InputFocusType;
+
 typedef struct {
     double time_sec;
     char text[64];
-    bool is_editing;
 } DawMarker;
 
 typedef struct {
@@ -75,6 +80,7 @@ typedef struct {
 
     DawMarker markers[MAX_MARKERS];
     int num_markers;
+    bool show_marker_lane;
 
     SimpleVideoPlayer video;
     UndoRedoManager undo_mgr;
@@ -94,6 +100,10 @@ typedef struct {
     bool script_manager_open;
     bool script_manager_is_python;
     int script_selected_idx;
+    SDL_Rect script_win_rect; // Freely draggable window rect
+    bool script_win_dragging;
+    int script_drag_offset_x;
+    int script_drag_offset_y;
 
     // Menus
     bool menu_file_open;
@@ -101,7 +111,8 @@ typedef struct {
     bool submenu_export_audio_open;
     bool submenu_export_video_open;
 
-    // Renaming states
+    // Exclusive Input Focus State
+    InputFocusType input_focus;
     int editing_track_name_idx;
     char editing_name_buf[64];
     int editing_marker_idx;
