@@ -10,7 +10,7 @@
 
 #include "font.h"
 
-// FFmpeg headers for metadata, peak extraction, and video decoding
+// FFmpeg headers
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
@@ -27,7 +27,6 @@
 #define PEAK_SAMPLES_PER_BIN 256
 #define SAMPLE_RATE 48000
 
-// Exact min/max peak bin like REAPER .reapeaks
 typedef struct {
     float min_val;
     float max_val;
@@ -35,13 +34,13 @@ typedef struct {
 
 typedef struct {
     int track_idx;
-    double start_time;          // multitrack timeline position (seconds)
-    double offset_in_file;      // in-point trim (seconds)
-    double duration;            // item length (seconds)
+    double start_time;
+    double offset_in_file;
+    double duration;
     double file_total_duration;
-    char file_path[512];        // Media referenced by path ONLY
+    char file_path[512];
     char label[128];
-    PeakBin *peaks;             // Real peak cache (~50KB instead of 500MB PCM)
+    PeakBin *peaks;
     int peak_count;
     bool is_selected;
 } AudioItem;
@@ -54,7 +53,6 @@ typedef struct {
     float volume;
 } Track;
 
-// Video reader state for the Floating Video Monitor
 typedef struct {
     SDL_Rect rect;
     bool is_open;
@@ -87,12 +85,12 @@ typedef struct {
     float pixels_per_second;
     int track_height;
     VideoEngine video;
+    SDL_AudioDeviceID audio_device;
 } DawEngine;
 
 static DawEngine g_daw;
 
-// ----------------- 1. REAPER-STYLE PEAK EXTRACTION -----------------
-// Decodes audio in small temporary frames to compute exact min/max peaks, then frees everything
+// ----------------- 1. REAL PEAK EXTRACTION (LITE: NO PCM IN RAM) -----------------
 int extract_real_peaks(const char *filepath, AudioItem *item) {
     AVFormatContext *fmt = NULL;
     if (avformat_open_input(&fmt, filepath, NULL, NULL) < 0) return -1;
@@ -115,6 +113,7 @@ int extract_real_peaks(const char *filepath, AudioItem *item) {
 
     AVCodecParameters *cpar = fmt->streams[a_idx]->codecpar;
     const AVCodec *codec = avcodec_find_decoder(cpar->codec_id);
+    if (!codec) { avformat_close_input(&fmt); return -1; }
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(ctx, cpar);
     if (avcodec_open2(ctx, codec, NULL) < 0) {
@@ -124,14 +123,14 @@ int extract_real_peaks(const char *filepath, AudioItem *item) {
     }
 
     SwrContext *swr = swr_alloc();
-    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO; // Mono peak envelope
+    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
     swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, SAMPLE_RATE,
                         &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, 0, NULL);
     swr_init(swr);
 
     double total_sec = (fmt->duration != AV_NOPTS_VALUE) ? ((double)fmt->duration / AV_TIME_BASE) : 10.0;
-    int estimated_bins = (int)((total_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN) + 1000;
-    PeakBin *peak_cache = (PeakBin *)malloc(estimated_bins * sizeof(PeakBin));
+    int estimated_bins = (int)((total_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN) + 2000;
+    PeakBin *peak_cache = (PeakBin *)calloc(estimated_bins, sizeof(PeakBin));
     int current_bin = 0;
 
     AVPacket *pkt = av_packet_alloc();
@@ -173,7 +172,7 @@ int extract_real_peaks(const char *filepath, AudioItem *item) {
     av_packet_free(&pkt);
     swr_free(&swr);
     avcodec_free_context(&ctx);
-    avformat_close_input(&fmt); // Immediately closed! ZERO audio stored in RAM
+    avformat_close_input(&fmt);
 
     item->peaks = peak_cache;
     item->peak_count = current_bin;
@@ -189,7 +188,7 @@ int extract_real_peaks(const char *filepath, AudioItem *item) {
     return 0;
 }
 
-// ----------------- 2. HARDWARE VIDEO FRAME ENGINE -----------------
+// ----------------- 2. SAFE HARDWARE VIDEO ENGINE -----------------
 void close_video_stream() {
     if (g_daw.video.texture) { SDL_DestroyTexture(g_daw.video.texture); g_daw.video.texture = NULL; }
     if (g_daw.video.sws_ctx) { sws_freeContext(g_daw.video.sws_ctx); g_daw.video.sws_ctx = NULL; }
@@ -219,9 +218,19 @@ int open_video_stream(const char *filepath, SDL_Renderer *ren) {
 
     AVCodecParameters *cpar = fmt->streams[v_idx]->codecpar;
     const AVCodec *codec = avcodec_find_decoder(cpar->codec_id);
+    if (!codec) { avformat_close_input(&fmt); return -1; }
+
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(ctx, cpar);
     if (avcodec_open2(ctx, codec, NULL) < 0) {
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return -1;
+    }
+
+    // Safety checks for pixel format & dimensions
+    enum AVPixelFormat src_pix_fmt = (ctx->pix_fmt == AV_PIX_FMT_NONE) ? AV_PIX_FMT_YUV420P : ctx->pix_fmt;
+    if (ctx->width <= 0 || ctx->height <= 0) {
         avcodec_free_context(&ctx);
         avformat_close_input(&fmt);
         return -1;
@@ -232,7 +241,7 @@ int open_video_stream(const char *filepath, SDL_Renderer *ren) {
     g_daw.video.video_stream_idx = v_idx;
     g_daw.video.width = ctx->width;
     g_daw.video.height = ctx->height;
-    g_daw.video.last_seek_time = -1.0;
+    g_daw.video.last_seek_time = -999.0;
 
     g_daw.video.frame_yuv = av_frame_alloc();
     g_daw.video.frame_rgb = av_frame_alloc();
@@ -243,9 +252,10 @@ int open_video_stream(const char *filepath, SDL_Renderer *ren) {
     av_image_fill_arrays(g_daw.video.frame_rgb->data, g_daw.video.frame_rgb->linesize,
                          g_daw.video.rgb_buffer, AV_PIX_FMT_RGB24, ctx->width, ctx->height, 1);
 
-    g_daw.video.sws_ctx = sws_getContext(ctx->width, ctx->height, ctx->sample_fmt,
+    // Correct pix_fmt conversion (preventing segmentation fault)
+    g_daw.video.sws_ctx = sws_getContext(ctx->width, ctx->height, src_pix_fmt,
                                          ctx->width, ctx->height, AV_PIX_FMT_RGB24,
-                                         SWS_BILINEAR, NULL, NULL, NULL);
+                                         SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
     g_daw.video.texture = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, ctx->width, ctx->height);
     strncpy(g_daw.video.file_path, filepath, sizeof(g_daw.video.file_path) - 1);
@@ -253,11 +263,9 @@ int open_video_stream(const char *filepath, SDL_Renderer *ren) {
     return 0;
 }
 
-// Seeks and grabs a video frame synchronized with the multitrack timeline playhead
 void render_video_frame(double target_seconds) {
-    if (!g_daw.video.fmt_ctx || g_daw.video.video_stream_idx == -1) return;
+    if (!g_daw.video.fmt_ctx || g_daw.video.video_stream_idx == -1 || !g_daw.video.sws_ctx) return;
 
-    // Only seek if playhead moved noticeably
     if (fabs(target_seconds - g_daw.video.last_seek_time) > 0.03) {
         int64_t target_ts = (int64_t)(target_seconds * AV_TIME_BASE);
         av_seek_frame(g_daw.video.fmt_ctx, -1, target_ts, AVSEEK_FLAG_BACKWARD);
@@ -290,6 +298,95 @@ void render_video_frame(double target_seconds) {
     }
 }
 
+// ----------------- 3. REALTIME STREAMING AUDIO PLAYBACK -----------------
+// Opens audio only when needed to play the current section, keeping RAM usage low
+void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
+    DawEngine *eng = (DawEngine *)userdata;
+    float *out = (float *)stream;
+    int frames_needed = len / (sizeof(float) * 2);
+    memset(stream, 0, len);
+
+    if (!eng->is_playing) return;
+
+    bool any_solo = false;
+    for (int t = 0; t < eng->num_tracks; t++) {
+        if (eng->tracks[t].solo) { any_solo = true; break; }
+    }
+
+    double st = eng->playhead_seconds;
+    double et = st + ((double)frames_needed / SAMPLE_RATE);
+
+    for (int i = 0; i < eng->num_items; i++) {
+        AudioItem *it = &eng->items[i];
+        Track *tr = &eng->tracks[it->track_idx];
+        if (tr->mute) continue;
+        if (any_solo && !tr->solo) continue;
+
+        double it_s = it->start_time;
+        double it_e = it->start_time + it->duration;
+
+        if (it_e > st && it_s < et) {
+            // Stream audio samples on-demand using FFmpeg
+            AVFormatContext *afmt = NULL;
+            if (avformat_open_input(&afmt, it->file_path, NULL, NULL) == 0) {
+                if (avformat_find_stream_info(afmt, NULL) >= 0) {
+                    int a_idx = -1;
+                    for (unsigned int s = 0; s < afmt->nb_streams; s++) {
+                        if (afmt->streams[s]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                            a_idx = s;
+                            break;
+                        }
+                    }
+                    if (a_idx >= 0) {
+                        AVCodecParameters *cpar = afmt->streams[a_idx]->codecpar;
+                        const AVCodec *codec = avcodec_find_decoder(cpar->codec_id);
+                        AVCodecContext *actx = avcodec_alloc_context3(codec);
+                        avcodec_parameters_to_context(actx, cpar);
+                        if (avcodec_open2(actx, codec, NULL) == 0) {
+                            SwrContext *swr = swr_alloc();
+                            AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
+                            swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, SAMPLE_RATE,
+                                                &actx->ch_layout, actx->sample_fmt, actx->sample_rate, 0, NULL);
+                            swr_init(swr);
+
+                            int64_t seek_pts = (int64_t)((st - it_s + it->offset_in_file) * AV_TIME_BASE);
+                            av_seek_frame(afmt, -1, seek_pts, AVSEEK_FLAG_BACKWARD);
+
+                            AVPacket *pkt = av_packet_alloc();
+                            AVFrame *frm = av_frame_alloc();
+                            float temp_buf[2048];
+                            int filled = 0;
+
+                            while (av_read_frame(afmt, pkt) >= 0 && filled < frames_needed) {
+                                if (pkt->stream_index == a_idx) {
+                                    if (avcodec_send_packet(actx, pkt) == 0) {
+                                        while (avcodec_receive_frame(actx, frm) == 0 && filled < frames_needed) {
+                                            uint8_t *out_p[2] = { (uint8_t *)temp_buf, NULL };
+                                            int conv = swr_convert(swr, out_p, 1024, (const uint8_t **)frm->extended_data, frm->nb_samples);
+                                            for (int f = 0; f < conv && filled < frames_needed; f++) {
+                                                out[filled * 2]     += temp_buf[f * 2] * tr->volume;
+                                                out[filled * 2 + 1] += temp_buf[f * 2 + 1] * tr->volume;
+                                                filled++;
+                                            }
+                                        }
+                                    }
+                                }
+                                av_packet_unref(pkt);
+                            }
+                            av_frame_free(&frm);
+                            av_packet_free(&pkt);
+                            swr_free(&swr);
+                            avcodec_free_context(&actx);
+                        }
+                    }
+                }
+                avformat_close_input(&afmt);
+            }
+        }
+    }
+    eng->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
+}
+
 void open_file_dialog(char *out_path, int max_len) {
     OPENFILENAMEA ofn;
     char szFile[MAX_PATH] = {0};
@@ -304,7 +401,7 @@ void open_file_dialog(char *out_path, int max_len) {
 }
 
 int main(int argc, char *argv[]) {
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) return 1;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
 
     SDL_Window *win = SDL_CreateWindow(
         "[unsaved project] - Professional Multitrack DAW",
@@ -327,6 +424,18 @@ int main(int argc, char *argv[]) {
         g_daw.tracks[i].volume = 0.8f;
     }
 
+    // Initialize low-latency audio device
+    SDL_AudioSpec want, have;
+    SDL_zero(want);
+    want.freq = SAMPLE_RATE;
+    want.format = AUDIO_F32;
+    want.channels = 2;
+    want.samples = 1024;
+    want.callback = audio_mixer_callback;
+    want.userdata = &g_daw;
+    g_daw.audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (g_daw.audio_device > 0) SDL_PauseAudioDevice(g_daw.audio_device, 0);
+
     bool running = true;
     bool dragging_scrollbar_h = false;
     bool dragging_scrollbar_v = false;
@@ -346,17 +455,8 @@ int main(int argc, char *argv[]) {
     double item_orig_offset = 0.0;
 
     SDL_Event e;
-    Uint32 last_tick = SDL_GetTicks();
 
     while (running) {
-        Uint32 now = SDL_GetTicks();
-        float delta_time = (now - last_tick) / 1000.0f;
-        last_tick = now;
-
-        if (g_daw.is_playing) {
-            g_daw.playhead_seconds += delta_time;
-        }
-
         int win_w, win_h;
         SDL_GetWindowSize(win, &win_w, &win_h);
         int view_w = win_w - TCP_WIDTH - SCROLLBAR_SIZE;
@@ -373,7 +473,6 @@ int main(int argc, char *argv[]) {
                 int mx, my;
                 SDL_GetMouseState(&mx, &my);
 
-                // Ctrl + Mouse Wheel = Zoom
                 if (mod & KMOD_CTRL) {
                     if (mod & KMOD_SHIFT) {
                         g_daw.track_height += e.wheel.y * 8;
@@ -416,11 +515,10 @@ int main(int argc, char *argv[]) {
                         g_daw.num_items++;
                     }
                 }
-                // Also initialize video stream if container has video
                 open_video_stream(file, ren);
                 SDL_free(file);
             }
-            // Keyboard Shortcuts
+            // Hotkeys
             else if (e.type == SDL_KEYDOWN) {
                 if (e.key.keysym.sym == SDLK_SPACE) {
                     g_daw.is_playing = !g_daw.is_playing;
@@ -429,7 +527,6 @@ int main(int argc, char *argv[]) {
                 } else if (e.key.keysym.sym == SDLK_HOME) {
                     g_daw.playhead_seconds = 0.0;
                 } else if (e.key.keysym.sym == SDLK_s) {
-                    // Split item at playhead
                     double cur_t = g_daw.playhead_seconds;
                     for (int i = 0; i < g_daw.num_items; i++) {
                         AudioItem *it = &g_daw.items[i];
@@ -457,7 +554,7 @@ int main(int argc, char *argv[]) {
             else if (e.type == SDL_MOUSEBUTTONDOWN) {
                 int mx = e.button.x, my = e.button.y;
 
-                // 1. Floating Video Window Header Dragging & Close
+                // 1. Video Window Dragging & Close
                 if (g_daw.video.is_open && mx >= g_daw.video.rect.x && mx <= g_daw.video.rect.x + g_daw.video.rect.w &&
                     my >= g_daw.video.rect.y && my <= g_daw.video.rect.y + g_daw.video.rect.h) {
                     if (mx >= g_daw.video.rect.x + g_daw.video.rect.w - 24 && my <= g_daw.video.rect.y + 24) {
@@ -514,7 +611,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // 5. TCP Volume & Mute/Solo
+                // 5. TCP Controls
                 if (mx < TCP_WIDTH && my > TOPBAR_HEIGHT + RULER_HEIGHT) {
                     int trk = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) / g_daw.track_height;
                     if (trk >= 0 && trk < g_daw.num_tracks) {
@@ -667,7 +764,7 @@ int main(int argc, char *argv[]) {
         SDL_RenderFillRect(ren, &btn_play);
         draw_text(ren, g_daw.is_playing ? "Stop" : "Play", 675, 12, c_white);
 
-        draw_text(ren, "[Real Peaks Active | Hardware Video Renderer]", win_w - 390, 12, c_muted);
+        draw_text(ren, "[Real Peaks | Audio Streaming | Video Active]", win_w - 380, 12, c_muted);
 
         // Timeline Clip Region
         SDL_Rect timeline_clip = { TCP_WIDTH, TOPBAR_HEIGHT + RULER_HEIGHT, view_w, view_h };
@@ -689,7 +786,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderDrawLine(ren, TCP_WIDTH, ty, TCP_WIDTH + view_w, ty);
         }
 
-        // 3. Render Real Audio Waveforms (REAPER-Style from Peak Cache)
+        // 3. Render Real Audio Waveforms
         for (int i = 0; i < g_daw.num_items; i++) {
             AudioItem *it = &g_daw.items[i];
             int ix = TCP_WIDTH + (int)((it->start_time - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
@@ -705,7 +802,6 @@ int main(int argc, char *argv[]) {
             SDL_SetRenderDrawColor(ren, it->is_selected ? 0 : 80, it->is_selected ? 220 : 150, it->is_selected ? 190 : 160, 255);
             SDL_RenderDrawRect(ren, &clip_r);
 
-            // True min/max sample envelope rendering
             int mid_y = iy + ih / 2;
             SDL_SetRenderDrawColor(ren, 100, 220, 175, 255);
 
@@ -756,7 +852,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderDrawLine(ren, rx, TOPBAR_HEIGHT, rx, TOPBAR_HEIGHT + RULER_HEIGHT);
         }
 
-        // 6. Track Control Panels (Sidebar)
+        // 6. Track Control Panels
         SDL_Rect tcp_clip = { 0, TOPBAR_HEIGHT + RULER_HEIGHT, TCP_WIDTH, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
 
@@ -817,7 +913,7 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(ren, 75, 75, 75, 255);
         SDL_RenderFillRect(ren, &thumb_v);
 
-        // 9. Floating Video Window (Hardware-Accelerated Frame Rendering)
+        // 9. Floating Video Window
         if (g_daw.video.is_open) {
             SDL_Rect s_rect = { g_daw.video.rect.x + 4, g_daw.video.rect.y + 4, g_daw.video.rect.w, g_daw.video.rect.h };
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
@@ -833,7 +929,6 @@ int main(int argc, char *argv[]) {
 
             SDL_Rect v_canvas = { g_daw.video.rect.x, g_daw.video.rect.y + 24, g_daw.video.rect.w, g_daw.video.rect.h - 24 };
 
-            // Render live decoded video frame
             if (g_daw.video.texture) {
                 SDL_RenderCopy(ren, g_daw.video.texture, NULL, &v_canvas);
             } else {
@@ -847,6 +942,7 @@ int main(int argc, char *argv[]) {
         SDL_Delay(16);
     }
 
+    if (g_daw.audio_device > 0) SDL_CloseAudioDevice(g_daw.audio_device);
     close_video_stream();
     for (int i = 0; i < g_daw.num_items; i++) {
         if (g_daw.items[i].peaks) free(g_daw.items[i].peaks);
