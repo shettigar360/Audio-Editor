@@ -1,6 +1,14 @@
 #ifndef DAW_TYPES_H
 #define DAW_TYPES_H
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <dwmapi.h>
+#endif
+
 #include <SDL2/SDL.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -11,17 +19,27 @@
 #include "video_player.h"
 #include "audio_engine.h"
 
-#define RULER_HEIGHT 34
-#define TOPBAR_HEIGHT 38
+#define TABBAR_HEIGHT 28
+#define TOPBAR_HEIGHT 36
+#define RULER_HEIGHT 28
+#define MARKER_BAR_HEIGHT 22
 #define SCROLLBAR_SIZE 16
 #define MAX_UNDO_STACK 32
 #define MAX_SCRIPTS 32
+#define MAX_TABS 8
+#define MAX_MARKERS 64
+
+typedef struct {
+    double time_sec;
+    char text[64];
+    bool is_editing;
+} DawMarker;
 
 typedef struct {
     char name[64];
     char filepath[260];
     char shortcut[16];
-    bool is_python; // true = Python, false = Lua
+    bool is_python;
 } DawScript;
 
 typedef struct {
@@ -37,13 +55,14 @@ typedef struct {
 } UndoRedoManager;
 
 typedef struct {
+    char project_name[64];
+    char project_path[512];
     Track tracks[MAX_TRACKS];
     char track_names[MAX_TRACKS][64];
     float track_db[MAX_TRACKS];
     int track_heights[MAX_TRACKS];
     bool track_selected[MAX_TRACKS];
     int num_tracks;
-    int tcp_width;
 
     AudioItem items[MAX_ITEMS];
     int num_items;
@@ -53,9 +72,21 @@ typedef struct {
     int scroll_y_px;
     float pixels_per_second;
     double project_duration_sec;
+
+    DawMarker markers[MAX_MARKERS];
+    int num_markers;
+
     SimpleVideoPlayer video;
-    SDL_AudioDeviceID audio_device;
     UndoRedoManager undo_mgr;
+} ProjectTab;
+
+typedef struct {
+    ProjectTab tabs[MAX_TABS];
+    int num_tabs;
+    int active_tab;
+    int tcp_width;
+
+    SDL_AudioDeviceID audio_device;
 
     // Scripts
     DawScript scripts[MAX_SCRIPTS];
@@ -64,18 +95,24 @@ typedef struct {
     bool script_manager_is_python;
     int script_selected_idx;
 
-    // Menu States
+    // Menus
     bool menu_file_open;
     bool menu_action_open;
     bool submenu_export_audio_open;
     bool submenu_export_video_open;
 
-    // In-place track name editing
+    // Renaming states
     int editing_track_name_idx;
     char editing_name_buf[64];
+    int editing_marker_idx;
+    char editing_marker_buf[64];
 } DawEngine;
 
 extern DawEngine g_daw;
+
+static inline ProjectTab* get_cur_tab(void) {
+    return &g_daw.tabs[g_daw.active_tab];
+}
 
 static inline float db_to_linear(float db) {
     if (db <= -60.0f) return 0.0f;
@@ -92,45 +129,48 @@ static inline void format_timecode(double seconds, char *out, size_t max_len) {
 }
 
 static inline void push_undo_state(void) {
-    if (g_daw.undo_mgr.head < MAX_UNDO_STACK - 1) {
-        g_daw.undo_mgr.head++;
+    ProjectTab *p = get_cur_tab();
+    if (p->undo_mgr.head < MAX_UNDO_STACK - 1) {
+        p->undo_mgr.head++;
     } else {
         for (int i = 0; i < MAX_UNDO_STACK - 1; i++) {
-            g_daw.undo_mgr.history[i] = g_daw.undo_mgr.history[i + 1];
+            p->undo_mgr.history[i] = p->undo_mgr.history[i + 1];
         }
     }
-    DawSnapshot *snap = &g_daw.undo_mgr.history[g_daw.undo_mgr.head];
-    snap->num_items = g_daw.num_items;
-    snap->num_tracks = g_daw.num_tracks;
-    memcpy(snap->items, g_daw.items, sizeof(AudioItem) * g_daw.num_items);
-    g_daw.undo_mgr.count = g_daw.undo_mgr.head + 1;
+    DawSnapshot *snap = &p->undo_mgr.history[p->undo_mgr.head];
+    snap->num_items = p->num_items;
+    snap->num_tracks = p->num_tracks;
+    memcpy(snap->items, p->items, sizeof(AudioItem) * p->num_items);
+    p->undo_mgr.count = p->undo_mgr.head + 1;
 }
 
 static inline void perform_undo(void) {
-    if (g_daw.undo_mgr.head > 0) {
-        g_daw.undo_mgr.head--;
-        DawSnapshot *snap = &g_daw.undo_mgr.history[g_daw.undo_mgr.head];
-        g_daw.num_items = snap->num_items;
-        g_daw.num_tracks = snap->num_tracks;
-        memcpy(g_daw.items, snap->items, sizeof(AudioItem) * snap->num_items);
-        for (int i = 0; i < g_daw.num_items; i++) {
-            if (!g_daw.items[i].raw_file_handle) {
-                g_daw.items[i].raw_file_handle = fopen(g_daw.items[i].raw_audio_path, "rb");
+    ProjectTab *p = get_cur_tab();
+    if (p->undo_mgr.head > 0) {
+        p->undo_mgr.head--;
+        DawSnapshot *snap = &p->undo_mgr.history[p->undo_mgr.head];
+        p->num_items = snap->num_items;
+        p->num_tracks = snap->num_tracks;
+        memcpy(p->items, snap->items, sizeof(AudioItem) * snap->num_items);
+        for (int i = 0; i < p->num_items; i++) {
+            if (!p->items[i].raw_file_handle) {
+                p->items[i].raw_file_handle = fopen(p->items[i].raw_audio_path, "rb");
             }
         }
     }
 }
 
 static inline void perform_redo(void) {
-    if (g_daw.undo_mgr.head + 1 < g_daw.undo_mgr.count) {
-        g_daw.undo_mgr.head++;
-        DawSnapshot *snap = &g_daw.undo_mgr.history[g_daw.undo_mgr.head];
-        g_daw.num_items = snap->num_items;
-        g_daw.num_tracks = snap->num_tracks;
-        memcpy(g_daw.items, snap->items, sizeof(AudioItem) * snap->num_items);
-        for (int i = 0; i < g_daw.num_items; i++) {
-            if (!g_daw.items[i].raw_file_handle) {
-                g_daw.items[i].raw_file_handle = fopen(g_daw.items[i].raw_audio_path, "rb");
+    ProjectTab *p = get_cur_tab();
+    if (p->undo_mgr.head + 1 < p->undo_mgr.count) {
+        p->undo_mgr.head++;
+        DawSnapshot *snap = &p->undo_mgr.history[p->undo_mgr.head];
+        p->num_items = snap->num_items;
+        p->num_tracks = snap->num_tracks;
+        memcpy(p->items, snap->items, sizeof(AudioItem) * snap->num_items);
+        for (int i = 0; i < p->num_items; i++) {
+            if (!p->items[i].raw_file_handle) {
+                p->items[i].raw_file_handle = fopen(p->items[i].raw_audio_path, "rb");
             }
         }
     }
