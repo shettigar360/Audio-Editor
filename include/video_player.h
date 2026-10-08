@@ -13,6 +13,7 @@ typedef struct {
     SDL_Rect rect;
     bool is_open;
     bool is_dragging;
+    bool is_resizing;
     int drag_x;
     int drag_y;
     char file_path[512];
