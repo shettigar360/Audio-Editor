@@ -43,7 +43,7 @@ typedef struct {
     PeakBin *peaks;
     int peak_count;
     float *audio_samples;       // Interleaved stereo 32-bit float PCM
-    int64_t total_sample_pairs; // Total frames
+    int64_t total_sample_pairs; // Total audio sample frames
     bool is_selected;
 } AudioItem;
 
@@ -200,7 +200,7 @@ int load_audio_and_generate_peaks(const char *filepath, AudioItem *item) {
     return 0;
 }
 
-// Low-latency stutter-free mixer loop
+// Low-latency stutter-free audio playback callback
 void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
     DawEngine *eng = (DawEngine *)userdata;
     float *out = (float *)stream;
@@ -317,39 +317,54 @@ int open_video_stream(const char *filepath, SDL_Renderer *ren) {
     return 0;
 }
 
-void render_video_frame(double target_seconds) {
+// Fluid video frame updater: linear decode during playback, seek only when scrubbing or paused
+void render_video_frame(double target_seconds, bool is_scrubbing) {
     if (!g_daw.video.fmt_ctx || g_daw.video.video_stream_idx == -1 || !g_daw.video.sws_ctx) return;
 
-    if (fabs(target_seconds - g_daw.video.last_seek_time) > 0.04) {
-        int64_t target_ts = (int64_t)(target_seconds * AV_TIME_BASE);
-        av_seek_frame(g_daw.video.fmt_ctx, -1, target_ts, AVSEEK_FLAG_BACKWARD);
+    AVStream *v_stream = g_daw.video.fmt_ctx->streams[g_daw.video.video_stream_idx];
+    double time_base = av_q2d(v_stream->time_base);
+
+    // Only seek when scrubbed or if timestamp drifts significantly
+    if (is_scrubbing || fabs(target_seconds - g_daw.video.last_seek_time) > 1.0) {
+        int64_t target_ts = (int64_t)(target_seconds / time_base);
+        av_seek_frame(g_daw.video.fmt_ctx, g_daw.video.video_stream_idx, target_ts, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(g_daw.video.codec_ctx);
+    }
 
-        AVPacket *pkt = av_packet_alloc();
-        bool frame_found = false;
+    AVPacket *pkt = av_packet_alloc();
+    bool frame_updated = false;
 
-        while (av_read_frame(g_daw.video.fmt_ctx, pkt) >= 0) {
-            if (pkt->stream_index == g_daw.video.video_stream_idx) {
-                if (avcodec_send_packet(g_daw.video.codec_ctx, pkt) == 0) {
-                    if (avcodec_receive_frame(g_daw.video.codec_ctx, g_daw.video.frame_yuv) == 0) {
-                        sws_scale(g_daw.video.sws_ctx,
-                                  (uint8_t const *const *)g_daw.video.frame_yuv->data,
-                                  g_daw.video.frame_yuv->linesize, 0, g_daw.video.height,
-                                  g_daw.video.frame_rgb->data, g_daw.video.frame_rgb->linesize);
+    // Decode forward sequentially until reaching current timeline position
+    while (av_read_frame(g_daw.video.fmt_ctx, pkt) >= 0) {
+        if (pkt->stream_index == g_daw.video.video_stream_idx) {
+            if (avcodec_send_packet(g_daw.video.codec_ctx, pkt) == 0) {
+                while (avcodec_receive_frame(g_daw.video.codec_ctx, g_daw.video.frame_yuv) == 0) {
+                    double pts_sec = g_daw.video.frame_yuv->pts * time_base;
 
-                        SDL_UpdateTexture(g_daw.video.texture, NULL,
-                                          g_daw.video.frame_rgb->data[0],
-                                          g_daw.video.frame_rgb->linesize[0]);
-                        frame_found = true;
+                    sws_scale(g_daw.video.sws_ctx,
+                              (uint8_t const *const *)g_daw.video.frame_yuv->data,
+                              g_daw.video.frame_yuv->linesize, 0, g_daw.video.height,
+                              g_daw.video.frame_rgb->data, g_daw.video.frame_rgb->linesize);
+
+                    SDL_UpdateTexture(g_daw.video.texture, NULL,
+                                      g_daw.video.frame_rgb->data[0],
+                                      g_daw.video.frame_rgb->linesize[0]);
+
+                    g_daw.video.last_seek_time = pts_sec;
+                    frame_updated = true;
+
+                    if (pts_sec >= target_seconds) {
+                        break;
                     }
                 }
             }
-            av_packet_unref(pkt);
-            if (frame_found) break;
         }
-        av_packet_free(&pkt);
-        g_daw.video.last_seek_time = target_seconds;
+        av_packet_unref(pkt);
+        if (frame_updated && g_daw.video.last_seek_time >= target_seconds) {
+            break;
+        }
     }
+    av_packet_free(&pkt);
 }
 
 void open_file_dialog(char *out_path, int max_len) {
@@ -389,7 +404,7 @@ int main(int argc, char *argv[]) {
         g_daw.tracks[i].volume = 0.8f;
     }
 
-    // Configure 48kHz audio output
+    // Initialize 48kHz audio output
     SDL_AudioSpec want, have;
     SDL_zero(want);
     want.freq = SAMPLE_RATE;
@@ -692,7 +707,7 @@ int main(int argc, char *argv[]) {
 
         // Render video frame synchronized with playhead
         if (g_daw.video.is_open && g_daw.video.video_stream_idx != -1) {
-            render_video_frame(g_daw.playhead_seconds);
+            render_video_frame(g_daw.playhead_seconds, scrubbing || !g_daw.is_playing);
         }
 
         // ================= RENDERING =================
@@ -729,7 +744,7 @@ int main(int argc, char *argv[]) {
         SDL_RenderFillRect(ren, &btn_play);
         draw_text(ren, g_daw.is_playing ? "Stop" : "Play", 675, 12, c_white);
 
-        draw_text(ren, "[Low-Latency Realtime Audio Output]", win_w - 320, 12, c_muted);
+        draw_text(ren, "[Fluid Video Playback & Zero-Latency Audio]", win_w - 380, 12, c_muted);
 
         // Timeline Clip Region
         SDL_Rect timeline_clip = { TCP_WIDTH, TOPBAR_HEIGHT + RULER_HEIGHT, view_w, view_h };
@@ -856,7 +871,7 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // Compact Horizontal Scrollbar
+        // Compact Horizontal Scrollbar (Clamped 48px to 120px)
         SDL_Rect bar_h = { TCP_WIDTH, win_h - SCROLLBAR_SIZE, view_w, SCROLLBAR_SIZE };
         SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
         SDL_RenderFillRect(ren, &bar_h);
