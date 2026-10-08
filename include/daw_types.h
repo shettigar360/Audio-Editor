@@ -13,9 +13,16 @@
 
 #define RULER_HEIGHT 34
 #define TOPBAR_HEIGHT 38
-#define TCP_WIDTH 190
 #define SCROLLBAR_SIZE 16
 #define MAX_UNDO_STACK 32
+#define MAX_SCRIPTS 32
+
+typedef struct {
+    char name[64];
+    char filepath[260];
+    char shortcut[16];
+    bool is_python; // true = Python, false = Lua
+} DawScript;
 
 typedef struct {
     AudioItem items[MAX_ITEMS];
@@ -31,9 +38,13 @@ typedef struct {
 
 typedef struct {
     Track tracks[MAX_TRACKS];
+    char track_names[MAX_TRACKS][64];
     float track_db[MAX_TRACKS];
+    int track_heights[MAX_TRACKS];
     bool track_selected[MAX_TRACKS];
     int num_tracks;
+    int tcp_width;
+
     AudioItem items[MAX_ITEMS];
     int num_items;
     double playhead_seconds;
@@ -41,16 +52,27 @@ typedef struct {
     double scroll_x_sec;
     int scroll_y_px;
     float pixels_per_second;
-    int track_height;
     double project_duration_sec;
     SimpleVideoPlayer video;
     SDL_AudioDeviceID audio_device;
     UndoRedoManager undo_mgr;
 
+    // Scripts
+    DawScript scripts[MAX_SCRIPTS];
+    int num_scripts;
+    bool script_manager_open;
+    bool script_manager_is_python;
+    int script_selected_idx;
+
     // Menu States
     bool menu_file_open;
+    bool menu_action_open;
     bool submenu_export_audio_open;
     bool submenu_export_video_open;
+
+    // In-place track name editing
+    int editing_track_name_idx;
+    char editing_name_buf[64];
 } DawEngine;
 
 extern DawEngine g_daw;
