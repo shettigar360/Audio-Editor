@@ -28,10 +28,78 @@ typedef struct {
     int scroll_y_px;
     float pixels_per_second;
     int track_height;
+    double project_duration_sec;
     SimpleVideoPlayer video;
+    SDL_AudioDeviceID audio_device;
 } DawEngine;
 
 static DawEngine g_daw;
+
+// Low-latency streaming callback: reads directly from files with 0 RAM waste
+void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
+    DawEngine *eng = (DawEngine *)userdata;
+    float *out = (float *)stream;
+    int frames_needed = len / (sizeof(float) * 2);
+    memset(stream, 0, len);
+
+    if (!eng->is_playing) return;
+
+    bool any_solo = false;
+    for (int t = 0; t < eng->num_tracks; t++) {
+        if (eng->tracks[t].solo) { any_solo = true; break; }
+    }
+
+    double st = eng->playhead_seconds;
+    double et = st + ((double)frames_needed / SAMPLE_RATE);
+
+    for (int i = 0; i < eng->num_items; i++) {
+        AudioItem *it = &eng->items[i];
+        if (!it->play_fmt) continue;
+
+        Track *tr = &eng->tracks[it->track_idx];
+        if (tr->mute) continue;
+        if (any_solo && !tr->solo) continue;
+
+        double it_s = it->start_time;
+        double it_e = it->start_time + it->duration;
+
+        if (it_e > st && it_s < et) {
+            double req_seek_sec = (st - it_s) + it->offset_in_file;
+            if (fabs(it->play_current_sec - req_seek_sec) > 0.3) {
+                int64_t target_ts = (int64_t)(req_seek_sec * AV_TIME_BASE);
+                av_seek_frame(it->play_fmt, -1, target_ts, AVSEEK_FLAG_BACKWARD);
+                avcodec_flush_buffers(it->play_ctx);
+                it->play_current_sec = req_seek_sec;
+            }
+
+            AVPacket *pkt = av_packet_alloc();
+            AVFrame *frame = av_frame_alloc();
+            float temp_buf[2048];
+            int filled = 0;
+
+            while (av_read_frame(it->play_fmt, pkt) >= 0 && filled < frames_needed) {
+                if (pkt->stream_index == it->audio_stream_idx) {
+                    if (avcodec_send_packet(it->play_ctx, pkt) == 0) {
+                        while (avcodec_receive_frame(it->play_ctx, frame) == 0 && filled < frames_needed) {
+                            uint8_t *out_p[2] = { (uint8_t *)temp_buf, NULL };
+                            int conv = swr_convert(it->play_swr, out_p, 1024, (const uint8_t **)frame->extended_data, frame->nb_samples);
+                            for (int f = 0; f < conv && filled < frames_needed; f++) {
+                                out[filled * 2]     += temp_buf[f * 2] * tr->volume;
+                                out[filled * 2 + 1] += temp_buf[f * 2 + 1] * tr->volume;
+                                filled++;
+                            }
+                            it->play_current_sec += (double)conv / SAMPLE_RATE;
+                        }
+                    }
+                }
+                av_packet_unref(pkt);
+            }
+            av_frame_free(&frame);
+            av_packet_free(&pkt);
+        }
+    }
+    eng->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
+}
 
 void open_file_dialog(char *out_path, int max_len) {
     OPENFILENAMEA ofn;
@@ -47,7 +115,7 @@ void open_file_dialog(char *out_path, int max_len) {
 }
 
 int main(int argc, char *argv[]) {
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) return 1;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
 
     SDL_Window *win = SDL_CreateWindow(
         "[unsaved project] - Professional Multitrack DAW",
@@ -60,12 +128,25 @@ int main(int argc, char *argv[]) {
     g_daw.num_tracks = 4;
     g_daw.pixels_per_second = 80.0f;
     g_daw.track_height = 80;
+    g_daw.project_duration_sec = 300.0; // Default 5 minutes, expands dynamically
     g_daw.video = (SimpleVideoPlayer){ .rect = { 650, 160, 480, 310 }, .is_open = false, .video_stream_idx = -1 };
 
     for (int i = 0; i < MAX_TRACKS; i++) {
         g_daw.tracks[i].id = i + 1;
         g_daw.tracks[i].volume = 0.8f;
     }
+
+    // Initialize 48 kHz stereo audio device
+    SDL_AudioSpec want;
+    SDL_zero(want);
+    want.freq = SAMPLE_RATE;
+    want.format = AUDIO_F32;
+    want.channels = 2;
+    want.samples = 1024;
+    want.callback = audio_mixer_callback;
+    want.userdata = &g_daw;
+    g_daw.audio_device = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+    if (g_daw.audio_device > 0) SDL_PauseAudioDevice(g_daw.audio_device, 0);
 
     bool running = true;
     bool dragging_scrollbar_h = false;
@@ -79,28 +160,22 @@ int main(int argc, char *argv[]) {
     double drag_start_mouse_time = 0.0, item_orig_start = 0.0, item_orig_dur = 0.0, item_orig_offset = 0.0;
 
     SDL_Event e;
-    Uint32 last_tick = SDL_GetTicks();
-
     while (running) {
-        Uint32 now = SDL_GetTicks();
-        float delta_time = (now - last_tick) / 1000.0f;
-        last_tick = now;
-
-        if (g_daw.is_playing) {
-            g_daw.playhead_seconds += delta_time;
-        }
-
         int win_w, win_h;
         SDL_GetWindowSize(win, &win_w, &win_h);
         int view_w = win_w - TCP_WIDTH - SCROLLBAR_SIZE;
         int view_h = win_h - TOPBAR_HEIGHT - RULER_HEIGHT - SCROLLBAR_SIZE;
+
+        // Dynamic horizontal timeline width (mirrors vertical track height logic)
+        for (int i = 0; i < g_daw.num_items; i++) {
+            double end_t = g_daw.items[i].start_time + g_daw.items[i].duration + 60.0;
+            if (end_t > g_daw.project_duration_sec) g_daw.project_duration_sec = end_t;
+        }
+        int total_w_timeline = (int)(g_daw.project_duration_sec * g_daw.pixels_per_second);
         int max_h_tracks = g_daw.num_tracks * g_daw.track_height;
 
         while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) {
-                running = false;
-            }
-            // Mouse Wheel Navigation
+            if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_MOUSEWHEEL) {
                 SDL_Keymod mod = SDL_GetModState();
                 int mx, my; SDL_GetMouseState(&mx, &my);
@@ -127,9 +202,7 @@ int main(int argc, char *argv[]) {
                     if (g_daw.scroll_y_px < 0) g_daw.scroll_y_px = 0;
                     if (g_daw.scroll_y_px > max_y_scroll) g_daw.scroll_y_px = max_y_scroll;
                 }
-            }
-            // Drag-and-drop media (Path-only reference, zero media RAM bloat)
-            else if (e.type == SDL_DROPFILE) {
+            } else if (e.type == SDL_DROPFILE) {
                 char *file = e.drop.file;
                 int my = 0; SDL_GetMouseState(NULL, &my);
                 int trk = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) / g_daw.track_height;
@@ -140,15 +213,11 @@ int main(int argc, char *argv[]) {
                     AudioItem *it = &g_daw.items[g_daw.num_items];
                     it->track_idx = trk;
                     it->start_time = g_daw.playhead_seconds;
-                    if (load_media_item_peaks_only(file, it) == 0) {
-                        g_daw.num_items++;
-                    }
+                    if (load_media_item_peaks_only(file, it) == 0) g_daw.num_items++;
                 }
                 open_video_by_path(&g_daw.video, file, ren);
                 SDL_free(file);
-            }
-            // Hotkeys
-            else if (e.type == SDL_KEYDOWN) {
+            } else if (e.type == SDL_KEYDOWN) {
                 if (e.key.keysym.sym == SDLK_SPACE) g_daw.is_playing = !g_daw.is_playing;
                 else if (e.key.keysym.sym == SDLK_v) g_daw.video.is_open = !g_daw.video.is_open;
                 else if (e.key.keysym.sym == SDLK_HOME) { g_daw.playhead_seconds = 0.0; seek_video(&g_daw.video, 0.0); }
@@ -168,40 +237,29 @@ int main(int argc, char *argv[]) {
                                 r_item->duration = it_e - cur_t;
                                 r_item->is_selected = true;
                                 it->is_selected = false;
+                                init_item_audio_stream(r_item);
                                 g_daw.num_items++;
                                 break;
                             }
                         }
                     }
                 }
-            }
-            // Mouse Down
-            else if (e.type == SDL_MOUSEBUTTONDOWN) {
+            } else if (e.type == SDL_MOUSEBUTTONDOWN) {
                 int mx = e.button.x, my = e.button.y;
 
-                // Video Window Drag & Bottom-Right Corner Resize Handling
                 if (g_daw.video.is_open && mx >= g_daw.video.rect.x && mx <= g_daw.video.rect.x + g_daw.video.rect.w &&
                     my >= g_daw.video.rect.y && my <= g_daw.video.rect.y + g_daw.video.rect.h) {
-                    
-                    // Resize Grip (bottom-right 16x16 corner)
-                    if (mx >= g_daw.video.rect.x + g_daw.video.rect.w - 18 &&
-                        my >= g_daw.video.rect.y + g_daw.video.rect.h - 18) {
+                    if (mx >= g_daw.video.rect.x + g_daw.video.rect.w - 18 && my >= g_daw.video.rect.y + g_daw.video.rect.h - 18) {
                         g_daw.video.is_resizing = true;
-                    }
-                    // Close button
-                    else if (mx >= g_daw.video.rect.x + g_daw.video.rect.w - 24 && my <= g_daw.video.rect.y + 24) {
+                    } else if (mx >= g_daw.video.rect.x + g_daw.video.rect.w - 24 && my <= g_daw.video.rect.y + 24) {
                         g_daw.video.is_open = false;
-                    }
-                    // Titlebar drag
-                    else if (my <= g_daw.video.rect.y + 24) {
+                    } else if (my <= g_daw.video.rect.y + 24) {
                         g_daw.video.is_dragging = true;
                         g_daw.video.drag_x = mx - g_daw.video.rect.x;
                         g_daw.video.drag_y = my - g_daw.video.rect.y;
                     }
                     continue;
                 }
-
-                // Topbar Actions
                 if (my <= TOPBAR_HEIGHT) {
                     if (mx >= 115 && mx <= 200) g_daw.video.is_open = !g_daw.video.is_open;
                     else if (mx >= 440 && mx <= 550) {
@@ -217,21 +275,15 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Horizontal Scrollbar Click
+                // Horizontal scrollbar click (Mirrors vertical scrollbar logic)
                 if (my >= win_h - SCROLLBAR_SIZE && mx >= TCP_WIDTH && mx < win_w - SCROLLBAR_SIZE) {
-                    float thumb_w = fminf(120.0f, fmaxf(48.0f, (float)view_w * (40.0f / g_daw.pixels_per_second)));
-                    float thumb_x = TCP_WIDTH + (float)(g_daw.scroll_x_sec / 300.0f) * (view_w - thumb_w);
-                    if (mx >= thumb_x && mx <= thumb_x + thumb_w) {
-                        dragging_scrollbar_h = true;
-                        scrollbar_h_start_mx = mx;
-                        orig_scroll_x = g_daw.scroll_x_sec;
-                    } else {
-                        g_daw.scroll_x_sec = fmax(0.0, ((float)(mx - TCP_WIDTH) / (float)view_w) * 300.0f);
-                    }
+                    dragging_scrollbar_h = true;
+                    scrollbar_h_start_mx = mx;
+                    orig_scroll_x = g_daw.scroll_x_sec;
                     continue;
                 }
 
-                // Vertical Scrollbar Click
+                // Vertical scrollbar click
                 if (mx >= win_w - SCROLLBAR_SIZE && my >= TOPBAR_HEIGHT + RULER_HEIGHT && my < win_h - SCROLLBAR_SIZE) {
                     dragging_scrollbar_v = true;
                     scrollbar_v_start_my = my;
@@ -239,7 +291,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // TCP Volume & Mute/Solo
+                // TCP panel controls
                 if (mx < TCP_WIDTH && my > TOPBAR_HEIGHT + RULER_HEIGHT) {
                     int trk = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) / g_daw.track_height;
                     if (trk >= 0 && trk < g_daw.num_tracks) {
@@ -252,25 +304,22 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Scrubbing Timeline
+                // Timeline scrubbing
                 if (mx >= TCP_WIDTH && my > TOPBAR_HEIGHT && my < win_h - SCROLLBAR_SIZE) {
                     scrubbing = true;
                     g_daw.playhead_seconds = fmax(0.0, g_daw.scroll_x_sec + (double)(mx - TCP_WIDTH) / g_daw.pixels_per_second);
                     seek_video(&g_daw.video, g_daw.playhead_seconds);
                     continue;
                 }
-            }
-            else if (e.type == SDL_MOUSEBUTTONUP) {
+            } else if (e.type == SDL_MOUSEBUTTONUP) {
                 g_daw.video.is_dragging = false;
                 g_daw.video.is_resizing = false;
                 dragging_scrollbar_h = false; dragging_scrollbar_v = false;
                 scrubbing = false; active_vol_track = -1;
                 dragging_item_idx = -1; dragging_trim_left = false; dragging_trim_right = false;
-            }
-            else if (e.type == SDL_MOUSEMOTION) {
+            } else if (e.type == SDL_MOUSEMOTION) {
                 int mx = e.motion.x, my = e.motion.y;
 
-                // Dragging or Resizing Video Window
                 if (g_daw.video.is_dragging) {
                     g_daw.video.rect.x = mx - g_daw.video.drag_x;
                     g_daw.video.rect.y = my - g_daw.video.drag_y;
@@ -282,13 +331,24 @@ int main(int argc, char *argv[]) {
                     if (new_h >= 140) g_daw.video.rect.h = new_h;
                 }
 
-                if (dragging_scrollbar_h) g_daw.scroll_x_sec = fmax(0.0, orig_scroll_x + ((float)(mx - scrollbar_h_start_mx) / (float)view_w) * 300.0f);
+                // Horizontal drag math (Identical structure to vertical scrollbar)
+                if (dragging_scrollbar_h) {
+                    float delta = (float)(mx - scrollbar_h_start_mx);
+                    double max_x_scroll = (total_w_timeline > view_w) ? (double)(total_w_timeline - view_w) / g_daw.pixels_per_second : 0.0;
+                    g_daw.scroll_x_sec = orig_scroll_x + (delta / (float)view_w) * (g_daw.project_duration_sec);
+                    if (g_daw.scroll_x_sec < 0) g_daw.scroll_x_sec = 0;
+                    if (g_daw.scroll_x_sec > max_x_scroll) g_daw.scroll_x_sec = max_x_scroll;
+                }
+
+                // Vertical drag math
                 if (dragging_scrollbar_v) {
+                    float delta = (float)(my - scrollbar_v_start_my);
                     int max_y = max_h_tracks - view_h; if (max_y < 0) max_y = 0;
                     g_daw.scroll_y_px = (int)(orig_scroll_y + ((float)(my - scrollbar_v_start_my) / view_h) * max_h_tracks);
                     if (g_daw.scroll_y_px < 0) g_daw.scroll_y_px = 0;
                     if (g_daw.scroll_y_px > max_y) g_daw.scroll_y_px = max_y;
                 }
+
                 if (scrubbing && mx >= TCP_WIDTH && mx < win_w - SCROLLBAR_SIZE) {
                     g_daw.playhead_seconds = fmax(0.0, g_daw.scroll_x_sec + (double)(mx - TCP_WIDTH) / g_daw.pixels_per_second);
                     seek_video(&g_daw.video, g_daw.playhead_seconds);
@@ -333,14 +393,12 @@ int main(int argc, char *argv[]) {
         SDL_RenderFillRect(ren, &btn_play);
         draw_text(ren, g_daw.is_playing ? "Stop" : "Play", 675, 12, c_white);
 
-        draw_text(ren, "[Zero Media in RAM - Peak Cache Active]", win_w - 380, 12, c_muted);
-
         // Timeline Clip Region
         SDL_Rect timeline_clip = { TCP_WIDTH, TOPBAR_HEIGHT + RULER_HEIGHT, view_w, view_h };
         SDL_RenderSetClipRect(ren, &timeline_clip);
 
         int sec_step = (g_daw.pixels_per_second < 40) ? 2 : 1;
-        for (int s = 0; s < 3600; s += sec_step) {
+        for (int s = 0; s < (int)g_daw.project_duration_sec; s += sec_step) {
             int gx = TCP_WIDTH + (int)((s - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
             if (gx < TCP_WIDTH || gx > TCP_WIDTH + view_w) continue;
             SDL_SetRenderDrawColor(ren, 46, 46, 46, 255);
@@ -405,7 +463,7 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
         SDL_RenderFillRect(ren, &ruler);
 
-        for (int s = 0; s < 3600; s += sec_step) {
+        for (int s = 0; s < (int)g_daw.project_duration_sec; s += sec_step) {
             int rx = TCP_WIDTH + (int)((s - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
             if (rx < TCP_WIDTH || rx > TCP_WIDTH + view_w) continue;
             char b_txt[16], t_txt[16];
@@ -455,19 +513,23 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // Scrollbars
+        // --- HORIZONTAL SCROLLBAR (Identical proportional logic to vertical bar) ---
         SDL_Rect bar_h = { TCP_WIDTH, win_h - SCROLLBAR_SIZE, view_w, SCROLLBAR_SIZE };
         SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
         SDL_RenderFillRect(ren, &bar_h);
-        float thumb_w = fminf(120.0f, fmaxf(48.0f, (float)view_w * (40.0f / g_daw.pixels_per_second)));
-        float thumb_x = TCP_WIDTH + (float)(g_daw.scroll_x_sec / 300.0f) * (view_w - thumb_w);
-        SDL_Rect thumb_h = { (int)thumb_x, win_h - SCROLLBAR_SIZE + 2, (int)thumb_w, SCROLLBAR_SIZE - 4 };
-        SDL_SetRenderDrawColor(ren, 85, 85, 85, 255);
+
+        float thumb_w_sz = (total_w_timeline > 0) ? fmaxf(30.0f, (float)view_w * ((float)view_w / total_w_timeline)) : view_w;
+        double max_scroll_sec = (total_w_timeline > view_w) ? (double)(total_w_timeline - view_w) / g_daw.pixels_per_second : 0.0001;
+        float thumb_x = TCP_WIDTH + (max_scroll_sec > 0 ? (float)(g_daw.scroll_x_sec / max_scroll_sec) * (view_w - thumb_w_sz) : 0);
+        SDL_Rect thumb_h = { (int)thumb_x, win_h - SCROLLBAR_SIZE + 2, (int)thumb_w_sz, SCROLLBAR_SIZE - 4 };
+        SDL_SetRenderDrawColor(ren, 75, 75, 75, 255);
         SDL_RenderFillRect(ren, &thumb_h);
 
+        // --- VERTICAL SCROLLBAR ---
         SDL_Rect bar_v = { win_w - SCROLLBAR_SIZE, TOPBAR_HEIGHT + RULER_HEIGHT, SCROLLBAR_SIZE, view_h };
         SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
         SDL_RenderFillRect(ren, &bar_v);
+
         float thumb_h_sz = (max_h_tracks > 0) ? fmaxf(30.0f, (float)view_h * ((float)view_h / max_h_tracks)) : view_h;
         float thumb_y = TOPBAR_HEIGHT + RULER_HEIGHT + (max_h_tracks > view_h ? ((float)g_daw.scroll_y_px / (max_h_tracks - view_h)) * (view_h - thumb_h_sz) : 0);
         SDL_Rect thumb_v = { win_w - SCROLLBAR_SIZE + 2, (int)thumb_y, SCROLLBAR_SIZE - 4, (int)thumb_h_sz };
@@ -485,7 +547,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &v_bar);
 
             SDL_Color c_dark = { 40, 40, 40, 255 };
-            draw_text(ren, "Video Monitor (Drag bottom-right to resize)", g_daw.video.rect.x + 8, g_daw.video.rect.y + 7, c_dark);
+            draw_text(ren, "Video Monitor", g_daw.video.rect.x + 8, g_daw.video.rect.y + 7, c_dark);
             draw_text(ren, "X", g_daw.video.rect.x + g_daw.video.rect.w - 18, g_daw.video.rect.y + 7, c_dark);
 
             SDL_Rect v_canvas = { g_daw.video.rect.x, g_daw.video.rect.y + 24, g_daw.video.rect.w, g_daw.video.rect.h - 24 };
@@ -497,7 +559,6 @@ int main(int argc, char *argv[]) {
                 draw_text(ren, "No Video Stream Loaded", g_daw.video.rect.x + 120, g_daw.video.rect.y + 140, c_muted);
             }
 
-            // Visual Resize Corner Handle (Bottom-Right)
             SDL_Rect resize_handle = { g_daw.video.rect.x + g_daw.video.rect.w - 12, g_daw.video.rect.y + g_daw.video.rect.h - 12, 10, 10 };
             SDL_SetRenderDrawColor(ren, 0, 210, 170, 255);
             SDL_RenderFillRect(ren, &resize_handle);
@@ -507,8 +568,10 @@ int main(int argc, char *argv[]) {
         SDL_Delay(16);
     }
 
+    if (g_daw.audio_device > 0) SDL_CloseAudioDevice(g_daw.audio_device);
     close_video(&g_daw.video);
     for (int i = 0; i < g_daw.num_items; i++) {
+        close_item_audio_stream(&g_daw.items[i]);
         if (g_daw.items[i].peaks) free(g_daw.items[i].peaks);
     }
     SDL_DestroyRenderer(ren);
