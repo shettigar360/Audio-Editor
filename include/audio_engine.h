@@ -27,9 +27,16 @@ typedef struct {
     double file_total_duration;
     char file_path[512];        // Reference path only
     char label[128];
-    PeakBin *peaks;             // Small peak array (< 500 KB)
+    PeakBin *peaks;             // Small peak cache (< 500 KB)
     int peak_count;
     bool is_selected;
+
+    // Streaming playback state (Zero RAM: only keeps current packet)
+    AVFormatContext *play_fmt;
+    AVCodecContext *play_ctx;
+    SwrContext *play_swr;
+    int audio_stream_idx;
+    double play_current_sec;
 } AudioItem;
 
 typedef struct {
@@ -40,7 +47,56 @@ typedef struct {
     float volume;
 } Track;
 
-// Streams file in tiny 4 KB chunks to build exact peaks, then instantly frees all buffers
+// Opens an on-demand audio stream for low-latency playback
+static inline void init_item_audio_stream(AudioItem *it) {
+    if (it->play_fmt) return;
+
+    AVFormatContext *fmt = NULL;
+    if (avformat_open_input(&fmt, it->file_path, NULL, NULL) < 0) return;
+    if (avformat_find_stream_info(fmt, NULL) < 0) { avformat_close_input(&fmt); return; }
+
+    int a_idx = -1;
+    for (unsigned int i = 0; i < fmt->nb_streams; i++) {
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            a_idx = i;
+            break;
+        }
+    }
+    if (a_idx == -1) { avformat_close_input(&fmt); return; }
+
+    AVCodecParameters *cpar = fmt->streams[a_idx]->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(cpar->codec_id);
+    if (!codec) { avformat_close_input(&fmt); return; }
+
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(ctx, cpar);
+    if (avcodec_open2(ctx, codec, NULL) < 0) {
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return;
+    }
+
+    SwrContext *swr = swr_alloc();
+    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
+    swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, SAMPLE_RATE,
+                        &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, 0, NULL);
+    swr_init(swr);
+
+    it->play_fmt = fmt;
+    it->play_ctx = ctx;
+    it->play_swr = swr;
+    it->audio_stream_idx = a_idx;
+    it->play_current_sec = 0.0;
+}
+
+static inline void close_item_audio_stream(AudioItem *it) {
+    if (it->play_swr) { swr_free(&it->play_swr); it->play_swr = NULL; }
+    if (it->play_ctx) { avcodec_free_context(&it->play_ctx); it->play_ctx = NULL; }
+    if (it->play_fmt) { avformat_close_input(&it->play_fmt); it->play_fmt = NULL; }
+    it->audio_stream_idx = -1;
+}
+
+// Extract peaks cleanly on load without saving PCM buffer
 static inline int load_media_item_peaks_only(const char *filepath, AudioItem *item) {
     AVFormatContext *fmt = NULL;
     if (avformat_open_input(&fmt, filepath, NULL, NULL) < 0) return -1;
@@ -83,7 +139,6 @@ static inline int load_media_item_peaks_only(const char *filepath, AudioItem *it
     float cur_min = 0.0f, cur_max = 0.0f;
     int samples_in_bin = 0;
 
-    // Stream-decode in tiny chunks: zero media audio stored in RAM
     while (av_read_frame(fmt, pkt) >= 0) {
         if (pkt->stream_index == a_idx) {
             if (avcodec_send_packet(ctx, pkt) == 0) {
@@ -117,7 +172,7 @@ static inline int load_media_item_peaks_only(const char *filepath, AudioItem *it
     av_packet_free(&pkt);
     swr_free(&swr);
     avcodec_free_context(&ctx);
-    avformat_close_input(&fmt); // Closed immediately! 0 RAM allocated for media
+    avformat_close_input(&fmt);
 
     item->peaks = peak_cache;
     item->peak_count = current_bin;
@@ -130,6 +185,8 @@ static inline int load_media_item_peaks_only(const char *filepath, AudioItem *it
     const char *name = strrchr(filepath, '\\');
     if (!name) name = strrchr(filepath, '/');
     snprintf(item->label, sizeof(item->label), "%s", name ? name + 1 : filepath);
+
+    init_item_audio_stream(item);
     return 0;
 }
 
