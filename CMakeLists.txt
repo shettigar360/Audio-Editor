@@ -25,7 +25,7 @@ add_executable(audio_editor src/main.c)
 
 if(WIN32)
     target_link_options(audio_editor PRIVATE -mwindows)
-    target_link_libraries(audio_editor PRIVATE comdlg32 m)
+    target_link_libraries(audio_editor PRIVATE comdlg32 dwmapi m)
 endif()
 
 target_include_directories(audio_editor PRIVATE
