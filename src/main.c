@@ -5,112 +5,15 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
-#include <windows.h>
-#include <commdlg.h>
 
 #include "font.h"
 #include "video_player.h"
 #include "audio_engine.h"
+#include "daw_types.h"
+#include "project_io.h"
 
-#define RULER_HEIGHT 34
-#define TOPBAR_HEIGHT 38
-#define TCP_WIDTH 190
-#define SCROLLBAR_SIZE 16
-#define MAX_UNDO_STACK 32
+DawEngine g_daw;
 
-// ----------------- UNDO / REDO STATE SNAPSHOT -----------------
-typedef struct {
-    AudioItem items[MAX_ITEMS];
-    int num_items;
-    int num_tracks;
-} DawSnapshot;
-
-typedef struct {
-    DawSnapshot history[MAX_UNDO_STACK];
-    int head;
-    int count;
-} UndoRedoManager;
-
-// ----------------- DAW MAIN ENGINE -----------------
-typedef struct {
-    Track tracks[MAX_TRACKS];
-    float track_db[MAX_TRACKS]; // Stored in decibels (-inf to +12 dB)
-    int num_tracks;
-    AudioItem items[MAX_ITEMS];
-    int num_items;
-    double playhead_seconds;
-    bool is_playing;
-    double scroll_x_sec;
-    int scroll_y_px;
-    float pixels_per_second;
-    int track_height;
-    double project_duration_sec;
-    SimpleVideoPlayer video;
-    SDL_AudioDeviceID audio_device;
-    UndoRedoManager undo_mgr;
-
-    // Menu States
-    bool menu_file_open;
-    bool submenu_export_audio_open;
-    bool submenu_export_video_open;
-} DawEngine;
-
-static DawEngine g_daw;
-
-// Save current DAW state for undo
-void push_undo_state() {
-    if (g_daw.undo_mgr.head < MAX_UNDO_STACK - 1) {
-        g_daw.undo_mgr.head++;
-    } else {
-        // Shift left
-        for (int i = 0; i < MAX_UNDO_STACK - 1; i++) {
-            g_daw.undo_mgr.history[i] = g_daw.undo_mgr.history[i + 1];
-        }
-    }
-    DawSnapshot *snap = &g_daw.undo_mgr.history[g_daw.undo_mgr.head];
-    snap->num_items = g_daw.num_items;
-    snap->num_tracks = g_daw.num_tracks;
-    memcpy(snap->items, g_daw.items, sizeof(AudioItem) * g_daw.num_items);
-    g_daw.undo_mgr.count = g_daw.undo_mgr.head + 1;
-}
-
-void perform_undo() {
-    if (g_daw.undo_mgr.head > 0) {
-        g_daw.undo_mgr.head--;
-        DawSnapshot *snap = &g_daw.undo_mgr.history[g_daw.undo_mgr.head];
-        g_daw.num_items = snap->num_items;
-        g_daw.num_tracks = snap->num_tracks;
-        memcpy(g_daw.items, snap->items, sizeof(AudioItem) * snap->num_items);
-        for (int i = 0; i < g_daw.num_items; i++) {
-            if (!g_daw.items[i].raw_file_handle) {
-                g_daw.items[i].raw_file_handle = fopen(g_daw.items[i].raw_audio_path, "rb");
-            }
-        }
-    }
-}
-
-void perform_redo() {
-    if (g_daw.undo_mgr.head + 1 < g_daw.undo_mgr.count) {
-        g_daw.undo_mgr.head++;
-        DawSnapshot *snap = &g_daw.undo_mgr.history[g_daw.undo_mgr.head];
-        g_daw.num_items = snap->num_items;
-        g_daw.num_tracks = snap->num_tracks;
-        memcpy(g_daw.items, snap->items, sizeof(AudioItem) * snap->num_items);
-        for (int i = 0; i < g_daw.num_items; i++) {
-            if (!g_daw.items[i].raw_file_handle) {
-                g_daw.items[i].raw_file_handle = fopen(g_daw.items[i].raw_audio_path, "rb");
-            }
-        }
-    }
-}
-
-// Convert decibels to linear amplitude multiplier
-static inline float db_to_linear(float db) {
-    if (db <= -60.0f) return 0.0f;
-    return powf(10.0f, db / 20.0f);
-}
-
-// ----------------- AUDIO MIXER CALLBACK -----------------
 void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
     DawEngine *eng = (DawEngine *)userdata;
     float *out = (float *)stream;
@@ -136,7 +39,6 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
         if (any_solo && !tr->solo) continue;
 
         float linear_gain = db_to_linear(eng->track_db[it->track_idx]);
-
         double it_s = it->start_time;
         double it_e = it->start_time + it->duration;
 
@@ -156,119 +58,6 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
     eng->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
 }
 
-// ----------------- FILE DIALOG HELPERS -----------------
-bool open_generic_dialog(char *out_path, int max_len, const char *filter, bool is_save) {
-    OPENFILENAMEA ofn;
-    char szFile[MAX_PATH] = {0};
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile);
-    ofn.lpstrFilter = filter;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (is_save) {
-        ofn.Flags |= OFN_OVERWRITEPROMPT;
-        if (GetSaveFileNameA(&ofn)) { strncpy(out_path, szFile, max_len); return true; }
-    } else {
-        ofn.Flags |= OFN_FILEMUSTEXIST;
-        if (GetOpenFileNameA(&ofn)) { strncpy(out_path, szFile, max_len); return true; }
-    }
-    return false;
-}
-
-// ----------------- PROJECT & EXPORT HANDLERS -----------------
-void save_project_file() {
-    char p[MAX_PATH];
-    if (open_generic_dialog(p, sizeof(p), "DAW Project (*.dawproj)\0*.dawproj\0", true)) {
-        FILE *f = fopen(p, "wb");
-        if (f) {
-            fwrite(&g_daw.num_tracks, sizeof(int), 1, f);
-            fwrite(&g_daw.num_items, sizeof(int), 1, f);
-            fwrite(g_daw.track_db, sizeof(float), MAX_TRACKS, f);
-            for (int i = 0; i < g_daw.num_items; i++) {
-                fwrite(&g_daw.items[i].track_idx, sizeof(int), 1, f);
-                fwrite(&g_daw.items[i].start_time, sizeof(double), 1, f);
-                fwrite(&g_daw.items[i].offset_in_file, sizeof(double), 1, f);
-                fwrite(&g_daw.items[i].duration, sizeof(double), 1, f);
-                fwrite(g_daw.items[i].file_path, 512, 1, f);
-            }
-            fclose(f);
-        }
-    }
-}
-
-void load_project_file(SDL_Renderer *ren) {
-    char p[MAX_PATH];
-    if (open_generic_dialog(p, sizeof(p), "DAW Project (*.dawproj)\0*.dawproj\0", false)) {
-        FILE *f = fopen(p, "rb");
-        if (f) {
-            push_undo_state();
-            fread(&g_daw.num_tracks, sizeof(int), 1, f);
-            fread(&g_daw.num_items, sizeof(int), 1, f);
-            fread(g_daw.track_db, sizeof(float), MAX_TRACKS, f);
-            for (int i = 0; i < g_daw.num_items; i++) {
-                AudioItem *it = &g_daw.items[i];
-                fread(&it->track_idx, sizeof(int), 1, f);
-                fread(&it->start_time, sizeof(double), 1, f);
-                fread(&it->offset_in_file, sizeof(double), 1, f);
-                fread(&it->duration, sizeof(double), 1, f);
-                fread(it->file_path, 512, 1, f);
-                process_media_cache(it->file_path, it);
-            }
-            fclose(f);
-        }
-    }
-}
-
-void export_rendered_audio(const char *ext) {
-    char filter[128], path[MAX_PATH];
-    snprintf(filter, sizeof(filter), "Audio Format (*.%s)\0*.%s\0", ext, ext);
-    if (open_generic_dialog(path, sizeof(path), filter, true)) {
-        // Render project mix to standard file using cached audio channels
-        FILE *out_f = fopen(path, "wb");
-        if (out_f) {
-            // Write standard stereo float container or header
-            for (int i = 0; i < g_daw.num_items; i++) {
-                if (g_daw.items[i].raw_file_handle) {
-                    fseek(g_daw.items[i].raw_file_handle, 0, SEEK_SET);
-                    float buf[4096];
-                    size_t r;
-                    while ((r = fread(buf, sizeof(float), 4096, g_daw.items[i].raw_file_handle)) > 0) {
-                        fwrite(buf, sizeof(float), r, out_f);
-                    }
-                    break;
-                }
-            }
-            fclose(out_f);
-        }
-    }
-}
-
-void export_batch_tracks() {
-    char dir[MAX_PATH];
-    if (open_generic_dialog(dir, sizeof(dir), "Batch Stem Folder\0*.*\0", true)) {
-        for (int t = 0; t < g_daw.num_tracks; t++) {
-            char stem_path[MAX_PATH];
-            snprintf(stem_path, sizeof(stem_path), "%s_Track_%d.raw", dir, t + 1);
-            FILE *f_stem = fopen(stem_path, "wb");
-            if (f_stem) {
-                for (int i = 0; i < g_daw.num_items; i++) {
-                    if (g_daw.items[i].track_idx == t && g_daw.items[i].raw_file_handle) {
-                        fseek(g_daw.items[i].raw_file_handle, 0, SEEK_SET);
-                        float buf[4096];
-                        size_t r;
-                        while ((r = fread(buf, sizeof(float), 4096, g_daw.items[i].raw_file_handle)) > 0) {
-                            fwrite(buf, sizeof(float), r, f_stem);
-                        }
-                    }
-                }
-                fclose(f_stem);
-            }
-        }
-    }
-}
-
-// ----------------- APPLICATION MAIN -----------------
 int main(int argc, char *argv[]) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
 
@@ -289,7 +78,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < MAX_TRACKS; i++) {
         g_daw.tracks[i].id = i + 1;
         g_daw.tracks[i].volume = 1.0f;
-        g_daw.track_db[i] = 0.0f; // Default unity 0.0 dB
+        g_daw.track_db[i] = 0.0f;
     }
 
     push_undo_state();
@@ -306,11 +95,10 @@ int main(int argc, char *argv[]) {
     if (g_daw.audio_device > 0) SDL_PauseAudioDevice(g_daw.audio_device, 0);
 
     bool running = true;
-    bool dragging_scrollbar_h = false;
-    bool dragging_scrollbar_v = false;
+    bool dragging_scrollbar_h = false, dragging_scrollbar_v = false;
     int scrollbar_h_start_mx = 0, scrollbar_v_start_my = 0;
     double orig_scroll_x = 0; int orig_scroll_y = 0;
-    bool scrubbing = false;
+    bool scrubbing_ruler = false;
     int dragging_item_idx = -1;
     bool dragging_trim_left = false, dragging_trim_right = false;
     double drag_start_mouse_time = 0.0, item_orig_start = 0.0, item_orig_dur = 0.0, item_orig_offset = 0.0;
@@ -328,6 +116,13 @@ int main(int argc, char *argv[]) {
         }
         int total_w_timeline = (int)(g_daw.project_duration_sec * g_daw.pixels_per_second);
         int max_h_tracks = g_daw.num_tracks * g_daw.track_height;
+
+        if (g_daw.is_playing) {
+            double visible_end_sec = g_daw.scroll_x_sec + ((double)view_w / g_daw.pixels_per_second);
+            if (g_daw.playhead_seconds >= visible_end_sec) {
+                g_daw.scroll_x_sec = g_daw.playhead_seconds;
+            }
+        }
 
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
@@ -375,18 +170,16 @@ int main(int argc, char *argv[]) {
                 SDL_free(file);
             } else if (e.type == SDL_KEYDOWN) {
                 SDL_Keymod mod = SDL_GetModState();
-                if ((mod & KMOD_CTRL) && e.key.keysym.sym == SDLK_z) {
-                    perform_undo();
-                } else if ((mod & KMOD_CTRL) && (e.key.keysym.sym == SDLK_y || ((mod & KMOD_SHIFT) && e.key.keysym.sym == SDLK_z))) {
-                    perform_redo();
-                } else if (e.key.keysym.sym == SDLK_SPACE) {
-                    g_daw.is_playing = !g_daw.is_playing;
-                } else if (e.key.keysym.sym == SDLK_v) {
-                    g_daw.video.is_open = !g_daw.video.is_open;
-                } else if (e.key.keysym.sym == SDLK_HOME) {
-                    g_daw.playhead_seconds = 0.0;
-                    seek_video(&g_daw.video, 0.0);
-                } else if (e.key.keysym.sym == SDLK_s) {
+                if ((mod & KMOD_CTRL) && e.key.keysym.sym == SDLK_z) perform_undo();
+                else if ((mod & KMOD_CTRL) && (e.key.keysym.sym == SDLK_y || ((mod & KMOD_SHIFT) && e.key.keysym.sym == SDLK_z))) perform_redo();
+                else if (e.key.keysym.sym == SDLK_EQUALS || e.key.keysym.sym == SDLK_PLUS || e.key.keysym.sym == SDLK_KP_PLUS)
+                    g_daw.pixels_per_second = fminf(400.0f, g_daw.pixels_per_second * 1.25f);
+                else if (e.key.keysym.sym == SDLK_MINUS || e.key.keysym.sym == SDLK_KP_MINUS)
+                    g_daw.pixels_per_second = fmaxf(15.0f, g_daw.pixels_per_second * 0.8f);
+                else if (e.key.keysym.sym == SDLK_SPACE) g_daw.is_playing = !g_daw.is_playing;
+                else if (e.key.keysym.sym == SDLK_v) g_daw.video.is_open = !g_daw.video.is_open;
+                else if (e.key.keysym.sym == SDLK_HOME) { g_daw.playhead_seconds = 0.0; seek_video(&g_daw.video, 0.0); }
+                else if (e.key.keysym.sym == SDLK_s) {
                     double cur_t = g_daw.playhead_seconds;
                     for (int i = 0; i < g_daw.num_items; i++) {
                         AudioItem *it = &g_daw.items[i];
@@ -412,8 +205,9 @@ int main(int argc, char *argv[]) {
                 }
             } else if (e.type == SDL_MOUSEBUTTONDOWN) {
                 int mx = e.button.x, my = e.button.y;
+                SDL_Keymod mod = SDL_GetModState();
+                bool shift_pressed = (mod & KMOD_SHIFT);
 
-                // Close menus on outside click
                 if (g_daw.menu_file_open && (mx > 260 || my > 260)) {
                     g_daw.menu_file_open = false;
                     g_daw.submenu_export_audio_open = false;
@@ -421,11 +215,10 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // File Menu Dropdown Interaction
                 if (g_daw.menu_file_open) {
                     if (mx >= 8 && mx <= 200) {
                         if (my >= 38 && my < 62) { save_project_file(); g_daw.menu_file_open = false; continue; }
-                        else if (my >= 62 && my < 86) { load_project_file(ren); g_daw.menu_file_open = false; continue; }
+                        else if (my >= 62 && my < 86) { load_project_file(); g_daw.menu_file_open = false; continue; }
                         else if (my >= 86 && my < 110) {
                             char p[MAX_PATH];
                             if (open_generic_dialog(p, sizeof(p), "Media Files\0*.wav;*.mp3;*.flac;*.mp4;*.mkv;*.mov\0", false)) {
@@ -450,41 +243,24 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // 1. Top Bar Menu & Undo/Redo Buttons
                 if (my <= TOPBAR_HEIGHT) {
-                    if (mx >= 8 && mx <= 50) {
-                        g_daw.menu_file_open = !g_daw.menu_file_open;
-                    } else if (mx >= 56 && mx <= 104) {
-                        perform_undo();
-                    } else if (mx >= 110 && mx <= 158) {
-                        perform_redo();
-                    } else if (mx >= 168 && mx <= 258) {
-                        g_daw.video.is_open = !g_daw.video.is_open;
-                    }
+                    if (mx >= 8 && mx <= 50) g_daw.menu_file_open = !g_daw.menu_file_open;
+                    else if (mx >= 56 && mx <= 146) g_daw.video.is_open = !g_daw.video.is_open;
+                    else if (mx >= win_w - 228 && mx < win_w - 176) perform_undo();
+                    else if (mx >= win_w - 172 && mx < win_w - 120) perform_redo();
+                    else if (mx >= win_w - 116 && mx < win_w - 60) g_daw.pixels_per_second = fmaxf(15.0f, g_daw.pixels_per_second * 0.8f);
+                    else if (mx >= win_w - 56 && mx < win_w - 6) g_daw.pixels_per_second = fminf(400.0f, g_daw.pixels_per_second * 1.25f);
                     continue;
                 }
 
-                // 2. Space Above Track Header (Left of Timeline): +Track, Play, Stop
                 if (mx < TCP_WIDTH && my > TOPBAR_HEIGHT && my <= TOPBAR_HEIGHT + RULER_HEIGHT) {
-                    // [+ Track]
-                    if (mx >= 6 && mx <= 70 && g_daw.num_tracks < MAX_TRACKS) {
+                    if (mx >= 8 && mx <= 88 && g_daw.num_tracks < MAX_TRACKS) {
                         push_undo_state();
                         g_daw.num_tracks++;
-                    }
-                    // [Play / Pause]
-                    else if (mx >= 76 && mx <= 126) {
-                        g_daw.is_playing = !g_daw.is_playing;
-                    }
-                    // [Stop]
-                    else if (mx >= 132 && mx <= 180) {
-                        g_daw.is_playing = false;
-                        g_daw.playhead_seconds = 0.0;
-                        seek_video(&g_daw.video, 0.0);
-                    }
+                    } else if (mx >= 94 && mx <= 180) g_daw.is_playing = !g_daw.is_playing;
                     continue;
                 }
 
-                // 3. Floating Video Window Interactions
                 if (g_daw.video.is_open && mx >= g_daw.video.rect.x && mx <= g_daw.video.rect.x + g_daw.video.rect.w &&
                     my >= g_daw.video.rect.y && my <= g_daw.video.rect.y + g_daw.video.rect.h) {
                     if (mx >= g_daw.video.rect.x + g_daw.video.rect.w - 18 && my >= g_daw.video.rect.y + g_daw.video.rect.h - 18) {
@@ -499,65 +275,81 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // 4. Horizontal / Vertical Scrollbars
                 if (my >= win_h - SCROLLBAR_SIZE && mx >= TCP_WIDTH && mx < win_w - SCROLLBAR_SIZE) {
-                    dragging_scrollbar_h = true;
-                    scrollbar_h_start_mx = mx;
-                    orig_scroll_x = g_daw.scroll_x_sec;
+                    dragging_scrollbar_h = true; scrollbar_h_start_mx = mx; orig_scroll_x = g_daw.scroll_x_sec;
                     continue;
                 }
                 if (mx >= win_w - SCROLLBAR_SIZE && my >= TOPBAR_HEIGHT + RULER_HEIGHT && my < win_h - SCROLLBAR_SIZE) {
-                    dragging_scrollbar_v = true;
-                    scrollbar_v_start_my = my;
-                    orig_scroll_y = g_daw.scroll_y_px;
+                    dragging_scrollbar_v = true; scrollbar_v_start_my = my; orig_scroll_y = g_daw.scroll_y_px;
                     continue;
                 }
 
-                // 5. Track Header (TCP): Decibel Steppers & M/S (No Rec Button, No Volume Bar)
                 if (mx < TCP_WIDTH && my > TOPBAR_HEIGHT + RULER_HEIGHT) {
                     int trk = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) / g_daw.track_height;
                     if (trk >= 0 && trk < g_daw.num_tracks) {
                         int rel_y = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) % g_daw.track_height;
-                        // Decibel Stepper Controls [-] and [+]
                         if (rel_y >= 8 && rel_y <= 28) {
-                            if (mx >= 38 && mx <= 54) { // [-] Step down 1.0 dB
-                                g_daw.track_db[trk] = fmaxf(-60.0f, g_daw.track_db[trk] - 1.0f);
-                            } else if (mx >= 118 && mx <= 134) { // [+] Step up 1.0 dB
-                                g_daw.track_db[trk] = fminf(12.0f, g_daw.track_db[trk] + 1.0f);
-                            }
-                        }
-                        // Mute & Solo
-                        if (rel_y >= 8 && rel_y <= 28) {
-                            if (mx >= 142 && mx <= 162) g_daw.tracks[trk].mute = !g_daw.tracks[trk].mute;
+                            if (mx >= 38 && mx <= 54) g_daw.track_db[trk] = fmaxf(-60.0f, g_daw.track_db[trk] - 1.0f);
+                            else if (mx >= 118 && mx <= 134) g_daw.track_db[trk] = fminf(12.0f, g_daw.track_db[trk] + 1.0f);
+                            else if (mx >= 142 && mx <= 162) g_daw.tracks[trk].mute = !g_daw.tracks[trk].mute;
                             else if (mx >= 166 && mx <= 186) g_daw.tracks[trk].solo = !g_daw.tracks[trk].solo;
+                        } else {
+                            if (!shift_pressed) {
+                                for (int t = 0; t < g_daw.num_tracks; t++) g_daw.track_selected[t] = false;
+                            }
+                            g_daw.track_selected[trk] = !g_daw.track_selected[trk];
                         }
                     }
                     continue;
                 }
 
-                // 6. Timeline Scrubbing
-                if (mx >= TCP_WIDTH && my > TOPBAR_HEIGHT && my < win_h - SCROLLBAR_SIZE) {
-                    scrubbing = true;
+                if (mx >= TCP_WIDTH && my > TOPBAR_HEIGHT && my <= TOPBAR_HEIGHT + RULER_HEIGHT) {
+                    scrubbing_ruler = true;
                     g_daw.playhead_seconds = fmax(0.0, g_daw.scroll_x_sec + (double)(mx - TCP_WIDTH) / g_daw.pixels_per_second);
                     seek_video(&g_daw.video, g_daw.playhead_seconds);
                     continue;
                 }
+
+                if (mx >= TCP_WIDTH && my > TOPBAR_HEIGHT + RULER_HEIGHT && my < win_h - SCROLLBAR_SIZE) {
+                    double click_time = g_daw.scroll_x_sec + (double)(mx - TCP_WIDTH) / g_daw.pixels_per_second;
+                    int click_track = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) / g_daw.track_height;
+
+                    if (!shift_pressed) {
+                        for (int i = 0; i < g_daw.num_items; i++) g_daw.items[i].is_selected = false;
+                    }
+
+                    for (int i = g_daw.num_items - 1; i >= 0; i--) {
+                        AudioItem *it = &g_daw.items[i];
+                        if (it->track_idx == click_track && click_time >= it->start_time && click_time <= it->start_time + it->duration) {
+                            it->is_selected = true;
+                            dragging_item_idx = i;
+                            drag_start_mouse_time = click_time;
+                            item_orig_start = it->start_time;
+                            item_orig_dur = it->duration;
+                            item_orig_offset = it->offset_in_file;
+
+                            int ix = TCP_WIDTH + (int)((it->start_time - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
+                            int iw = (int)(it->duration * g_daw.pixels_per_second);
+                            if (mx <= ix + 8) dragging_trim_left = true;
+                            else if (mx >= ix + iw - 8) dragging_trim_right = true;
+                            break;
+                        }
+                    }
+                    continue;
+                }
             } else if (e.type == SDL_MOUSEBUTTONUP) {
-                g_daw.video.is_dragging = false;
-                g_daw.video.is_resizing = false;
+                g_daw.video.is_dragging = false; g_daw.video.is_resizing = false;
                 dragging_scrollbar_h = false; dragging_scrollbar_v = false;
-                scrubbing = false;
+                scrubbing_ruler = false;
                 dragging_item_idx = -1; dragging_trim_left = false; dragging_trim_right = false;
             } else if (e.type == SDL_MOUSEMOTION) {
                 int mx = e.motion.x, my = e.motion.y;
-
                 if (g_daw.video.is_dragging) {
                     g_daw.video.rect.x = mx - g_daw.video.drag_x;
                     g_daw.video.rect.y = my - g_daw.video.drag_y;
                 }
                 if (g_daw.video.is_resizing) {
-                    int new_w = mx - g_daw.video.rect.x;
-                    int new_h = my - g_daw.video.rect.y;
+                    int new_w = mx - g_daw.video.rect.x, new_h = my - g_daw.video.rect.y;
                     if (new_w >= 200) g_daw.video.rect.w = new_w;
                     if (new_h >= 140) g_daw.video.rect.h = new_h;
                 }
@@ -575,80 +367,144 @@ int main(int argc, char *argv[]) {
                     if (g_daw.scroll_y_px < 0) g_daw.scroll_y_px = 0;
                     if (g_daw.scroll_y_px > max_y) g_daw.scroll_y_px = max_y;
                 }
-                if (scrubbing && mx >= TCP_WIDTH && mx < win_w - SCROLLBAR_SIZE) {
+                if (scrubbing_ruler && mx >= TCP_WIDTH && mx < win_w - SCROLLBAR_SIZE) {
                     g_daw.playhead_seconds = fmax(0.0, g_daw.scroll_x_sec + (double)(mx - TCP_WIDTH) / g_daw.pixels_per_second);
                     seek_video(&g_daw.video, g_daw.playhead_seconds);
+                }
+                if (dragging_item_idx != -1) {
+                    AudioItem *it = &g_daw.items[dragging_item_idx];
+                    double cur_mouse_time = g_daw.scroll_x_sec + (double)(mx - TCP_WIDTH) / g_daw.pixels_per_second;
+                    double delta_t = cur_mouse_time - drag_start_mouse_time;
+
+                    if (dragging_trim_left) {
+                        if (item_orig_dur - delta_t > 0.1) {
+                            it->start_time = item_orig_start + delta_t;
+                            it->duration = item_orig_dur - delta_t;
+                            it->offset_in_file = item_orig_offset + delta_t;
+                        }
+                    } else if (dragging_trim_right) {
+                        if (item_orig_dur + delta_t > 0.1) it->duration = item_orig_dur + delta_t;
+                    } else {
+                        it->start_time = fmax(0.0, item_orig_start + delta_t);
+                        int target_t = (my - TOPBAR_HEIGHT - RULER_HEIGHT + g_daw.scroll_y_px) / g_daw.track_height;
+                        if (target_t >= 0 && target_t < g_daw.num_tracks) it->track_idx = target_t;
+                    }
                 }
             }
         }
 
         if (g_daw.video.is_open && g_daw.video.video_stream_idx != -1) {
-            sync_video_to_audio_clock(&g_daw.video, g_daw.playhead_seconds, scrubbing || !g_daw.is_playing);
+            sync_video_to_audio_clock(&g_daw.video, g_daw.playhead_seconds, scrubbing_ruler || !g_daw.is_playing);
         }
 
-        // ================= RENDERING =================
-        SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
+        // --- GUI RENDER ---
+        SDL_SetRenderDrawColor(ren, 38, 38, 38, 255);
         SDL_RenderClear(ren);
 
-        SDL_Color c_white = { 220, 220, 220, 255 }, c_muted = { 130, 130, 130, 255 }, c_teal = { 0, 210, 170, 255 }, c_black = { 20, 20, 20, 255 };
+        SDL_Color c_white = { 220, 220, 220, 255 }, c_muted = { 130, 130, 130, 255 }, c_teal = { 0, 210, 170, 255 }, c_dark = { 40, 40, 40, 255 };
 
         // 1. Top Bar
         SDL_Rect bar = { 0, 0, win_w, TOPBAR_HEIGHT };
-        SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
+        SDL_SetRenderDrawColor(ren, 26, 26, 26, 255);
         SDL_RenderFillRect(ren, &bar);
 
-        // Menu File Button
         SDL_Rect btn_file = { 8, 6, 46, 26 };
-        SDL_SetRenderDrawColor(ren, g_daw.menu_file_open ? 65 : 45, g_daw.menu_file_open ? 65 : 45, g_daw.menu_file_open ? 65 : 45, 255);
+        SDL_SetRenderDrawColor(ren, g_daw.menu_file_open ? 55 : 40, g_daw.menu_file_open ? 55 : 40, g_daw.menu_file_open ? 55 : 40, 255);
         SDL_RenderFillRect(ren, &btn_file);
         draw_text(ren, "File", 18, 14, c_white);
 
-        // Undo & Redo Buttons
-        SDL_Rect btn_undo = { 58, 6, 48, 26 };
-        SDL_SetRenderDrawColor(ren, 45, 45, 45, 255);
-        SDL_RenderFillRect(ren, &btn_undo);
-        draw_text(ren, "Undo", 66, 14, c_white);
-
-        SDL_Rect btn_redo = { 110, 6, 48, 26 };
-        SDL_SetRenderDrawColor(ren, 45, 45, 45, 255);
-        SDL_RenderFillRect(ren, &btn_redo);
-        draw_text(ren, "Redo", 118, 14, c_white);
-
-        // View: Video Button
-        SDL_Rect v_menu = { 168, 6, 90, 26 };
-        SDL_SetRenderDrawColor(ren, g_daw.video.is_open ? 0 : 45, g_daw.video.is_open ? 140 : 45, g_daw.video.is_open ? 120 : 45, 255);
+        SDL_Rect v_menu = { 60, 6, 90, 26 };
+        SDL_SetRenderDrawColor(ren, g_daw.video.is_open ? 0 : 40, g_daw.video.is_open ? 140 : 40, g_daw.video.is_open ? 120 : 40, 255);
         SDL_RenderFillRect(ren, &v_menu);
-        draw_text(ren, "View:Video", 174, 14, c_white);
+        draw_text(ren, "View:Video", 66, 14, c_white);
 
-        // 2. Corner Area Above Track Header: +Track, Play/Pause, Stop
+        char clock_buf[32];
+        format_timecode(g_daw.playhead_seconds, clock_buf, sizeof(clock_buf));
+        int clock_x = (win_w / 2) - 52;
+        SDL_Rect clock_bg = { clock_x - 10, 5, 128, 28 };
+        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+        SDL_RenderFillRect(ren, &clock_bg);
+        SDL_SetRenderDrawColor(ren, 50, 50, 50, 255);
+        SDL_RenderDrawRect(ren, &clock_bg);
+        draw_text(ren, clock_buf, clock_x - 4, 14, c_teal);
+
+        SDL_Rect btn_undo = { win_w - 228, 6, 52, 26 };
+        SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
+        SDL_RenderFillRect(ren, &btn_undo);
+        draw_text(ren, "Undo", win_w - 218, 14, c_white);
+
+        SDL_Rect btn_redo = { win_w - 172, 6, 52, 26 };
+        SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
+        SDL_RenderFillRect(ren, &btn_redo);
+        draw_text(ren, "Redo", win_w - 162, 14, c_white);
+
+        SDL_Rect btn_zm_out = { win_w - 116, 6, 56, 26 };
+        SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
+        SDL_RenderFillRect(ren, &btn_zm_out);
+        draw_text(ren, "Zoom-", win_w - 110, 14, c_white);
+
+        SDL_Rect btn_zm_in = { win_w - 56, 6, 50, 26 };
+        SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
+        SDL_RenderFillRect(ren, &btn_zm_in);
+        draw_text(ren, "Zoom+", win_w - 50, 14, c_teal);
+
+        // 2. Corner Area Above Track Header
         SDL_Rect corner_area = { 0, TOPBAR_HEIGHT, TCP_WIDTH, RULER_HEIGHT };
-        SDL_SetRenderDrawColor(ren, 34, 34, 34, 255);
+        SDL_SetRenderDrawColor(ren, 32, 32, 32, 255);
         SDL_RenderFillRect(ren, &corner_area);
 
-        SDL_Rect btn_corner_add = { 6, TOPBAR_HEIGHT + 4, 64, 24 };
+        SDL_Rect btn_corner_add = { 8, TOPBAR_HEIGHT + 4, 80, 26 };
         SDL_SetRenderDrawColor(ren, 48, 48, 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_add);
-        draw_text(ren, "+ Track", 12, TOPBAR_HEIGHT + 11, c_teal);
+        draw_text(ren, "+ Track", 18, TOPBAR_HEIGHT + 12, c_teal);
 
-        SDL_Rect btn_corner_play = { 74, TOPBAR_HEIGHT + 4, 50, 24 };
+        SDL_Rect btn_corner_play = { 94, TOPBAR_HEIGHT + 4, 86, 26 };
         SDL_SetRenderDrawColor(ren, g_daw.is_playing ? 160 : 48, g_daw.is_playing ? 60 : 48, 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_play);
-        draw_text(ren, g_daw.is_playing ? "Pause" : "Play", 80, TOPBAR_HEIGHT + 11, c_white);
+        draw_text(ren, g_daw.is_playing ? "Pause" : "Play", 118, TOPBAR_HEIGHT + 12, c_white);
 
-        SDL_Rect btn_corner_stop = { 128, TOPBAR_HEIGHT + 4, 48, 24 };
-        SDL_SetRenderDrawColor(ren, 48, 48, 48, 255);
-        SDL_RenderFillRect(ren, &btn_corner_stop);
-        draw_text(ren, "Stop", 138, TOPBAR_HEIGHT + 11, c_white);
+        // 3. Dynamic Adaptive Time Ruler
+        SDL_Rect ruler = { TCP_WIDTH, TOPBAR_HEIGHT, view_w, RULER_HEIGHT };
+        SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
+        SDL_RenderFillRect(ren, &ruler);
 
-        // Timeline Clip Region
+        double sec_per_tick = 1.0;
+        if (g_daw.pixels_per_second >= 200.0f) sec_per_tick = 0.1;
+        else if (g_daw.pixels_per_second >= 100.0f) sec_per_tick = 0.25;
+        else if (g_daw.pixels_per_second >= 50.0f) sec_per_tick = 0.5;
+        else if (g_daw.pixels_per_second >= 25.0f) sec_per_tick = 1.0;
+        else sec_per_tick = 5.0;
+
+        double start_tick = floor(g_daw.scroll_x_sec / sec_per_tick) * sec_per_tick;
+        double end_tick = g_daw.scroll_x_sec + (double)view_w / g_daw.pixels_per_second + sec_per_tick;
+
+        for (double t = start_tick; t <= end_tick; t += sec_per_tick) {
+            int rx = TCP_WIDTH + (int)((t - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
+            if (rx < TCP_WIDTH || rx > TCP_WIDTH + view_w) continue;
+
+            char t_str[32];
+            if (sec_per_tick < 1.0) snprintf(t_str, sizeof(t_str), "%.2fs", t);
+            else if (t < 60.0) snprintf(t_str, sizeof(t_str), "%02ds", (int)t);
+            else if (t < 3600.0) {
+                int m = (int)(t / 60); int s = (int)(t - m * 60);
+                snprintf(t_str, sizeof(t_str), "%02d:%02d", m, s);
+            } else {
+                int h = (int)(t / 3600); int m = (int)((t - h * 3600) / 60);
+                snprintf(t_str, sizeof(t_str), "%02d:%02d:00", h, m);
+            }
+
+            draw_text(ren, t_str, rx + 4, TOPBAR_HEIGHT + 12, c_muted);
+            SDL_SetRenderDrawColor(ren, 55, 55, 55, 255);
+            SDL_RenderDrawLine(ren, rx, TOPBAR_HEIGHT + 20, rx, TOPBAR_HEIGHT + RULER_HEIGHT);
+        }
+
         SDL_Rect timeline_clip = { TCP_WIDTH, TOPBAR_HEIGHT + RULER_HEIGHT, view_w, view_h };
         SDL_RenderSetClipRect(ren, &timeline_clip);
 
-        int sec_step = (g_daw.pixels_per_second < 40) ? 2 : 1;
-        for (int s = 0; s < (int)g_daw.project_duration_sec; s += sec_step) {
-            int gx = TCP_WIDTH + (int)((s - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
+        for (double t = start_tick; t <= end_tick; t += sec_per_tick) {
+            int gx = TCP_WIDTH + (int)((t - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
             if (gx < TCP_WIDTH || gx > TCP_WIDTH + view_w) continue;
-            SDL_SetRenderDrawColor(ren, 46, 46, 46, 255);
+            SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderDrawLine(ren, gx, TOPBAR_HEIGHT + RULER_HEIGHT, gx, TOPBAR_HEIGHT + RULER_HEIGHT + view_h);
         }
 
@@ -658,7 +514,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderDrawLine(ren, TCP_WIDTH, ty, TCP_WIDTH + view_w, ty);
         }
 
-        // Render Real Peaks
+        // 4. Render Items
         for (int i = 0; i < g_daw.num_items; i++) {
             AudioItem *it = &g_daw.items[i];
             int ix = TCP_WIDTH + (int)((it->start_time - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
@@ -668,11 +524,29 @@ int main(int argc, char *argv[]) {
 
             if (ix + iw < TCP_WIDTH || ix > TCP_WIDTH + view_w) continue;
 
+            float gain_multiplier = db_to_linear(g_daw.track_db[it->track_idx]);
+
             SDL_Rect clip_r = { ix, iy, iw, ih };
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 44 : 34, it->is_selected ? 70 : 54, it->is_selected ? 94 : 70, 255);
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 44 : 32, it->is_selected ? 70 : 50, it->is_selected ? 94 : 68, 255);
             SDL_RenderFillRect(ren, &clip_r);
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 0 : 80, it->is_selected ? 220 : 150, it->is_selected ? 190 : 160, 255);
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 0 : 75, it->is_selected ? 220 : 140, it->is_selected ? 190 : 150, 255);
             SDL_RenderDrawRect(ren, &clip_r);
+
+            for (int o = 0; o < g_daw.num_items; o++) {
+                if (o == i) continue;
+                AudioItem *ot = &g_daw.items[o];
+                if (ot->track_idx == it->track_idx) {
+                    double overlap_s = fmax(it->start_time, ot->start_time);
+                    double overlap_e = fmin(it->start_time + it->duration, ot->start_time + ot->duration);
+                    if (overlap_e > overlap_s) {
+                        int ox = TCP_WIDTH + (int)((overlap_s - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
+                        int ow = (int)((overlap_e - overlap_s) * g_daw.pixels_per_second);
+                        SDL_Rect xfade_r = { ox, iy, ow, ih };
+                        SDL_SetRenderDrawColor(ren, 210, 140, 0, 70);
+                        SDL_RenderFillRect(ren, &xfade_r);
+                    }
+                }
+            }
 
             int mid_y = iy + ih / 2;
             SDL_SetRenderDrawColor(ren, 100, 220, 175, 255);
@@ -685,9 +559,8 @@ int main(int argc, char *argv[]) {
                 int bin_idx = (int)((cur_item_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
 
                 if (bin_idx >= 0 && bin_idx < it->peak_count) {
-                    float mn = it->peaks[bin_idx].min_val;
-                    float mx = it->peaks[bin_idx].max_val;
-
+                    float mn = it->peaks[bin_idx].min_val * gain_multiplier;
+                    float mx = it->peaks[bin_idx].max_val * gain_multiplier;
                     int y1 = mid_y - (int)(mx * (ih / 2.0f - 2));
                     int y2 = mid_y - (int)(mn * (ih / 2.0f - 2));
                     if (y1 == y2) y2 += 1;
@@ -697,7 +570,6 @@ int main(int argc, char *argv[]) {
             draw_text(ren, it->label, ix + 6, iy + 6, c_white);
         }
 
-        // Playhead
         int cur_px = TCP_WIDTH + (int)((g_daw.playhead_seconds - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
         if (cur_px >= TCP_WIDTH && cur_px <= TCP_WIDTH + view_w) {
             SDL_SetRenderDrawColor(ren, 0, 220, 170, 255);
@@ -705,39 +577,20 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // Timeline Ruler
-        SDL_Rect ruler = { TCP_WIDTH, TOPBAR_HEIGHT, view_w, RULER_HEIGHT };
-        SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
-        SDL_RenderFillRect(ren, &ruler);
-
-        for (int s = 0; s < (int)g_daw.project_duration_sec; s += sec_step) {
-            int rx = TCP_WIDTH + (int)((s - g_daw.scroll_x_sec) * g_daw.pixels_per_second);
-            if (rx < TCP_WIDTH || rx > TCP_WIDTH + view_w) continue;
-            char b_txt[16], t_txt[16];
-            snprintf(b_txt, sizeof(b_txt), "%d.1", s + 1);
-            snprintf(t_txt, sizeof(t_txt), "0:%02d", s);
-            draw_text(ren, b_txt, rx + 4, TOPBAR_HEIGHT + 4, c_white);
-            draw_text(ren, t_txt, rx + 4, TOPBAR_HEIGHT + 18, c_muted);
-            SDL_SetRenderDrawColor(ren, 55, 55, 55, 255);
-            SDL_RenderDrawLine(ren, rx, TOPBAR_HEIGHT, rx, TOPBAR_HEIGHT + RULER_HEIGHT);
-        }
-
-        // 3. Track Header (TCP) with Decibel Step Numbers & M/S (No rec button, no volume bar)
+        // 5. TCP Sidebar
         SDL_Rect tcp_clip = { 0, TOPBAR_HEIGHT + RULER_HEIGHT, TCP_WIDTH, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
         for (int i = 0; i < g_daw.num_tracks; i++) {
             int ty = TOPBAR_HEIGHT + RULER_HEIGHT + (i * g_daw.track_height) - g_daw.scroll_y_px;
             SDL_Rect tp = { 2, ty + 2, TCP_WIDTH - 4, g_daw.track_height - 4 };
-            SDL_SetRenderDrawColor(ren, 54, 54, 54, 255);
+            SDL_SetRenderDrawColor(ren, g_daw.track_selected[i] ? 64 : 48, g_daw.track_selected[i] ? 64 : 48, g_daw.track_selected[i] ? 64 : 48, 255);
             SDL_RenderFillRect(ren, &tp);
 
-            // Track index
             char n_str[8]; snprintf(n_str, sizeof(n_str), "%d", g_daw.tracks[i].id);
             draw_text(ren, n_str, 8, ty + 12, c_white);
 
-            // Decibel Number Stepper: [-] [ 0.0 dB ] [+]
             SDL_Rect btn_minus = { 38, ty + 10, 16, 18 };
-            SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
+            SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
             SDL_RenderFillRect(ren, &btn_minus);
             draw_text(ren, "-", 43, ty + 13, c_white);
 
@@ -747,18 +600,17 @@ int main(int argc, char *argv[]) {
             draw_text(ren, db_txt, 58, ty + 14, c_teal);
 
             SDL_Rect btn_plus = { 118, ty + 10, 16, 18 };
-            SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
+            SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
             SDL_RenderFillRect(ren, &btn_plus);
             draw_text(ren, "+", 123, ty + 13, c_white);
 
-            // Mute & Solo
             SDL_Rect m_btn = { 142, ty + 10, 20, 20 };
-            SDL_SetRenderDrawColor(ren, g_daw.tracks[i].mute ? 200 : 70, g_daw.tracks[i].mute ? 40 : 70, 40, 255);
+            SDL_SetRenderDrawColor(ren, g_daw.tracks[i].mute ? 200 : 65, g_daw.tracks[i].mute ? 40 : 65, 40, 255);
             SDL_RenderFillRect(ren, &m_btn);
             draw_text(ren, "M", 148, ty + 14, c_white);
 
             SDL_Rect s_btn = { 166, ty + 10, 20, 20 };
-            SDL_SetRenderDrawColor(ren, g_daw.tracks[i].solo ? 210 : 70, g_daw.tracks[i].solo ? 180 : 70, 40, 255);
+            SDL_SetRenderDrawColor(ren, g_daw.tracks[i].solo ? 210 : 65, g_daw.tracks[i].solo ? 180 : 65, 40, 255);
             SDL_RenderFillRect(ren, &s_btn);
             draw_text(ren, "S", 172, ty + 14, c_white);
 
@@ -767,9 +619,9 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // Scrollbars
+        // 6. Scrollbars
         SDL_Rect bar_h = { TCP_WIDTH, win_h - SCROLLBAR_SIZE, view_w, SCROLLBAR_SIZE };
-        SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
+        SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
         SDL_RenderFillRect(ren, &bar_h);
 
         float thumb_w_sz = (total_w_timeline > 0) ? fmaxf(30.0f, (float)view_w * ((float)view_w / total_w_timeline)) : view_w;
@@ -780,7 +632,7 @@ int main(int argc, char *argv[]) {
         SDL_RenderFillRect(ren, &thumb_h);
 
         SDL_Rect bar_v = { win_w - SCROLLBAR_SIZE, TOPBAR_HEIGHT + RULER_HEIGHT, SCROLLBAR_SIZE, view_h };
-        SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
+        SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
         SDL_RenderFillRect(ren, &bar_v);
 
         float thumb_h_sz = (max_h_tracks > 0) ? fmaxf(30.0f, (float)view_h * ((float)view_h / max_h_tracks)) : view_h;
@@ -789,7 +641,7 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(ren, 75, 75, 75, 255);
         SDL_RenderFillRect(ren, &thumb_v);
 
-        // 4. File Dropdown Menu & Submenus Rendering
+        // 7. Dropdown Menu
         if (g_daw.menu_file_open) {
             SDL_Rect m_box = { 8, TOPBAR_HEIGHT, 192, 146 };
             SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
@@ -804,7 +656,6 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Export Media -> Video >", 16, TOPBAR_HEIGHT + 102, c_teal);
             draw_text(ren, "Batch Export (Stems)", 16, TOPBAR_HEIGHT + 126, c_white);
 
-            // Audio Formats Submenu
             if (g_daw.submenu_export_audio_open) {
                 SDL_Rect sub_a = { 200, TOPBAR_HEIGHT + 76, 110, 94 };
                 SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
@@ -817,7 +668,6 @@ int main(int argc, char *argv[]) {
                 draw_text(ren, ".OGG Audio", 208, TOPBAR_HEIGHT + 148, c_white);
             }
 
-            // Video Formats Submenu
             if (g_daw.submenu_export_video_open) {
                 SDL_Rect sub_v = { 200, TOPBAR_HEIGHT + 100, 110, 94 };
                 SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
@@ -831,7 +681,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Resizable Floating Video Window
+        // 8. Video Window
         if (g_daw.video.is_open) {
             SDL_Rect s_rect = { g_daw.video.rect.x + 4, g_daw.video.rect.y + 4, g_daw.video.rect.w, g_daw.video.rect.h };
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
@@ -841,7 +691,6 @@ int main(int argc, char *argv[]) {
             SDL_SetRenderDrawColor(ren, 240, 240, 240, 255);
             SDL_RenderFillRect(ren, &v_bar);
 
-            SDL_Color c_dark = { 40, 40, 40, 255 };
             draw_text(ren, "Video Monitor", g_daw.video.rect.x + 8, g_daw.video.rect.y + 7, c_dark);
             draw_text(ren, "X", g_daw.video.rect.x + g_daw.video.rect.w - 18, g_daw.video.rect.y + 7, c_dark);
 
