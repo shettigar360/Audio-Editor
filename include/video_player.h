@@ -87,7 +87,7 @@ static inline int open_video_by_path(SimpleVideoPlayer *v, const char *filepath,
 
     v->sws_ctx = sws_getContext(ctx->width, ctx->height, src_pix_fmt,
                                 ctx->width, ctx->height, AV_PIX_FMT_RGB24,
-                                SWS_BILINEAR, NULL, NULL, NULL);
+                                SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
     v->texture = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, ctx->width, ctx->height);
     strncpy(v->file_path, filepath, sizeof(v->file_path) - 1);
@@ -104,18 +104,20 @@ static inline void seek_video(SimpleVideoPlayer *v, double target_seconds) {
     v->current_pts = target_seconds;
 }
 
-static inline void update_video_player(SimpleVideoPlayer *v, double target_seconds) {
+// Master audio sync: reads sequentially to display the frame matching the audio clock
+static inline void sync_video_to_audio_clock(SimpleVideoPlayer *v, double audio_master_time, bool is_seeking) {
     if (!v->fmt_ctx || v->video_stream_idx == -1) return;
 
     AVStream *st = v->fmt_ctx->streams[v->video_stream_idx];
     double time_base = av_q2d(st->time_base);
 
-    if (fabs(target_seconds - v->current_pts) > 0.5) {
-        seek_video(v, target_seconds);
+    // If scrubbed or audio jumped past half a second, seek to closest keyframe
+    if (is_seeking || fabs(audio_master_time - v->current_pts) > 0.5) {
+        seek_video(v, audio_master_time);
     }
 
     AVPacket *pkt = av_packet_alloc();
-    while (v->current_pts < target_seconds) {
+    while (v->current_pts < audio_master_time) {
         if (av_read_frame(v->fmt_ctx, pkt) < 0) break;
         if (pkt->stream_index == v->video_stream_idx) {
             if (avcodec_send_packet(v->codec_ctx, pkt) == 0) {
