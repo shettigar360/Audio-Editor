@@ -1,43 +1,24 @@
 cmake_minimum_required(VERSION 3.20)
-project(AudioVideoEditor C CXX)
+project(AudioDawEngine C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-add_definitions(-DSDL_MAIN_HANDLED)
-
 find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswresample)
+pkg_check_modules(LUA REQUIRED IMPORTED_TARGET lua5.4)
 
-# 1. FFmpeg
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswresample libswscale)
-
-# 2. Lua
-find_package(Lua REQUIRED)
-
-# 3. SDL2
-find_package(SDL2 REQUIRED)
-list(FILTER SDL2_LIBRARIES EXCLUDE REGEX "SDL2main")
-
-# 4. Embedded Python
 find_package(Python3 COMPONENTS Development REQUIRED)
 
-add_executable(audio_editor src/main.c)
+add_executable(audio_engine src/main.c)
 
-if(WIN32)
-    target_link_options(audio_editor PRIVATE -mwindows)
-    target_link_libraries(audio_editor PRIVATE comdlg32 dwmapi m)
-endif()
-
-target_include_directories(audio_editor PRIVATE
+target_include_directories(audio_engine PRIVATE
     include
-    ${LUA_INCLUDE_DIR}
-    ${SDL2_INCLUDE_DIRS}
     ${Python3_INCLUDE_DIRS}
 )
 
-target_link_libraries(audio_editor PRIVATE
+target_link_libraries(audio_engine PRIVATE
     PkgConfig::FFMPEG
-    ${LUA_LIBRARIES}
-    ${SDL2_LIBRARIES}
+    PkgConfig::LUA
     Python3::Python
 )
