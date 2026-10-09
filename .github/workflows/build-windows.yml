@@ -35,7 +35,7 @@ jobs:
         run: |
           cmake --build build
 
-      - name: Package Executable with Dependencies
+      - name: Package Executable with Complete Dependency Tree
         shell: msys2 {0}
         run: |
           mkdir -p package
