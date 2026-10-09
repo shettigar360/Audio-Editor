@@ -6,9 +6,8 @@ set(CMAKE_C_STANDARD 11)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
 pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswresample libswscale)
-
-# Use pkg_search_module to pick whichever Lua pkg-config name exists
 pkg_search_module(LUA REQUIRED lua lua5.4 lua-5.4 lua54)
+pkg_search_module(PYTHON REQUIRED python3-embed python3 python-3.12 python-3.11)
 
 add_executable(audio_editor src/main.c)
 
@@ -17,12 +16,14 @@ target_include_directories(audio_editor PRIVATE
     ${SDL2_INCLUDE_DIRS} 
     ${FFMPEG_INCLUDE_DIRS}
     ${LUA_INCLUDE_DIRS}
+    ${PYTHON_INCLUDE_DIRS}
 )
 
 target_link_libraries(audio_editor PRIVATE 
     ${SDL2_LIBRARIES} 
     ${FFMPEG_LIBRARIES}
     ${LUA_LIBRARIES}
+    ${PYTHON_LIBRARIES}
 )
 
 if(WIN32)
