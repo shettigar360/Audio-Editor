@@ -186,11 +186,28 @@ static inline void format_timecode(double seconds, char *out, size_t max_len) {
     snprintf(out, max_len, "%02d:%02d:%02d.%03d", h, m, s, ms);
 }
 
+static inline const char* daw_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (!*needle) return haystack;
+    for (; *haystack; ++haystack) {
+        if (tolower((unsigned char)*haystack) == tolower((unsigned char)*needle)) {
+            const char *h = haystack;
+            const char *n = needle;
+            while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+                ++h;
+                ++n;
+            }
+            if (!*n) return haystack;
+        }
+    }
+    return NULL;
+}
+
 static inline void filter_actions(void) {
     g_daw.num_filtered = 0;
     bool has_filter = (strlen(g_daw.filter_buf) > 0);
     for (int i = 0; i < g_daw.num_actions; i++) {
-        if (!has_filter || strcasestr(g_daw.actions[i].description, g_daw.filter_buf)) {
+        if (!has_filter || daw_strcasestr(g_daw.actions[i].description, g_daw.filter_buf)) {
             g_daw.filtered_indices[g_daw.num_filtered++] = i;
         }
     }
