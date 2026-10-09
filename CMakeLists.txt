@@ -1,24 +1,31 @@
 cmake_minimum_required(VERSION 3.20)
-project(AudioDawEngine C CXX)
+project(AudioEditor C)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswresample)
-pkg_check_modules(LUA REQUIRED IMPORTED_TARGET lua5.4)
+pkg_check_modules(SDL2 REQUIRED sdl2)
+pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswresample libswscale)
 
-find_package(Python3 COMPONENTS Development REQUIRED)
+# On MSYS2 UCRT64, the pkg-config file is named 'lua', with 'lua5.4' / 'lua-5.4' as fallbacks
+pkg_check_modules(LUA REQUIRED lua lua-5.4 lua5.4 lua54)
 
-add_executable(audio_engine src/main.c)
+add_executable(audio_editor src/main.c)
 
-target_include_directories(audio_engine PRIVATE
-    include
-    ${Python3_INCLUDE_DIRS}
+target_include_directories(audio_editor PRIVATE 
+    include 
+    ${SDL2_INCLUDE_DIRS} 
+    ${FFMPEG_INCLUDE_DIRS}
+    ${LUA_INCLUDE_DIRS}
 )
 
-target_link_libraries(audio_engine PRIVATE
-    PkgConfig::FFMPEG
-    PkgConfig::LUA
-    Python3::Python
+target_link_libraries(audio_editor PRIVATE 
+    ${SDL2_LIBRARIES} 
+    ${FFMPEG_LIBRARIES}
+    ${LUA_LIBRARIES}
 )
+
+if(WIN32)
+    target_link_options(audio_editor PRIVATE -mwindows)
+    target_link_libraries(audio_editor PRIVATE comdlg32 dwmapi m)
+endif()
