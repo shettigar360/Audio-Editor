@@ -23,7 +23,6 @@
 #include "daw_ui.h"
 #include "daw_input.h"
 
-// Global engine state
 DawEngine g_daw;
 
 static SDL_Cursor *g_cursor_arrow = NULL;
