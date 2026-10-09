@@ -73,9 +73,7 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
         }
     }
 
-    // Inbuilt Open-Source DSP Processing Chain (Filter, Delay, Soft Limiter)
     process_master_plugins(out, frames_needed, &p->master_filter, &p->master_delay);
-
     p->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
 }
 
@@ -111,12 +109,12 @@ int main(int argc, char *argv[]) {
     g_daw.editing_track_name_idx = -1;
     g_daw.editing_marker_idx = -1;
     g_daw.selected_marker_idx = -1;
-    g_daw.rebinding_action_idx = -1;
-    g_daw.script_selected_idx = -1;
-    g_daw.script_win_rect = (SDL_Rect){ 420, 180, 440, 270 };
+    g_daw.selected_action_idx = 0;
+    g_daw.action_window_open = false;
+    g_daw.action_win_rect = (SDL_Rect){ 360, 140, 560, 460 };
 
     init_tab_defaults(0, "Project 1");
-    init_default_shortcuts();
+    init_default_actions();
     push_undo_state();
 
     SDL_AudioSpec want;
