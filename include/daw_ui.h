@@ -22,6 +22,7 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
     SDL_Color c_white = { 224, 224, 224, 255 };
     SDL_Color c_muted = { 130, 130, 130, 255 };
     SDL_Color c_blue  = { 26, 86, 219, 255 };
+    SDL_Color c_black = { 20, 20, 20, 255 };
 
     // 1. Chrome-Style Project Tabs Bar
     SDL_Rect tab_bar = { 0, 0, win_w, TABBAR_HEIGHT };
@@ -71,7 +72,7 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
     SDL_Rect btn_act = { 56, TABBAR_HEIGHT + 5, 60, 26 };
     SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
     SDL_RenderFillRect(ren, &btn_act);
-    draw_text(ren, "Action", 64, TABBAR_HEIGHT + 13, c_white);
+    draw_text(ren, "Actions", 62, TABBAR_HEIGHT + 13, c_white);
 
     SDL_Rect btn_mk_toggle = { 122, TABBAR_HEIGHT + 5, 66, 26 };
     SDL_SetRenderDrawColor(ren, p->show_marker_lane ? 55 : 40, p->show_marker_lane ? 55 : 40, p->show_marker_lane ? 55 : 40, 255);
@@ -163,7 +164,6 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
         SDL_RenderDrawLine(ren, rx, corner_y + 16, rx, corner_y + RULER_HEIGHT);
     }
 
-    // Marker Lane
     int marker_y = corner_y + RULER_HEIGHT;
     if (p->show_marker_lane) {
         SDL_Rect marker_bg = { g_daw.tcp_width, marker_y, view_w, MARKER_BAR_HEIGHT };
@@ -214,7 +214,7 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
         SDL_RenderDrawLine(ren, g_daw.tcp_width, track_cur_y, g_daw.tcp_width + view_w, track_cur_y);
     }
 
-    // 5. Render Clips & Peaks
+    // 5. Render Clips
     for (int i = 0; i < p->num_items; i++) {
         AudioItem *it = &p->items[i];
         int iy = header_top_y - p->scroll_y_px;
@@ -233,27 +233,6 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
         SDL_RenderFillRect(ren, &clip_r);
         SDL_SetRenderDrawColor(ren, it->is_selected ? 180 : 80, it->is_selected ? 180 : 80, it->is_selected ? 180 : 80, 255);
         SDL_RenderDrawRect(ren, &clip_r);
-
-        for (int o = 0; o < p->num_items; o++) {
-            if (o == i) continue;
-            AudioItem *ot = &p->items[o];
-            if (ot->track_idx == it->track_idx && ot->start_time < it->start_time) {
-                double overlap_s = it->start_time;
-                double overlap_e = fmin(it->start_time + it->duration, ot->start_time + ot->duration);
-                if (overlap_e > overlap_s) {
-                    int ox = g_daw.tcp_width + (int)((overlap_s - p->scroll_x_sec) * p->pixels_per_second);
-                    int ow = (int)((overlap_e - overlap_s) * p->pixels_per_second);
-                    SDL_SetRenderDrawColor(ren, 185, 30, 30, 255);
-                    for (int px = 0; px < ow; px++) {
-                        float factor = (float)px / (float)ow;
-                        int y_fade_in = iy + ih - (int)(sinf(factor * 1.57079f) * ih);
-                        int y_fade_out = iy + (int)(sinf(factor * 1.57079f) * ih);
-                        SDL_RenderDrawPoint(ren, ox + px, y_fade_in);
-                        SDL_RenderDrawPoint(ren, ox + px, y_fade_out);
-                    }
-                }
-            }
-        }
 
         int mid_y = iy + ih / 2;
         SDL_SetRenderDrawColor(ren, 200, 200, 200, 255);
@@ -297,7 +276,7 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
     }
     SDL_RenderSetClipRect(ren, NULL);
 
-    // 6. 3-Section Track Header (TCP)
+    // 6. Track Header (TCP)
     SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
     SDL_RenderSetClipRect(ren, &tcp_clip);
     for (int i = 0; i < p->num_tracks; i++) {
@@ -383,115 +362,177 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
     SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
     SDL_RenderFillRect(ren, &thumb_v);
 
-    // 7. Action Menu Dropdown
+    // 7. Actions Dropdown Menu
     if (g_daw.menu_action_open) {
         int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-        SDL_Rect a_box = { 56, m_start, 170, 78 };
+        SDL_Rect a_box = { 56, m_start, 176, 56 };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &a_box);
         SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
         SDL_RenderDrawRect(ren, &a_box);
-        draw_text(ren, "Key Shortcuts... (?)", 64, m_start + 8, c_white);
-        draw_text(ren, "Lua Scripts...", 64, m_start + 32, c_white);
-        draw_text(ren, "Python Scripts...", 64, m_start + 56, c_white);
+        draw_text(ren, "Show Action List... (?)", 64, m_start + 8, c_white);
+        draw_text(ren, "New Action (Load Script)", 64, m_start + 32, c_white);
     }
 
-    // 8. REAPER / Logic-Style Action & Shortcut Manager Dialog
-    if (g_daw.shortcut_manager_open) {
-        int sw = 500, sh = 320;
-        int sx = (win_w - sw) / 2, sy = (win_h - sh) / 2;
-        SDL_Rect s_bg = { sx, sy, sw, sh };
-        SDL_SetRenderDrawColor(ren, 22, 22, 22, 255);
-        SDL_RenderFillRect(ren, &s_bg);
-        SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
-        SDL_RenderDrawRect(ren, &s_bg);
+    // 8. EXACT REAPER-STYLE ACTION WINDOW
+    if (g_daw.action_window_open) {
+        SDL_Rect *aw = &g_daw.action_win_rect;
 
-        SDL_Rect s_bar = { sx, sy, sw, 26 };
-        SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
-        SDL_RenderFillRect(ren, &s_bar);
-        draw_text(ren, "Action List & Shortcut Customizer", sx + 10, sy + 7, c_white);
-        draw_text(ren, "X", sx + sw - 20, sy + 7, c_white);
+        // Window background & borders
+        SDL_SetRenderDrawColor(ren, 192, 192, 192, 255); // Classic Reaper Dialog Grey
+        SDL_RenderFillRect(ren, aw);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, aw);
 
-        SDL_Rect s_list = { sx + 12, sy + 34, sw - 24, 230 };
-        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-        SDL_RenderFillRect(ren, &s_list);
+        // Window Title Bar
+        SDL_Rect title_bar = { aw->x, aw->y, aw->w, 24 };
+        SDL_SetRenderDrawColor(ren, 240, 240, 240, 255);
+        SDL_RenderFillRect(ren, &title_bar);
+        draw_text(ren, "Actions", aw->x + 8, aw->y + 6, c_black);
 
-        for (int a = 0; a < g_daw.num_actions; a++) {
-            int ay = sy + 38 + (a * 22);
-            bool is_rebinding = (g_daw.rebinding_action_idx == a);
+        // Window Close Button [X]
+        SDL_Rect btn_close_top = { aw->x + aw->w - 24, aw->y, 24, 24 };
+        SDL_SetRenderDrawColor(ren, 210, 60, 60, 255);
+        SDL_RenderFillRect(ren, &btn_close_top);
+        draw_text(ren, "x", aw->x + aw->w - 16, aw->y + 6, c_white);
 
-            if (is_rebinding) {
-                SDL_Rect r_row = { sx + 14, ay - 2, sw - 28, 20 };
-                SDL_SetRenderDrawColor(ren, 26, 86, 219, 255);
-                SDL_RenderFillRect(ren, &r_row);
+        // Top Filter Bar Section
+        int fy = aw->y + 32;
+        draw_text(ren, "Filter:", aw->x + 12, fy + 4, c_black);
+
+        // Filter text box
+        SDL_Rect filter_box = { aw->x + 60, fy, 190, 22 };
+        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+        SDL_RenderFillRect(ren, &filter_box);
+        SDL_SetRenderDrawColor(ren, 100, 100, 100, 255);
+        SDL_RenderDrawRect(ren, &filter_box);
+        if (strlen(g_daw.filter_buf) > 0) {
+            draw_text(ren, g_daw.filter_buf, aw->x + 64, fy + 4, c_black);
+        } else if (g_daw.input_focus == INPUT_FOCUS_ACTION_FILTER) {
+            draw_text(ren, "|", aw->x + 64, fy + 4, c_black);
+        }
+
+        // Clear button
+        SDL_Rect btn_clear = { aw->x + 256, fy, 48, 22 };
+        SDL_SetRenderDrawColor(ren, 225, 225, 225, 255);
+        SDL_RenderFillRect(ren, &btn_clear);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &btn_clear);
+        draw_text(ren, "Clear", aw->x + 262, fy + 4, c_black);
+
+        // Section display
+        draw_text(ren, "Section: Main", aw->x + 320, fy + 4, c_black);
+
+        // 3-Column Actions Table
+        int table_y = aw->y + 60;
+        int table_w = aw->w - 24;
+        int table_h = aw->h - 220;
+
+        // Table Header
+        SDL_Rect tbl_hdr = { aw->x + 12, table_y, table_w, 20 };
+        SDL_SetRenderDrawColor(ren, 230, 230, 230, 255);
+        SDL_RenderFillRect(ren, &tbl_hdr);
+        SDL_SetRenderDrawColor(ren, 160, 160, 160, 255);
+        SDL_RenderDrawRect(ren, &tbl_hdr);
+
+        draw_text(ren, "Shortcut", aw->x + 16, table_y + 4, c_black);
+        draw_text(ren, "Description", aw->x + 140, table_y + 4, c_black);
+        draw_text(ren, "State", aw->x + table_w - 40, table_y + 4, c_black);
+
+        // Table List Box
+        SDL_Rect tbl_body = { aw->x + 12, table_y + 20, table_w, table_h };
+        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+        SDL_RenderFillRect(ren, &tbl_body);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &tbl_body);
+
+        int max_visible_rows = table_h / 20;
+        for (int r = 0; r < max_visible_rows; r++) {
+            int idx_in_filter = g_daw.action_scroll_row + r;
+            if (idx_in_filter >= g_daw.num_filtered) break;
+
+            int real_idx = g_daw.filtered_indices[idx_in_filter];
+            int ry = table_y + 20 + (r * 20);
+            bool is_sel = (g_daw.selected_action_idx == real_idx);
+
+            if (is_sel) {
+                SDL_Rect sel_r = { aw->x + 13, ry, table_w - 2, 20 };
+                SDL_SetRenderDrawColor(ren, 218, 230, 245, 255); // REAPER light blue selection
+                SDL_RenderFillRect(ren, &sel_r);
             }
 
-            draw_text(ren, g_daw.actions[a].name, sx + 20, ay + 2, c_white);
+            draw_text(ren, g_daw.actions[real_idx].shortcut, aw->x + 16, ry + 4, c_black);
+            draw_text(ren, g_daw.actions[real_idx].description, aw->x + 140, ry + 4, c_black);
+        }
 
-            char key_buf[32];
-            if (is_rebinding) {
-                snprintf(key_buf, sizeof(key_buf), "[Press Key...]");
+        // Lower Pane: "Shortcuts for selected action"
+        int lower_y = table_y + table_h + 12;
+        SDL_Rect grp_box = { aw->x + 12, lower_y, 300, 110 };
+        SDL_SetRenderDrawColor(ren, 160, 160, 160, 255);
+        SDL_RenderDrawRect(ren, &grp_box);
+        draw_text(ren, "Shortcuts for selected action", aw->x + 20, lower_y - 6, c_black);
+
+        // Shortcut readout box
+        SDL_Rect sc_box = { aw->x + 20, lower_y + 14, 180, 80 };
+        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+        SDL_RenderFillRect(ren, &sc_box);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &sc_box);
+
+        if (g_daw.selected_action_idx >= 0 && g_daw.selected_action_idx < g_daw.num_actions) {
+            if (g_daw.input_focus == INPUT_FOCUS_SHORTCUT_ASSIGN) {
+                draw_text(ren, "[Press Key Combination...]", aw->x + 24, lower_y + 20, c_blue);
             } else {
-                snprintf(key_buf, sizeof(key_buf), "%s%s",
-                         (g_daw.actions[a].mod & KMOD_CTRL) ? "Ctrl+" : "",
-                         SDL_GetKeyName(g_daw.actions[a].key));
+                draw_text(ren, g_daw.actions[g_daw.selected_action_idx].shortcut, aw->x + 24, lower_y + 20, c_black);
             }
-            draw_text(ren, key_buf, sx + sw - 140, ay + 2, is_rebinding ? c_white : c_muted);
         }
 
-        SDL_Rect btn_rebind = { sx + 12, sy + sh - 36, 140, 24 };
-        SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
-        SDL_RenderFillRect(ren, &btn_rebind);
-        draw_text(ren, "Assign Selected", sx + 16, sy + sh - 30, c_white);
-    }
-
-    // 9. Draggable Script Manager
-    if (g_daw.script_manager_open) {
-        SDL_Rect *sr = &g_daw.script_win_rect;
-        SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
-        SDL_RenderFillRect(ren, sr);
-        SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
-        SDL_RenderDrawRect(ren, sr);
-
-        SDL_Rect s_hdr = { sr->x, sr->y, sr->w, 26 };
-        SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
-        SDL_RenderFillRect(ren, &s_hdr);
-
-        char win_title[64];
-        snprintf(win_title, sizeof(win_title), "%s Script Manager", g_daw.script_manager_is_python ? "Python" : "Lua");
-        draw_text(ren, win_title, sr->x + 8, sr->y + 8, c_white);
-        draw_text(ren, "X", sr->x + sr->w - 18, sr->y + 8, c_white);
-
-        SDL_Rect list_box = { sr->x + 12, sr->y + 34, sr->w - 24, 180 };
-        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-        SDL_RenderFillRect(ren, &list_box);
-
-        for (int s = 0; s < g_daw.num_scripts; s++) {
-            int sy = sr->y + 38 + (s * 22);
-            if (s == g_daw.script_selected_idx) {
-                SDL_Rect s_row = { sr->x + 14, sy - 2, sr->w - 28, 20 };
-                SDL_SetRenderDrawColor(ren, 48, 48, 48, 255);
-                SDL_RenderFillRect(ren, &s_row);
-            }
-            draw_text(ren, g_daw.scripts[s].name, sr->x + 18, sy + 2, c_white);
-            draw_text(ren, g_daw.scripts[s].shortcut, sr->x + sr->w - 70, sy + 2, c_white);
-        }
-
-        int by = sr->y + sr->h - 38;
-        SDL_Rect btn_add_sc = { sr->x + 12, by, 92, 28 };
-        SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
+        // Add... and Delete shortcut buttons
+        SDL_Rect btn_add_sc = { aw->x + 210, lower_y + 14, 80, 24 };
+        SDL_SetRenderDrawColor(ren, 225, 225, 225, 255);
         SDL_RenderFillRect(ren, &btn_add_sc);
-        draw_text(ren, "Add Script", sr->x + 18, by + 8, c_white);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &btn_add_sc);
+        draw_text(ren, "Add...", aw->x + 230, lower_y + 18, c_black);
 
-        SDL_Rect btn_run_sc = { sr->x + 114, by, 92, 28 };
-        SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
-        SDL_RenderFillRect(ren, &btn_run_sc);
-        draw_text(ren, "Run Script", sr->x + 120, by + 8, c_white);
-
-        SDL_Rect btn_del_sc = { sr->x + 216, by, 92, 28 };
-        SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
+        SDL_Rect btn_del_sc = { aw->x + 210, lower_y + 44, 80, 24 };
+        SDL_SetRenderDrawColor(ren, 225, 225, 225, 255);
         SDL_RenderFillRect(ren, &btn_del_sc);
-        draw_text(ren, "Delete", sr->x + 236, by + 8, c_white);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &btn_del_sc);
+        draw_text(ren, "Delete", aw->x + 226, lower_y + 48, c_black);
+
+        // Right Side Control Buttons: New action..., Run, Run/close, Close
+        int btn_col_x = aw->x + 330;
+        int btn_col_w = 96;
+
+        SDL_Rect btn_new_act = { btn_col_x, lower_y + 14, btn_col_w, 24 };
+        SDL_SetRenderDrawColor(ren, 225, 225, 225, 255);
+        SDL_RenderFillRect(ren, &btn_new_act);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &btn_new_act);
+        draw_text(ren, "New action...", btn_col_x + 6, lower_y + 18, c_black);
+
+        SDL_Rect btn_run = { btn_col_x, lower_y + 46, btn_col_w, 24 };
+        SDL_SetRenderDrawColor(ren, 225, 225, 225, 255);
+        SDL_RenderFillRect(ren, &btn_run);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &btn_run);
+        draw_text(ren, "Run", btn_col_x + 34, lower_y + 50, c_blue);
+
+        SDL_Rect btn_run_close = { btn_col_x + 104, lower_y + 46, btn_col_w, 24 };
+        SDL_SetRenderDrawColor(ren, 225, 225, 225, 255);
+        SDL_RenderFillRect(ren, &btn_run_close);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &btn_run_close);
+        draw_text(ren, "Run/close", btn_col_x + 116, lower_y + 50, c_black);
+
+        SDL_Rect btn_close_dlg = { btn_col_x + 104, lower_y + 76, btn_col_w, 24 };
+        SDL_SetRenderDrawColor(ren, 225, 225, 225, 255);
+        SDL_RenderFillRect(ren, &btn_close_dlg);
+        SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
+        SDL_RenderDrawRect(ren, &btn_close_dlg);
+        draw_text(ren, "Close", btn_col_x + 130, lower_y + 80, c_black);
     }
 
     if (g_daw.menu_file_open) {
