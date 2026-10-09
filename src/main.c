@@ -23,6 +23,7 @@
 #include "daw_ui.h"
 #include "daw_input.h"
 
+// Define global engine instance
 DawEngine g_daw;
 
 static SDL_Cursor *g_cursor_arrow = NULL;
