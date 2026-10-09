@@ -14,6 +14,56 @@
 #include "daw_ui.h"
 #include "daw_input.h"
 
+// Define cursor variables
+static SDL_Cursor *g_cursor_arrow = NULL;
+static SDL_Cursor *g_cursor_size_we = NULL;
+static SDL_Cursor *g_cursor_size_ns = NULL;
+
+void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
+    DawEngine *eng = (DawEngine *)userdata;
+    ProjectTab *p = &eng->tabs[eng->active_tab];
+    float *out = (float *)stream;
+    int frames_needed = len / (sizeof(float) * 2);
+    memset(stream, 0, len);
+
+    if (!p->is_playing) return;
+
+    bool any_solo = false;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->tracks[t].solo) { any_solo = true; break; }
+    }
+
+    double st = p->playhead_seconds;
+    double et = st + ((double)frames_needed / SAMPLE_RATE);
+
+    for (int i = 0; i < p->num_items; i++) {
+        AudioItem *it = &p->items[i];
+        if (!it->raw_file_handle) continue;
+
+        Track *tr = &p->tracks[it->track_idx];
+        if (tr->mute) continue;
+        if (any_solo && !tr->solo) continue;
+
+        float linear_gain = db_to_linear(p->track_db[it->track_idx]);
+        double it_s = it->start_time;
+        double it_e = it->start_time + it->duration;
+
+        if (it_e > st && it_s < et) {
+            int64_t sample_offset = (int64_t)(((st - it_s) + it->offset_in_file) * SAMPLE_RATE);
+            if (sample_offset >= 0) {
+                fseek(it->raw_file_handle, sample_offset * sizeof(float) * 2, SEEK_SET);
+                float chunk[1024 * 2];
+                size_t read_frames = fread(chunk, sizeof(float) * 2, frames_needed, it->raw_file_handle);
+                for (size_t f = 0; f < read_frames; f++) {
+                    out[f * 2]     += chunk[f * 2] * linear_gain;
+                    out[f * 2 + 1] += chunk[f * 2 + 1] * linear_gain;
+                }
+            }
+        }
+    }
+    p->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
+}
+
 int main(int argc, char *argv[]) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
 
