@@ -26,36 +26,34 @@
 #define MARKER_BAR_HEIGHT 22
 #define SCROLLBAR_SIZE 16
 #define MAX_UNDO_STACK 32
-#define MAX_SCRIPTS 32
+#define MAX_SCRIPTS 64
 #define MAX_TABS 8
 #define MAX_MARKERS 64
-#define MAX_ACTIONS 32
+#define MAX_ACTIONS 128
 
 typedef enum {
     INPUT_FOCUS_NONE = 0,
     INPUT_FOCUS_TRACK_NAME,
     INPUT_FOCUS_MARKER,
-    INPUT_FOCUS_KEY_BIND
+    INPUT_FOCUS_ACTION_FILTER,
+    INPUT_FOCUS_SHORTCUT_ASSIGN
 } InputFocusType;
 
 typedef struct {
-    int action_id;
-    char name[64];
+    int id;
+    char description[128];
+    char shortcut[32];
+    char script_path[260];
+    bool is_script;
+    bool is_python;
     SDL_Keycode key;
-    Uint16 mod; // KMOD_CTRL, KMOD_SHIFT, etc.
-} DawKeyAction;
+    Uint16 mod;
+} ActionItem;
 
 typedef struct {
     double time_sec;
     char text[64];
 } DawMarker;
-
-typedef struct {
-    char name[64];
-    char filepath[260];
-    char shortcut[16];
-    bool is_python;
-} DawScript;
 
 typedef struct {
     AudioItem items[MAX_ITEMS];
@@ -92,7 +90,6 @@ typedef struct {
     int num_markers;
     bool show_marker_lane;
 
-    // Inbuilt Plugins per Project
     SimpleFilterPlugin master_filter;
     SimpleDelayPlugin master_delay;
 
@@ -108,22 +105,19 @@ typedef struct DawEngine {
 
     SDL_AudioDeviceID audio_device;
 
-    // Shortcuts Engine
-    DawKeyAction actions[MAX_ACTIONS];
+    // REAPER-Style Action Registry
+    ActionItem actions[MAX_ACTIONS];
     int num_actions;
-    bool shortcut_manager_open;
-    int rebinding_action_idx;
-
-    // Scripts
-    DawScript scripts[MAX_SCRIPTS];
-    int num_scripts;
-    bool script_manager_open;
-    bool script_manager_is_python;
-    int script_selected_idx;
-    SDL_Rect script_win_rect;
-    bool script_win_dragging;
-    int script_drag_offset_x;
-    int script_drag_offset_y;
+    int filtered_indices[MAX_ACTIONS];
+    int num_filtered;
+    int selected_action_idx;
+    bool action_window_open;
+    char filter_buf[64];
+    int action_scroll_row;
+    SDL_Rect action_win_rect;
+    bool action_win_dragging;
+    int action_drag_offset_x;
+    int action_drag_offset_y;
 
     // Menus
     bool menu_file_open;
@@ -141,7 +135,7 @@ typedef struct DawEngine {
     // Marker Selection
     int selected_marker_idx;
 
-    // Text Box Input State
+    // Input Focus State
     InputFocusType input_focus;
     int editing_track_name_idx;
     char editing_name_buf[64];
@@ -169,6 +163,54 @@ static inline void format_timecode(double seconds, char *out, size_t max_len) {
     int s = (int)(seconds - h * 3600 - m * 60);
     int ms = (int)((seconds - (int)seconds) * 1000);
     snprintf(out, max_len, "%02d:%02d:%02d.%03d", h, m, s, ms);
+}
+
+static inline void filter_actions(void) {
+    g_daw.num_filtered = 0;
+    bool has_filter = (strlen(g_daw.filter_buf) > 0);
+    for (int i = 0; i < g_daw.num_actions; i++) {
+        if (!has_filter || strcasestr(g_daw.actions[i].description, g_daw.filter_buf)) {
+            g_daw.filtered_indices[g_daw.num_filtered++] = i;
+        }
+    }
+}
+
+static inline void register_action(int id, const char *desc, const char *sc, SDL_Keycode key, Uint16 mod, const char *script, bool is_py) {
+    if (g_daw.num_actions >= MAX_ACTIONS) return;
+    ActionItem *a = &g_daw.actions[g_daw.num_actions++];
+    a->id = id;
+    strncpy(a->description, desc, sizeof(a->description) - 1);
+    strncpy(a->shortcut, sc, sizeof(a->shortcut) - 1);
+    a->key = key;
+    a->mod = mod;
+    if (script && strlen(script) > 0) {
+        a->is_script = true;
+        a->is_python = is_py;
+        strncpy(a->script_path, script, sizeof(a->script_path) - 1);
+    } else {
+        a->is_script = false;
+        a->script_path[0] = '\0';
+    }
+}
+
+static inline void init_default_actions(void) {
+    g_daw.num_actions = 0;
+    register_action(1,  "Transport: Play/pause", "Space", SDLK_SPACE, 0, NULL, false);
+    register_action(2,  "Item: Split items at edit cursor", "S", SDLK_s, 0, NULL, false);
+    register_action(3,  "Markers: Insert marker at current position", "M", SDLK_m, 0, NULL, false);
+    register_action(4,  "View: Zoom in horizontal", "=", SDLK_EQUALS, 0, NULL, false);
+    register_action(5,  "View: Zoom out horizontal", "-", SDLK_MINUS, 0, NULL, false);
+    register_action(6,  "Edit: Undo", "Ctrl+Z", SDLK_z, KMOD_CTRL, NULL, false);
+    register_action(7,  "Edit: Redo", "Ctrl+Y", SDLK_y, KMOD_CTRL, NULL, false);
+    register_action(8,  "View: Toggle video monitor window", "V", SDLK_v, 0, NULL, false);
+    register_action(9,  "Transport: Go to start of project", "Home", SDLK_HOME, 0, NULL, false);
+    register_action(10, "Item: Remove selected items/markers", "Delete", SDLK_DELETE, 0, NULL, false);
+    register_action(11, "Track: Insert new track", "T", SDLK_t, 0, NULL, false);
+    register_action(12, "File: Save project", "Ctrl+S", SDLK_s, KMOD_CTRL, NULL, false);
+    register_action(13, "File: Open project", "Ctrl+O", SDLK_o, KMOD_CTRL, NULL, false);
+    register_action(14, "Action: Show action list", "?", SDLK_SLASH, KMOD_SHIFT, NULL, false);
+
+    filter_actions();
 }
 
 static inline void init_tab_defaults(int idx, const char *title) {
@@ -223,25 +265,6 @@ static inline void close_tab(int idx) {
     if (g_daw.active_tab >= g_daw.num_tabs) {
         g_daw.active_tab = g_daw.num_tabs - 1;
     }
-}
-
-static inline void init_default_shortcuts(void) {
-    g_daw.num_actions = 0;
-    #define REG_ACT(id, lbl, k, m) \
-        g_daw.actions[g_daw.num_actions] = (DawKeyAction){ id, lbl, k, m }; \
-        g_daw.num_actions++;
-
-    REG_ACT(1, "Play / Pause", SDLK_SPACE, 0);
-    REG_ACT(2, "Split Item At Playhead", SDLK_s, 0);
-    REG_ACT(3, "Insert Marker", SDLK_m, 0);
-    REG_ACT(4, "Zoom In", SDLK_EQUALS, 0);
-    REG_ACT(5, "Zoom Out", SDLK_MINUS, 0);
-    REG_ACT(6, "Undo", SDLK_z, KMOD_CTRL);
-    REG_ACT(7, "Redo", SDLK_y, KMOD_CTRL);
-    REG_ACT(8, "Jump To Start", SDLK_HOME, 0);
-    REG_ACT(9, "Toggle Video Window", SDLK_v, 0);
-    REG_ACT(10, "Delete Item / Marker", SDLK_DELETE, 0);
-    #undef REG_ACT
 }
 
 static inline void push_undo_state(void) {
