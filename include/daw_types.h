@@ -36,8 +36,23 @@ typedef enum {
     INPUT_FOCUS_TRACK_NAME,
     INPUT_FOCUS_MARKER,
     INPUT_FOCUS_ACTION_FILTER,
-    INPUT_FOCUS_SHORTCUT_ASSIGN
+    INPUT_FOCUS_SHORTCUT_ASSIGN,
+    INPUT_FOCUS_RENDER_DIR,
+    INPUT_FOCUS_RENDER_FILE
 } InputFocusType;
+
+typedef struct {
+    char directory[260];
+    char filename[128];
+    int source_idx;       // 0: Master mix, 1: Selected tracks (stems)
+    int bounds_idx;       // 0: Entire project, 1: Time selection
+    int sample_rate;      // 44100, 48000, 96000
+    int channels;         // 1: Mono, 2: Stereo
+    int format_idx;       // 0: WAV, 1: MP3, 2: FLAC, 3: OGG
+    int bit_depth_idx;    // 0: 16 bit PCM, 1: 24 bit PCM
+    bool auto_increment;  // [x] Silently increment filenames to avoid overwriting
+    bool skip_silent;     // [x] Do not render files that are likely silent
+} RenderSettings;
 
 typedef struct {
     int id;
@@ -119,11 +134,17 @@ typedef struct DawEngine {
     int action_drag_offset_x;
     int action_drag_offset_y;
 
+    // REAPER-Style Render Window
+    bool render_window_open;
+    SDL_Rect render_win_rect;
+    bool render_win_dragging;
+    int render_drag_offset_x;
+    int render_drag_offset_y;
+    RenderSettings render_settings;
+
     // Menus
     bool menu_file_open;
     bool menu_action_open;
-    bool submenu_export_audio_open;
-    bool submenu_export_video_open;
 
     // Marquee Selection Box
     bool marquee_selecting;
@@ -209,6 +230,7 @@ static inline void init_default_actions(void) {
     register_action(12, "File: Save project", "Ctrl+S", SDLK_s, KMOD_CTRL, NULL, false);
     register_action(13, "File: Open project", "Ctrl+O", SDLK_o, KMOD_CTRL, NULL, false);
     register_action(14, "Action: Show action list", "?", SDLK_SLASH, KMOD_SHIFT, NULL, false);
+    register_action(15, "File: Render to file...", "Ctrl+Alt+R", SDLK_r, KMOD_CTRL | KMOD_ALT, NULL, false);
 
     filter_actions();
 }
