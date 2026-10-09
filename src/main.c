@@ -1090,7 +1090,7 @@ int main(int argc, char *argv[]) {
             SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
             SDL_RenderDrawLine(ren, cur_px, corner_y, cur_px, header_top_y + view_h);
         }
-        SDL_RenderSetClipRect(NULL);
+        SDL_RenderSetClipRect(ren, NULL);
 
         // 6. Track Header (TCP) on the Left
         SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
@@ -1142,7 +1142,7 @@ int main(int argc, char *argv[]) {
             SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
             SDL_RenderDrawLine(ren, 0, ty + th, g_daw.tcp_width, ty + th);
         }
-        SDL_RenderSetClipRect(NULL);
+        SDL_RenderSetClipRect(ren, NULL);
 
         SDL_SetRenderDrawColor(ren, 45, 45, 45, 255);
         SDL_RenderDrawLine(ren, g_daw.tcp_width - 1, TABBAR_HEIGHT + TOPBAR_HEIGHT, g_daw.tcp_width - 1, win_h);
