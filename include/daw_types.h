@@ -18,6 +18,7 @@
 
 #include "video_player.h"
 #include "audio_engine.h"
+#include "daw_plugins.h"
 
 #define TABBAR_HEIGHT 28
 #define TOPBAR_HEIGHT 36
@@ -28,12 +29,21 @@
 #define MAX_SCRIPTS 32
 #define MAX_TABS 8
 #define MAX_MARKERS 64
+#define MAX_ACTIONS 32
 
 typedef enum {
     INPUT_FOCUS_NONE = 0,
     INPUT_FOCUS_TRACK_NAME,
-    INPUT_FOCUS_MARKER
+    INPUT_FOCUS_MARKER,
+    INPUT_FOCUS_KEY_BIND
 } InputFocusType;
+
+typedef struct {
+    int action_id;
+    char name[64];
+    SDL_Keycode key;
+    Uint16 mod; // KMOD_CTRL, KMOD_SHIFT, etc.
+} DawKeyAction;
 
 typedef struct {
     double time_sec;
@@ -82,6 +92,10 @@ typedef struct {
     int num_markers;
     bool show_marker_lane;
 
+    // Inbuilt Plugins per Project
+    SimpleFilterPlugin master_filter;
+    SimpleDelayPlugin master_delay;
+
     SimpleVideoPlayer video;
     UndoRedoManager undo_mgr;
 } ProjectTab;
@@ -93,6 +107,12 @@ typedef struct DawEngine {
     int tcp_width;
 
     SDL_AudioDeviceID audio_device;
+
+    // Shortcuts Engine
+    DawKeyAction actions[MAX_ACTIONS];
+    int num_actions;
+    bool shortcut_manager_open;
+    int rebinding_action_idx;
 
     // Scripts
     DawScript scripts[MAX_SCRIPTS];
@@ -121,7 +141,7 @@ typedef struct DawEngine {
     // Marker Selection
     int selected_marker_idx;
 
-    // Exclusive Text Box Input State
+    // Text Box Input State
     InputFocusType input_focus;
     int editing_track_name_idx;
     char editing_name_buf[64];
@@ -160,6 +180,8 @@ static inline void init_tab_defaults(int idx, const char *title) {
     p->pixels_per_second = 80.0f;
     p->project_duration_sec = 300.0;
     p->show_marker_lane = true;
+    p->master_filter = (SimpleFilterPlugin){ .enabled = false, .cutoff_hz = 12000.0f };
+    p->master_delay = (SimpleDelayPlugin){ .enabled = false, .delay_time_sec = 0.25f, .feedback = 0.35f };
     p->video = (SimpleVideoPlayer){ .rect = { 650, 160, 480, 310 }, .is_open = false, .video_stream_idx = -1 };
 
     for (int t = 0; t < MAX_TRACKS; t++) {
@@ -201,6 +223,25 @@ static inline void close_tab(int idx) {
     if (g_daw.active_tab >= g_daw.num_tabs) {
         g_daw.active_tab = g_daw.num_tabs - 1;
     }
+}
+
+static inline void init_default_shortcuts(void) {
+    g_daw.num_actions = 0;
+    #define REG_ACT(id, lbl, k, m) \
+        g_daw.actions[g_daw.num_actions] = (DawKeyAction){ id, lbl, k, m }; \
+        g_daw.num_actions++;
+
+    REG_ACT(1, "Play / Pause", SDLK_SPACE, 0);
+    REG_ACT(2, "Split Item At Playhead", SDLK_s, 0);
+    REG_ACT(3, "Insert Marker", SDLK_m, 0);
+    REG_ACT(4, "Zoom In", SDLK_EQUALS, 0);
+    REG_ACT(5, "Zoom Out", SDLK_MINUS, 0);
+    REG_ACT(6, "Undo", SDLK_z, KMOD_CTRL);
+    REG_ACT(7, "Redo", SDLK_y, KMOD_CTRL);
+    REG_ACT(8, "Jump To Start", SDLK_HOME, 0);
+    REG_ACT(9, "Toggle Video Window", SDLK_v, 0);
+    REG_ACT(10, "Delete Item / Marker", SDLK_DELETE, 0);
+    #undef REG_ACT
 }
 
 static inline void push_undo_state(void) {
