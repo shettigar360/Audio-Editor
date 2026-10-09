@@ -20,6 +20,7 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-SDL2
             mingw-w64-ucrt-x86_64-ffmpeg
             mingw-w64-ucrt-x86_64-lua
             mingw-w64-ucrt-x86_64-python
@@ -35,12 +36,24 @@ jobs:
         run: |
           cmake --build build
 
-      - name: Package Executable with Complete Dependency Tree
+      - name: Package Complete 150MB Runtime Bundle
         shell: msys2 {0}
         run: |
           mkdir -p package
           cp build/audio_editor.exe package/
-          for dll in $(ntldd -R build/audio_editor.exe | grep ucrt64 | awk '{print $3}'); do
+
+          # Copy core engine runtime libraries (FFmpeg, SDL2, Lua, Python, MinGW)
+          cp /ucrt64/bin/avcodec-*.dll package/ 2>/dev/null || true
+          cp /ucrt64/bin/avformat-*.dll package/ 2>/dev/null || true
+          cp /ucrt64/bin/avutil-*.dll package/ 2>/dev/null || true
+          cp /ucrt64/bin/swresample-*.dll package/ 2>/dev/null || true
+          cp /ucrt64/bin/swscale-*.dll package/ 2>/dev/null || true
+          cp /ucrt64/bin/SDL2.dll package/ 2>/dev/null || true
+          cp /ucrt64/bin/lua*.dll package/ 2>/dev/null || true
+          cp /ucrt64/bin/libpython*.dll package/ 2>/dev/null || true
+
+          # Copy all transitive media codec and system dependencies
+          for dll in $(ldd build/audio_editor.exe | grep ucrt64 | awk '{print $3}'); do
             cp "$dll" package/ 2>/dev/null || true
           done
 
