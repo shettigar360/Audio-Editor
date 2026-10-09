@@ -104,14 +104,12 @@ static inline void seek_video(SimpleVideoPlayer *v, double target_seconds) {
     v->current_pts = target_seconds;
 }
 
-// Master audio sync: reads sequentially to display the frame matching the audio clock
 static inline void sync_video_to_audio_clock(SimpleVideoPlayer *v, double audio_master_time, bool is_seeking) {
     if (!v->fmt_ctx || v->video_stream_idx == -1) return;
 
     AVStream *st = v->fmt_ctx->streams[v->video_stream_idx];
     double time_base = av_q2d(st->time_base);
 
-    // If scrubbed or audio jumped past half a second, seek to closest keyframe
     if (is_seeking || fabs(audio_master_time - v->current_pts) > 0.5) {
         seek_video(v, audio_master_time);
     }
