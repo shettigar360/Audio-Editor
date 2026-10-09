@@ -7,8 +7,8 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
 pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswresample libswscale)
 
-# On MSYS2 UCRT64, the pkg-config file is named 'lua', with 'lua5.4' / 'lua-5.4' as fallbacks
-pkg_check_modules(LUA REQUIRED lua lua-5.4 lua5.4 lua54)
+# Use pkg_search_module to pick whichever Lua pkg-config name exists
+pkg_search_module(LUA REQUIRED lua lua5.4 lua-5.4 lua54)
 
 add_executable(audio_editor src/main.c)
 
