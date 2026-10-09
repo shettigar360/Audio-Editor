@@ -34,12 +34,12 @@ typedef struct {
     double offset_in_file;
     double duration;
     double file_total_duration;
-    char file_path[512];        // Original media path reference
-    char raw_audio_path[512];   // Cached demuxed raw PCM in temp folder
+    char file_path[512];
+    char raw_audio_path[512];
     char label[128];
-    PeakBin *peaks;             // Small visual peak array (< 400 KB)
+    PeakBin *peaks;
     int peak_count;
-    FILE *raw_file_handle;      // Persistent handle for ultra-fast reading
+    FILE *raw_file_handle;
     bool is_selected;
 } AudioItem;
 
@@ -51,7 +51,6 @@ typedef struct {
     float volume;
 } Track;
 
-// Simple string hash to generate distinct cache filenames
 static inline unsigned int hash_path(const char *str) {
     unsigned int hash = 5381;
     int c;
@@ -59,7 +58,6 @@ static inline unsigned int hash_path(const char *str) {
     return hash;
 }
 
-// Demuxes and caches raw 48kHz stereo float PCM and peaks to .cache/ with 0 RAM overhead
 static inline int process_media_cache(const char *filepath, AudioItem *item) {
 #ifdef _WIN32
     CreateDirectoryA(".cache", NULL);
@@ -115,7 +113,7 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
 
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    float temp_pcm[2048 * 2]; // Stereo float chunk
+    float temp_pcm[2048 * 2];
     float cur_min = 0.0f, cur_max = 0.0f;
     int samples_in_bin = 0;
     int64_t total_written_frames = 0;
