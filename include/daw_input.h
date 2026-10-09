@@ -75,6 +75,7 @@ static inline void execute_action_by_id(int action_id) {
         case 12: save_project_file(); break;
         case 13: load_project_file(); break;
         case 14: g_daw.action_window_open = !g_daw.action_window_open; break;
+        case 15: g_daw.render_window_open = !g_daw.render_window_open; break;
         default: break;
     }
 }
@@ -145,6 +146,10 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
                 strcat(g_daw.filter_buf, e->text.text);
                 filter_actions();
             }
+        } else if (g_daw.input_focus == INPUT_FOCUS_RENDER_DIR) {
+            if (strlen(g_daw.render_settings.directory) + strlen(e->text.text) < 259) strcat(g_daw.render_settings.directory, e->text.text);
+        } else if (g_daw.input_focus == INPUT_FOCUS_RENDER_FILE) {
+            if (strlen(g_daw.render_settings.filename) + strlen(e->text.text) < 127) strcat(g_daw.render_settings.filename, e->text.text);
         }
     } else if (e->type == SDL_DROPFILE) {
         char *file = e->drop.file;
@@ -173,6 +178,28 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
             } else if (e->key.keysym.sym == SDLK_BACKSPACE) {
                 size_t l = strlen(g_daw.filter_buf);
                 if (l > 0) { g_daw.filter_buf[l - 1] = '\0'; filter_actions(); }
+            }
+            return;
+        }
+
+        if (g_daw.input_focus == INPUT_FOCUS_RENDER_DIR) {
+            if (e->key.keysym.sym == SDLK_RETURN || e->key.keysym.sym == SDLK_ESCAPE) {
+                g_daw.input_focus = INPUT_FOCUS_NONE;
+                SDL_StopTextInput();
+            } else if (e->key.keysym.sym == SDLK_BACKSPACE) {
+                size_t l = strlen(g_daw.render_settings.directory);
+                if (l > 0) g_daw.render_settings.directory[l - 1] = '\0';
+            }
+            return;
+        }
+
+        if (g_daw.input_focus == INPUT_FOCUS_RENDER_FILE) {
+            if (e->key.keysym.sym == SDLK_RETURN || e->key.keysym.sym == SDLK_ESCAPE) {
+                g_daw.input_focus = INPUT_FOCUS_NONE;
+                SDL_StopTextInput();
+            } else if (e->key.keysym.sym == SDLK_BACKSPACE) {
+                size_t l = strlen(g_daw.render_settings.filename);
+                if (l > 0) g_daw.render_settings.filename[l - 1] = '\0';
             }
             return;
         }
@@ -252,11 +279,128 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
             SDL_StopTextInput();
         }
 
+        // Render to File Window Interaction
+        if (g_daw.render_window_open) {
+            SDL_Rect *rw = &g_daw.render_win_rect;
+            RenderSettings *rs = &g_daw.render_settings;
+
+            // Header Drag and Close [X]
+            if (mx >= rw->x && mx <= rw->x + rw->w && my >= rw->y && my <= rw->y + 26) {
+                if (mx >= rw->x + rw->w - 26) {
+                    g_daw.render_window_open = false;
+                } else {
+                    g_daw.render_win_dragging = true;
+                    g_daw.render_drag_offset_x = mx - rw->x;
+                    g_daw.render_drag_offset_y = my - rw->y;
+                }
+                return;
+            }
+
+            int cy = rw->y + 36;
+            // Source Dropdown Toggle
+            if (mx >= rw->x + 70 && mx <= rw->x + 220 && my >= cy && my <= cy + 22) {
+                rs->source_idx = !rs->source_idx;
+                return;
+            }
+            // Bounds Dropdown Toggle
+            if (mx >= rw->x + 236 && mx <= rw->x + 376 && my >= cy && my <= cy + 22) {
+                rs->bounds_idx = !rs->bounds_idx;
+                return;
+            }
+
+            cy += 32;
+            // Directory Input
+            if (mx >= rw->x + 88 && mx <= rw->x + rw->w - 122 && my >= cy + 10 && my <= cy + 32) {
+                g_daw.input_focus = INPUT_FOCUS_RENDER_DIR;
+                SDL_StartTextInput();
+                return;
+            }
+            // Browse Directory Button
+            if (mx >= rw->x + rw->w - 110 && mx <= rw->x + rw->w - 26 && my >= cy + 10 && my <= cy + 32) {
+                char chosen_file[MAX_PATH];
+                if (open_generic_dialog(chosen_file, sizeof(chosen_file), "Audio File (*.wav)\0*.wav\0", true)) {
+                    char *last_slash = strrchr(chosen_file, '\\');
+                    if (!last_slash) last_slash = strrchr(chosen_file, '/');
+                    if (last_slash) {
+                        *last_slash = '\0';
+                        strncpy(rs->directory, chosen_file, sizeof(rs->directory) - 1);
+                        strncpy(rs->filename, last_slash + 1, sizeof(rs->filename) - 1);
+                        char *dot = strrchr(rs->filename, '.');
+                        if (dot) *dot = '\0';
+                    }
+                }
+                return;
+            }
+
+            // File Name Input
+            if (mx >= rw->x + 88 && mx <= rw->x + rw->w - 122 && my >= cy + 38 && my <= cy + 60) {
+                g_daw.input_focus = INPUT_FOCUS_RENDER_FILE;
+                SDL_StartTextInput();
+                return;
+            }
+
+            cy += 114;
+            // Sample rate toggle
+            if (mx >= rw->x + 96 && mx <= rw->x + 176 && my >= cy && my <= cy + 22) {
+                if (rs->sample_rate == 48000) rs->sample_rate = 96000;
+                else if (rs->sample_rate == 96000) rs->sample_rate = 44100;
+                else rs->sample_rate = 48000;
+                return;
+            }
+            // Channels toggle
+            if (mx >= rw->x + 286 && mx <= rw->x + 366 && my >= cy && my <= cy + 22) {
+                rs->channels = (rs->channels == 1) ? 2 : 1;
+                return;
+            }
+
+            cy += 34;
+            // Format toggle
+            if (mx >= rw->x + 76 && mx <= rw->x + 196 && my >= cy + 12 && my <= cy + 34) {
+                rs->format_idx = (rs->format_idx + 1) % 4;
+                return;
+            }
+            // Bit depth toggle
+            if (rs->format_idx == 0 && mx >= rw->x + 316 && mx <= rw->x + 426 && my >= cy + 12 && my <= cy + 34) {
+                rs->bit_depth_idx = !rs->bit_depth_idx;
+                return;
+            }
+
+            cy += 90;
+            // Checkbox 1: Auto-increment
+            if (mx >= rw->x + 16 && mx <= rw->x + 380 && my >= cy && my <= cy + 18) {
+                rs->auto_increment = !rs->auto_increment;
+                return;
+            }
+
+            cy += 22;
+            // Checkbox 2: Skip silent
+            if (mx >= rw->x + 16 && mx <= rw->x + 380 && my >= cy && my <= cy + 18) {
+                rs->skip_silent = !rs->skip_silent;
+                return;
+            }
+
+            cy += 34;
+            // Render 1 file button
+            if (mx >= rw->x + rw->w - 220 && mx <= rw->x + rw->w - 110 && my >= cy && my <= cy + 28) {
+                execute_render_to_file();
+                g_daw.render_window_open = false;
+                return;
+            }
+
+            // Cancel button
+            if (mx >= rw->x + rw->w - 100 && mx <= rw->x + rw->w - 16 && my >= cy && my <= cy + 28) {
+                g_daw.render_window_open = false;
+                return;
+            }
+
+            // Block clicks from leaking behind the window
+            if (mx >= rw->x && mx <= rw->x + rw->w && my >= rw->y && my <= rw->y + rw->h) return;
+        }
+
         // Action Window Interactions
         if (g_daw.action_window_open) {
             SDL_Rect *aw = &g_daw.action_win_rect;
 
-            // Window Header Drag & Close
             if (mx >= aw->x && mx <= aw->x + aw->w && my >= aw->y && my <= aw->y + 24) {
                 if (mx >= aw->x + aw->w - 24) {
                     g_daw.action_window_open = false;
@@ -269,14 +413,12 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
             }
 
             int fy = aw->y + 32;
-            // Filter Box click
             if (mx >= aw->x + 60 && mx <= aw->x + 250 && my >= fy && my <= fy + 22) {
                 g_daw.input_focus = INPUT_FOCUS_ACTION_FILTER;
                 SDL_StartTextInput();
                 return;
             }
 
-            // Clear Button click
             if (mx >= aw->x + 256 && mx <= aw->x + 304 && my >= fy && my <= fy + 22) {
                 g_daw.filter_buf[0] = '\0';
                 filter_actions();
@@ -285,7 +427,6 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
 
             int table_y = aw->y + 80;
             int table_h = aw->h - 220;
-            // Table Row Click / Double-click to Run
             if (mx >= aw->x + 12 && mx <= aw->x + aw->w - 12 && my >= table_y && my <= table_y + table_h) {
                 int row = (my - table_y) / 20;
                 int filter_idx = g_daw.action_scroll_row + row;
@@ -298,15 +439,12 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
                 return;
             }
 
-            // Lower Buttons
             int lower_y = aw->y + aw->h - 130;
-            // Add shortcut button
             if (mx >= aw->x + 210 && mx <= aw->x + 290 && my >= lower_y + 14 && my <= lower_y + 38) {
                 if (g_daw.selected_action_idx >= 0) g_daw.input_focus = INPUT_FOCUS_SHORTCUT_ASSIGN;
                 return;
             }
 
-            // Delete shortcut button
             if (mx >= aw->x + 210 && mx <= aw->x + 290 && my >= lower_y + 44 && my <= lower_y + 68) {
                 if (g_daw.selected_action_idx >= 0) {
                     g_daw.actions[g_daw.selected_action_idx].shortcut[0] = '\0';
@@ -317,7 +455,6 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
             }
 
             int btn_col_x = aw->x + 330;
-            // New Action (Load Script)
             if (mx >= btn_col_x && mx <= btn_col_x + 96 && my >= lower_y + 14 && my <= lower_y + 38) {
                 char spath[MAX_PATH];
                 if (open_generic_dialog(spath, sizeof(spath), "Script Files (*.lua;*.py)\0*.lua;*.py\0", false)) {
@@ -332,26 +469,22 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
                 return;
             }
 
-            // Run
             if (mx >= btn_col_x && mx <= btn_col_x + 96 && my >= lower_y + 46 && my <= lower_y + 70) {
                 if (g_daw.selected_action_idx >= 0) execute_action_by_id(g_daw.actions[g_daw.selected_action_idx].id);
                 return;
             }
 
-            // Run/close
             if (mx >= btn_col_x + 104 && mx <= btn_col_x + 200 && my >= lower_y + 46 && my <= lower_y + 70) {
                 if (g_daw.selected_action_idx >= 0) execute_action_by_id(g_daw.actions[g_daw.selected_action_idx].id);
                 g_daw.action_window_open = false;
                 return;
             }
 
-            // Close
             if (mx >= btn_col_x + 104 && mx <= btn_col_x + 200 && my >= lower_y + 76 && my <= lower_y + 100) {
                 g_daw.action_window_open = false;
                 return;
             }
 
-            // Block clicks leaking through window
             if (mx >= aw->x && mx <= aw->x + aw->w && my >= aw->y && my <= aw->y + aw->h) return;
         }
 
@@ -410,20 +543,23 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
             }
         }
 
-        if ((g_daw.menu_file_open || g_daw.menu_action_open) && (mx > 260 || my > 260)) {
-            g_daw.menu_file_open = false;
-            g_daw.menu_action_open = false;
-            g_daw.submenu_export_audio_open = false;
-            g_daw.submenu_export_video_open = false;
-            return;
-        }
-
+        // File Menu Dropdown
         if (g_daw.menu_file_open) {
+            int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
             if (mx >= 8 && mx <= 200) {
-                int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-                if (my >= m_start && my < m_start + 24) { save_project_file(); g_daw.menu_file_open = false; return; }
-                else if (my >= m_start + 24 && my < m_start + 48) { load_project_file(); g_daw.menu_file_open = false; return; }
-                else if (my >= m_start + 48 && my < m_start + 72) {
+                if (my >= m_start && my < m_start + 22) {
+                    save_project_file();
+                    g_daw.menu_file_open = false;
+                    return;
+                } else if (my >= m_start + 22 && my < m_start + 44) {
+                    load_project_file();
+                    g_daw.menu_file_open = false;
+                    return;
+                } else if (my >= m_start + 44 && my < m_start + 66) {
+                    g_daw.render_window_open = true;
+                    g_daw.menu_file_open = false;
+                    return;
+                } else if (my >= m_start + 66 && my < m_start + 90) {
                     char pth[MAX_PATH];
                     if (open_generic_dialog(pth, sizeof(pth), "Media Files\0*.wav;*.mp3;*.flac;*.mp4;*.mkv;*.mov\0", false)) {
                         push_undo_state();
@@ -435,17 +571,13 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
                     g_daw.menu_file_open = false;
                     return;
                 }
-                else if (my >= m_start + 72 && my < m_start + 96) { g_daw.submenu_export_audio_open = !g_daw.submenu_export_audio_open; return; }
-                else if (my >= m_start + 96 && my < m_start + 120) { g_daw.submenu_export_video_open = !g_daw.submenu_export_video_open; return; }
-                else if (my >= m_start + 120 && my < m_start + 144) { export_batch_tracks(); g_daw.menu_file_open = false; return; }
             }
-            if (g_daw.submenu_export_audio_open && mx >= 200 && mx <= 310) {
-                int s_start = TABBAR_HEIGHT + TOPBAR_HEIGHT + 72;
-                if (my >= s_start && my < s_start + 22) { export_rendered_audio("wav"); g_daw.menu_file_open = false; return; }
-                if (my >= s_start + 22 && my < s_start + 44) { export_rendered_audio("mp3"); g_daw.menu_file_open = false; return; }
-                if (my >= s_start + 44 && my < s_start + 66) { export_rendered_audio("flac"); g_daw.menu_file_open = false; return; }
-                if (my >= s_start + 66 && my < s_start + 88) { export_rendered_audio("ogg"); g_daw.menu_file_open = false; return; }
-            }
+        }
+
+        if ((g_daw.menu_file_open || g_daw.menu_action_open) && (mx > 260 || my > 260)) {
+            g_daw.menu_file_open = false;
+            g_daw.menu_action_open = false;
+            return;
         }
 
         // Top Bar
@@ -629,6 +761,7 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
         resizing_track_idx = -1;
         moving_track_idx = -1;
         g_daw.action_win_dragging = false;
+        g_daw.render_win_dragging = false;
         dragging_item_idx = -1; dragging_trim_left = false; dragging_trim_right = false;
 
         if (g_daw.marquee_selecting) {
@@ -653,6 +786,11 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
     } else if (e->type == SDL_MOUSEMOTION) {
         int mx = e->motion.x, my = e->motion.y;
 
+        if (g_daw.render_win_dragging) {
+            g_daw.render_win_rect.x = mx - g_daw.render_drag_offset_x;
+            g_daw.render_win_rect.y = my - g_daw.render_drag_offset_y;
+        }
+
         if (g_daw.action_win_dragging) {
             g_daw.action_win_rect.x = mx - g_daw.action_drag_offset_x;
             g_daw.action_win_rect.y = my - g_daw.action_drag_offset_y;
@@ -663,7 +801,6 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
             for (int t = 0; t < p->num_tracks; t++) {
                 if (my >= cur_y && my < cur_y + p->track_heights[t]) {
                     if (t != moving_track_idx) {
-                        // Swap track items & properties
                         Track tmp_tr = p->tracks[moving_track_idx]; p->tracks[moving_track_idx] = p->tracks[t]; p->tracks[t] = tmp_tr;
                         float tmp_db = p->track_db[moving_track_idx]; p->track_db[moving_track_idx] = p->track_db[t]; p->track_db[t] = tmp_db;
                         int tmp_h = p->track_heights[moving_track_idx]; p->track_heights[moving_track_idx] = p->track_heights[t]; p->track_heights[t] = tmp_h;
