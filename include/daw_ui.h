@@ -23,7 +23,7 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
     SDL_Color c_muted = { 130, 130, 130, 255 };
     SDL_Color c_blue  = { 26, 86, 219, 255 };
 
-    // 1. Chrome-Style Project Tabs Bar [ x Project N ] [+]
+    // 1. Chrome-Style Project Tabs Bar
     SDL_Rect tab_bar = { 0, 0, win_w, TABBAR_HEIGHT };
     SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
     SDL_RenderFillRect(ren, &tab_bar);
@@ -163,7 +163,7 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
         SDL_RenderDrawLine(ren, rx, corner_y + 16, rx, corner_y + RULER_HEIGHT);
     }
 
-    // Logic Pro Marker Lane
+    // Marker Lane
     int marker_y = corner_y + RULER_HEIGHT;
     if (p->show_marker_lane) {
         SDL_Rect marker_bg = { g_daw.tcp_width, marker_y, view_w, MARKER_BAR_HEIGHT };
@@ -214,7 +214,7 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
         SDL_RenderDrawLine(ren, g_daw.tcp_width, track_cur_y, g_daw.tcp_width + view_w, track_cur_y);
     }
 
-    // 5. Render Clips & Waveforms
+    // 5. Render Clips & Peaks
     for (int i = 0; i < p->num_items; i++) {
         AudioItem *it = &p->items[i];
         int iy = header_top_y - p->scroll_y_px;
@@ -383,18 +383,69 @@ static inline void render_daw_ui(SDL_Renderer *ren, int win_w, int win_h) {
     SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
     SDL_RenderFillRect(ren, &thumb_v);
 
-    // 7. Popups & Menus
+    // 7. Action Menu Dropdown
     if (g_daw.menu_action_open) {
         int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-        SDL_Rect a_box = { 56, m_start, 134, 56 };
+        SDL_Rect a_box = { 56, m_start, 170, 78 };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &a_box);
         SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
         SDL_RenderDrawRect(ren, &a_box);
-        draw_text(ren, "Lua Scripts...", 64, m_start + 8, c_white);
-        draw_text(ren, "Python Scripts...", 64, m_start + 32, c_white);
+        draw_text(ren, "Key Shortcuts... (?)", 64, m_start + 8, c_white);
+        draw_text(ren, "Lua Scripts...", 64, m_start + 32, c_white);
+        draw_text(ren, "Python Scripts...", 64, m_start + 56, c_white);
     }
 
+    // 8. REAPER / Logic-Style Action & Shortcut Manager Dialog
+    if (g_daw.shortcut_manager_open) {
+        int sw = 500, sh = 320;
+        int sx = (win_w - sw) / 2, sy = (win_h - sh) / 2;
+        SDL_Rect s_bg = { sx, sy, sw, sh };
+        SDL_SetRenderDrawColor(ren, 22, 22, 22, 255);
+        SDL_RenderFillRect(ren, &s_bg);
+        SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
+        SDL_RenderDrawRect(ren, &s_bg);
+
+        SDL_Rect s_bar = { sx, sy, sw, 26 };
+        SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
+        SDL_RenderFillRect(ren, &s_bar);
+        draw_text(ren, "Action List & Shortcut Customizer", sx + 10, sy + 7, c_white);
+        draw_text(ren, "X", sx + sw - 20, sy + 7, c_white);
+
+        SDL_Rect s_list = { sx + 12, sy + 34, sw - 24, 230 };
+        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+        SDL_RenderFillRect(ren, &s_list);
+
+        for (int a = 0; a < g_daw.num_actions; a++) {
+            int ay = sy + 38 + (a * 22);
+            bool is_rebinding = (g_daw.rebinding_action_idx == a);
+
+            if (is_rebinding) {
+                SDL_Rect r_row = { sx + 14, ay - 2, sw - 28, 20 };
+                SDL_SetRenderDrawColor(ren, 26, 86, 219, 255);
+                SDL_RenderFillRect(ren, &r_row);
+            }
+
+            draw_text(ren, g_daw.actions[a].name, sx + 20, ay + 2, c_white);
+
+            char key_buf[32];
+            if (is_rebinding) {
+                snprintf(key_buf, sizeof(key_buf), "[Press Key...]");
+            } else {
+                snprintf(key_buf, sizeof(key_buf), "%s%s",
+                         (g_daw.actions[a].mod & KMOD_CTRL) ? "Ctrl+" : "",
+                         SDL_GetKeyName(g_daw.actions[a].key));
+            }
+            draw_text(ren, key_buf, sx + sw - 140, ay + 2, is_rebinding ? c_white : c_muted);
+        }
+
+        SDL_Rect btn_rebind = { sx + 12, sy + sh - 36, 140, 24 };
+        SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
+        SDL_RenderFillRect(ren, &btn_rebind);
+        draw_text(ren, "Assign Selected", sx + 16, sy + sh - 30, c_white);
+    }
+
+    // 9. Draggable Script Manager
     if (g_daw.script_manager_open) {
         SDL_Rect *sr = &g_daw.script_win_rect;
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
