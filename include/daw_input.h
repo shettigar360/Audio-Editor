@@ -327,17 +327,30 @@ static inline void handle_daw_input_events(SDL_Event *e, SDL_Renderer *ren, SDL_
             }
         }
 
+        // Action Menu Dropdown Handling
         if (g_daw.menu_action_open) {
-            if (mx >= 56 && mx <= 190) {
-                int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+            int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+            if (mx >= 56 && mx <= 230) {
+                // Row 1: Key Shortcuts...
                 if (my >= m_start && my < m_start + 26) {
-                    g_daw.script_manager_open = true;
-                    g_daw.script_manager_is_python = false;
+                    g_daw.shortcut_manager_open = true;
+                    g_daw.script_manager_open = false;
                     g_daw.menu_action_open = false;
                     return;
-                } else if (my >= m_start + 26 && my < m_start + 52) {
+                }
+                // Row 2: Lua Scripts...
+                else if (my >= m_start + 26 && my < m_start + 50) {
+                    g_daw.script_manager_open = true;
+                    g_daw.script_manager_is_python = false;
+                    g_daw.shortcut_manager_open = false;
+                    g_daw.menu_action_open = false;
+                    return;
+                }
+                // Row 3: Python Scripts...
+                else if (my >= m_start + 50 && my < m_start + 76) {
                     g_daw.script_manager_open = true;
                     g_daw.script_manager_is_python = true;
+                    g_daw.shortcut_manager_open = false;
                     g_daw.menu_action_open = false;
                     return;
                 }
