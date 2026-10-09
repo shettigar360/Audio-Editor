@@ -113,6 +113,20 @@ int main(int argc, char *argv[]) {
     g_daw.action_window_open = false;
     g_daw.action_win_rect = (SDL_Rect){ 360, 140, 560, 460 };
 
+    // Default Render Dialog settings
+    g_daw.render_window_open = false;
+    g_daw.render_win_rect = (SDL_Rect){ 380, 110, 520, 500 };
+    strncpy(g_daw.render_settings.directory, "D:\\Harish\\Project file test", sizeof(g_daw.render_settings.directory) - 1);
+    strncpy(g_daw.render_settings.filename, "test only can delete", sizeof(g_daw.render_settings.filename) - 1);
+    g_daw.render_settings.source_idx = 0;
+    g_daw.render_settings.bounds_idx = 0;
+    g_daw.render_settings.sample_rate = 48000;
+    g_daw.render_settings.channels = 1; // Default mono like image
+    g_daw.render_settings.format_idx = 0; // WAV
+    g_daw.render_settings.bit_depth_idx = 1; // 24-bit PCM
+    g_daw.render_settings.auto_increment = true;
+    g_daw.render_settings.skip_silent = true;
+
     init_tab_defaults(0, "Project 1");
     init_default_actions();
     push_undo_state();
