@@ -1,70 +1,49 @@
-name: Build Multitrack Windows Bundle
+name: Build Ready-To-Use Windows App
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ "main", "master" ]
 
 jobs:
-  build-windows:
-    name: Build Ready-To-Use Windows App
+  build:
     runs-on: windows-latest
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 Toolchain & Libraries
+      - name: Setup MSYS2 UCRT64
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-ffmpeg
-            mingw-w64-ucrt-x86_64-lua
-            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-pkg-config
             mingw-w64-ucrt-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-ffmpeg
 
-      - name: Clean Cache & Configure CMake
+      - name: Configure CMake
         shell: msys2 {0}
         run: |
-          rm -rf build
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 
       - name: Compile Executable
         shell: msys2 {0}
         run: |
           cmake --build build
 
-      - name: Package Executable with Complete Dependency Tree
+      - name: Package Executable with Dependencies
         shell: msys2 {0}
         run: |
-          mkdir -p dist
-          mkdir -p dist/scripts/lua
-          mkdir -p dist/scripts/python
-
-          # 1. Copy the compiled executable
-          cp build/*.exe dist/
-
-          # 2. Copy all required UCRT64 runtime DLLs directly (guarantees zero missing DLL errors)
-          cp /ucrt64/bin/*.dll dist/ 2>/dev/null || true
-
-          # 3. Embed official standalone Python runtime
-          curl -sSL -o python-embed.zip https://www.python.org/ftp/python/3.11.8/python-3.11.8-embed-amd64.zip
-          unzip -q -o python-embed.zip -d dist/python/
-          rm -f python-embed.zip
-
-          # 4. Copy scripts folder if present
-          if [ -d "scripts" ]; then
-            cp -r scripts/* dist/scripts/ 2>/dev/null || true
-          fi
+          mkdir -p package
+          cp build/audio_editor.exe package/
+          for dll in $(ntldd -R build/audio_editor.exe | grep ucrt64 | awk '{print $3}'); do
+            cp "$dll" package/ 2>/dev/null || true
+          done
 
       - name: Upload Ready-to-Use Zip
         uses: actions/upload-artifact@v4
         with:
-          name: Multitrack-Editor-Windows
-          path: dist/
+          name: DAW_Windows_Bundle
+          path: package/
