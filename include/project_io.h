@@ -5,6 +5,9 @@
 #include <commdlg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 #include "daw_types.h"
 
 static inline bool open_generic_dialog(char *out_path, int max_len, const char *filter, bool is_save) {
@@ -86,51 +89,140 @@ static inline void load_project_file(void) {
     }
 }
 
-static inline void export_rendered_audio(const char *ext) {
-    ProjectTab *p = get_cur_tab();
-    char filter[128], path[MAX_PATH];
-    snprintf(filter, sizeof(filter), "Audio Format (*.%s)\0*.%s\0", ext, ext);
-    if (open_generic_dialog(path, sizeof(path), filter, true)) {
-        FILE *out_f = fopen(path, "wb");
-        if (out_f) {
-            for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].raw_file_handle) {
-                    fseek(p->items[i].raw_file_handle, 0, SEEK_SET);
-                    float buf[4096];
-                    size_t r;
-                    while ((r = fread(buf, sizeof(float), 4096, p->items[i].raw_file_handle)) > 0) {
-                        fwrite(buf, sizeof(float), r, out_f);
-                    }
-                    break;
-                }
-            }
-            fclose(out_f);
-        }
-    }
+static inline void write_wav_header(FILE *f, int sample_rate, int channels, int bits_per_sample, int total_frames) {
+    int byte_rate = sample_rate * channels * (bits_per_sample / 8);
+    int block_align = channels * (bits_per_sample / 8);
+    int subchunk2_size = total_frames * block_align;
+    int chunk_size = 36 + subchunk2_size;
+
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&chunk_size, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);
+    int subchunk1_size = 16;
+    short audio_format = 1; // PCM
+    short num_ch = channels;
+    fwrite(&subchunk1_size, 4, 1, f);
+    fwrite(&audio_format, 2, 1, f);
+    fwrite(&num_ch, 2, 1, f);
+    fwrite(&sample_rate, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    short ba = block_align;
+    short bps = bits_per_sample;
+    fwrite(&ba, 2, 1, f);
+    fwrite(&bps, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&subchunk2_size, 4, 1, f);
 }
 
-static inline void export_batch_tracks(void) {
+static inline void execute_render_to_file(void) {
     ProjectTab *p = get_cur_tab();
-    char dir[MAX_PATH];
-    if (open_generic_dialog(dir, sizeof(dir), "Batch Stem Prefix\0*.*\0", true)) {
-        for (int t = 0; t < p->num_tracks; t++) {
-            char stem_path[MAX_PATH];
-            snprintf(stem_path, sizeof(stem_path), "%s_Track_%d.raw", dir, t + 1);
-            FILE *f_stem = fopen(stem_path, "wb");
-            if (f_stem) {
-                for (int i = 0; i < p->num_items; i++) {
-                    if (p->items[i].track_idx == t && p->items[i].raw_file_handle) {
-                        fseek(p->items[i].raw_file_handle, 0, SEEK_SET);
-                        float buf[4096];
-                        size_t r;
-                        while ((r = fread(buf, sizeof(float), 4096, p->items[i].raw_file_handle)) > 0) {
-                            fwrite(buf, sizeof(float), r, f_stem);
-                        }
+    RenderSettings *rs = &g_daw.render_settings;
+
+    char final_path[MAX_PATH];
+    const char *ext = (rs->format_idx == 0) ? ".wav" : ((rs->format_idx == 1) ? ".mp3" : ((rs->format_idx == 2) ? ".flac" : ".ogg"));
+    
+    char base_file[128];
+    strncpy(base_file, strlen(rs->filename) > 0 ? rs->filename : "render", sizeof(base_file));
+
+    snprintf(final_path, sizeof(final_path), "%s\\%s%s", rs->directory, base_file, ext);
+
+    if (rs->auto_increment) {
+        int counter = 1;
+        while (GetFileAttributesA(final_path) != INVALID_FILE_ATTRIBUTES) {
+            snprintf(final_path, sizeof(final_path), "%s\\%s_%02d%s", rs->directory, base_file, counter++, ext);
+        }
+    }
+
+    FILE *out = fopen(final_path, "wb");
+    if (!out) return;
+
+    int sr = rs->sample_rate;
+    int ch = rs->channels;
+    int bits = (rs->bit_depth_idx == 0) ? 16 : 24;
+
+    double render_dur = 0.0;
+    for (int i = 0; i < p->num_items; i++) {
+        double it_end = p->items[i].start_time + p->items[i].duration;
+        if (it_end > render_dur) render_dur = it_end;
+    }
+    if (render_dur <= 0.0) render_dur = 5.0;
+
+    int total_frames = (int)(render_dur * sr);
+    write_wav_header(out, sr, ch, bits, total_frames);
+
+    int chunk_frames = 1024;
+    float mix_buf[1024 * 2];
+    float item_chunk[1024 * 2];
+
+    bool any_sound = false;
+
+    for (int frame_idx = 0; frame_idx < total_frames; frame_idx += chunk_frames) {
+        int frames_to_render = (frame_idx + chunk_frames > total_frames) ? (total_frames - frame_idx) : chunk_frames;
+        memset(mix_buf, 0, sizeof(float) * frames_to_render * 2);
+
+        double chunk_st = (double)frame_idx / sr;
+        double chunk_et = chunk_st + ((double)frames_to_render / sr);
+
+        for (int i = 0; i < p->num_items; i++) {
+            AudioItem *it = &p->items[i];
+            if (!it->raw_file_handle) continue;
+            if (p->tracks[it->track_idx].mute) continue;
+
+            float gain = db_to_linear(p->track_db[it->track_idx]);
+            double it_s = it->start_time;
+            double it_e = it->start_time + it->duration;
+
+            if (it_e > chunk_st && it_s < chunk_et) {
+                int64_t sample_offset = (int64_t)(((chunk_st - it_s) + it->offset_in_file) * SAMPLE_RATE);
+                if (sample_offset >= 0) {
+                    fseek(it->raw_file_handle, sample_offset * sizeof(float) * 2, SEEK_SET);
+                    size_t read_frames = fread(item_chunk, sizeof(float) * 2, frames_to_render, it->raw_file_handle);
+                    for (size_t f = 0; f < read_frames; f++) {
+                        mix_buf[f * 2]     += item_chunk[f * 2] * gain;
+                        mix_buf[f * 2 + 1] += item_chunk[f * 2 + 1] * gain;
                     }
                 }
-                fclose(f_stem);
             }
         }
+
+        process_master_plugins(mix_buf, frames_to_render, &p->master_filter, &p->master_delay);
+
+        for (int f = 0; f < frames_to_render; f++) {
+            float sample_l = mix_buf[f * 2];
+            float sample_r = mix_buf[f * 2 + 1];
+
+            if (fabsf(sample_l) > 0.0001f || fabsf(sample_r) > 0.0001f) any_sound = true;
+
+            if (ch == 1) {
+                float mono = (sample_l + sample_r) * 0.5f;
+                if (bits == 16) {
+                    short s = (short)(fmaxf(-1.0f, fminf(1.0f, mono)) * 32767.0f);
+                    fwrite(&s, 2, 1, out);
+                } else {
+                    int s = (int)(fmaxf(-1.0f, fminf(1.0f, mono)) * 8388607.0f);
+                    fwrite(&s, 3, 1, out);
+                }
+            } else {
+                if (bits == 16) {
+                    short sl = (short)(fmaxf(-1.0f, fminf(1.0f, sample_l)) * 32767.0f);
+                    short sr_s = (short)(fmaxf(-1.0f, fminf(1.0f, sample_r)) * 32767.0f);
+                    fwrite(&sl, 2, 1, out);
+                    fwrite(&sr_s, 2, 1, out);
+                } else {
+                    int sl = (int)(fmaxf(-1.0f, fminf(1.0f, sample_l)) * 8388607.0f);
+                    int sr_s = (int)(fmaxf(-1.0f, fminf(1.0f, sample_r)) * 8388607.0f);
+                    fwrite(&sl, 3, 1, out);
+                    fwrite(&sr_s, 3, 1, out);
+                }
+            }
+        }
+    }
+
+    fclose(out);
+
+    if (rs->skip_silent && !any_sound) {
+        DeleteFileA(final_path);
     }
 }
 
