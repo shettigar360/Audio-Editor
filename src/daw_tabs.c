@@ -9,7 +9,7 @@ void init_tab_defaults(int idx, const char *title) {
     p->num_tracks = 4;
     p->pixels_per_second = 80.0f;
     p->project_duration_sec = 300.0;
-    p->show_marker_lane = true;
+    p->show_marker_lane = false; // <-- Markers hidden by default
     p->is_dirty = false;
     p->video = (SimpleVideoPlayer){ .rect = { 650, 160, 480, 310 }, .is_open = false, .video_stream_idx = -1 };
 
