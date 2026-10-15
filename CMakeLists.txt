@@ -42,7 +42,10 @@ endif()
 # Platform-Specific Linker Libraries & Flags
 # ---------------------------------------------------------
 if(WIN32)
-    # Windows system libraries for DwmSetWindowAttribute and window management
+    # Hide the black terminal window on startup
+    target_link_options(audio_engine PRIVATE -mwindows)
+
+    # Windows system libraries
     target_link_libraries(audio_engine PRIVATE 
         dwmapi
         user32
