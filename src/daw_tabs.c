@@ -69,31 +69,30 @@ void request_close_tab(int idx) {
 }
 
 void handle_save_modal_choice(int choice, bool *running) {
-    // 1: Save, 2: Don't Save, 3: Cancel
-    if (choice == 1) {
-        save_project_file();
-        int t_idx = g_daw.save_prompt_tab_idx;
-        if (t_idx >= 0 && t_idx < g_daw.num_tabs) g_daw.tabs[t_idx].is_dirty = false;
-        g_daw.save_prompt_open = false;
+    int t_idx = g_daw.save_prompt_tab_idx;
+    bool quit_after = g_daw.save_prompt_quit_app;
 
-        if (g_daw.save_prompt_quit_app) {
-            *running = false;
-        } else {
-            force_close_tab(t_idx);
-        }
-    } else if (choice == 2) {
-        int t_idx = g_daw.save_prompt_tab_idx;
-        g_daw.save_prompt_open = false;
-
-        if (g_daw.save_prompt_quit_app) {
-            *running = false;
-        } else {
-            force_close_tab(t_idx);
-        }
-    } else if (choice == 3) {
-        g_daw.save_prompt_open = false;
-        g_daw.save_prompt_tab_idx = -1;
-        g_daw.save_prompt_quit_app = false;
-    }
+    // Reset prompt state
+    g_daw.save_prompt_open = false;
     g_daw.save_prompt_tab_idx = -1;
+    g_daw.save_prompt_quit_app = false;
+
+    if (choice == 1) { // Save
+        if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
+            save_project_file();
+            g_daw.tabs[t_idx].is_dirty = false;
+        }
+        if (quit_after) {
+            if (running) *running = false;
+        } else {
+            force_close_tab(t_idx);
+        }
+    } else if (choice == 2) { // Don't Save
+        if (quit_after) {
+            if (running) *running = false;
+        } else {
+            force_close_tab(t_idx);
+        }
+    }
+    // choice == 3 (Cancel) -> Does nothing, tab remains open
 }
