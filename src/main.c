@@ -1,4 +1,4 @@
-#ifndef SDL_MAIN_HANDLED
+    #ifndef SDL_MAIN_HANDLED
 #define SDL_MAIN_HANDLED
 #endif
 #include <SDL2/SDL.h>
@@ -653,18 +653,18 @@ int main(int argc, char *argv[]) {
                         }
                         if (my >= cur_y && my < cur_y + th) {
                             int rel_y = my - cur_y;
-                            if (rel_y >= 30 && rel_y <= 50) {
-                                if (mx >= 8 && mx <= 24) { p->track_db[t] -= 1.0f; p->is_dirty = true; }
-                                else if (mx >= 78 && mx <= 94) { p->track_db[t] += 1.0f; p->is_dirty = true; }
-                                else if (mx >= 106 && mx <= 126) { p->tracks[t].mute = !p->tracks[t].mute; p->is_dirty = true; }
-                                else if (mx >= 132 && mx <= 152) { p->tracks[t].solo = !p->tracks[t].solo; p->is_dirty = true; }
-                            } else if (rel_y >= 6 && rel_y <= 24 && mx >= 8 && mx <= 130) {
-                                if (e.button.clicks == 2) {
-                                    g_daw.input_focus = INPUT_FOCUS_TRACK_NAME;
-                                    g_daw.editing_track_name_idx = t;
-                                    strncpy(g_daw.editing_name_buf, p->track_names[t], 63);
-                                    SDL_StartTextInput();
-                                }
+                            if (rel_y >= 30 && rel_y <= 56) {
+                                if (mx >= 8 && mx <= 26) { p->track_db[t] -= 1.0f; p->is_dirty = true; }
+                                else if (mx >= 76 && mx <= 94) { p->track_db[t] += 1.0f; p->is_dirty = true; }
+                                else if (mx >= 110 && mx <= 132) { p->tracks[t].mute = !p->tracks[t].mute; p->is_dirty = true; }
+                                else if (mx >= 138 && mx <= 160) { p->tracks[t].solo = !p->tracks[t].solo; p->is_dirty = true; }
+}                         else if (rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx <= g_daw.tcp_width - 16) {
+                             if (e.button.clicks == 2) {
+                                g_daw.input_focus = INPUT_FOCUS_TRACK_NAME;
+                                g_daw.editing_track_name_idx = t;
+                                strncpy(g_daw.editing_name_buf, p->track_names[t], 63);
+                                SDL_StartTextInput();
+                              }
                             } else {
                                 if (ctrl_pressed) p->track_selected[t] = !p->track_selected[t];
                                 else if (shift_pressed) {
