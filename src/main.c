@@ -1219,9 +1219,9 @@ int main(int argc, char *argv[]) {
         if (g_daw.script_manager_open) {
             SDL_Rect *sr = &g_daw.script_win_rect;
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
-            SDL_RenderFillRect(ren, &sr);
+            SDL_RenderFillRect(ren, sr);
             SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
-            SDL_RenderDrawRect(ren, &sr);
+            SDL_RenderDrawRect(ren, sr);
 
             SDL_Rect s_hdr = { sr->x, sr->y, sr->w, 26 };
             SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
