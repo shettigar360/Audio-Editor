@@ -1141,55 +1141,7 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 6. Track Header (TCP)
-        SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
-        SDL_RenderSetClipRect(ren, &tcp_clip);
-        for (int i = 0; i < p->num_tracks; i++) {
-            int ty = get_track_y_pos(i);
-            int th = p->track_heights[i];
-            SDL_Rect tp = { 2, ty + 2, g_daw.tcp_width - 4, th - 4 };
-            SDL_SetRenderDrawColor(ren, p->track_selected[i] ? 45 : 32, p->track_selected[i] ? 45 : 32, p->track_selected[i] ? 45 : 32, 255);
-            SDL_RenderFillRect(ren, &tp);
-
-            if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME && g_daw.editing_track_name_idx == i) {
-                SDL_Rect sel_box = { 8, ty + 6, g_daw.tcp_width - 24, 20 };
-                SDL_SetRenderDrawColor(ren, c_blue.r, c_blue.g, c_blue.b, 255);
-                SDL_RenderFillRect(ren, &sel_box);
-                SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                SDL_RenderDrawRect(ren, &sel_box);
-                draw_text(ren, g_daw.editing_name_buf, 12, ty + 10, c_white);
-            } else {
-                draw_text(ren, p->track_names[i], 8, ty + 10, c_white);
-            }
-
-            SDL_Rect btn_minus = { 8, ty + 30, 16, 18 };
-            SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
-            SDL_RenderFillRect(ren, &btn_minus);
-            draw_text(ren, "-", 13, ty + 33, c_white);
-
-            char db_txt[16];
-            snprintf(db_txt, sizeof(db_txt), "%+.1f", p->track_db[i]);
-            draw_text(ren, db_txt, 28, ty + 34, c_white);
-
-            SDL_Rect btn_plus = { 78, ty + 30, 16, 18 };
-            SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
-            SDL_RenderFillRect(ren, &btn_plus);
-            draw_text(ren, "+", 83, ty + 33, c_white);
-
-            SDL_Rect m_btn = { 106, ty + 30, 20, 20 };
-            SDL_SetRenderDrawColor(ren, p->tracks[i].mute ? 160 : 42, 42, 42, 255);
-            SDL_RenderFillRect(ren, &m_btn);
-            draw_text(ren, "M", 112, ty + 34, c_white);
-
-            SDL_Rect s_btn = { 132, ty + 30, 20, 20 };
-            SDL_SetRenderDrawColor(ren, p->tracks[i].solo ? 160 : 42, p->tracks[i].solo ? 140 : 42, 42, 255);
-            SDL_RenderFillRect(ren, &s_btn);
-            draw_text(ren, "S", 138, ty + 34, c_white);
-
-            SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
-            SDL_RenderDrawLine(ren, 0, ty + th, g_daw.tcp_width, ty + th);
-        }
-        SDL_RenderSetClipRect(ren, NULL);
+        SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h
 
         SDL_SetRenderDrawColor(ren, 45, 45, 45, 255);
         SDL_RenderDrawLine(ren, g_daw.tcp_width - 1, TABBAR_HEIGHT + TOPBAR_HEIGHT, g_daw.tcp_width - 1, win_h);
