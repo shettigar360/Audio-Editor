@@ -62,6 +62,8 @@ typedef struct {
 typedef struct {
     char project_name[64];
     char project_path[512];
+    bool is_dirty;                      // True if unsaved changes exist
+
     Track tracks[MAX_TRACKS];
     char track_names[MAX_TRACKS][64];
     float track_db[MAX_TRACKS];
@@ -94,6 +96,11 @@ typedef struct {
 
     SDL_AudioDeviceID audio_device;
 
+    // Save Confirmation Modal
+    bool save_prompt_open;              // Modal visibility
+    int save_prompt_tab_idx;            // Tab index pending close confirmation (-1 if none)
+    bool save_prompt_quit_app;          // True if user clicked window 'X' (quit) instead of tab 'x'
+
     // Scripts
     DawScript scripts[MAX_SCRIPTS];
     int num_scripts;
@@ -122,6 +129,7 @@ typedef struct {
 extern DawEngine g_daw;
 
 static inline ProjectTab* get_cur_tab(void) {
+    if (g_daw.num_tabs <= 0) return NULL;
     if (g_daw.active_tab < 0) g_daw.active_tab = 0;
     if (g_daw.active_tab >= g_daw.num_tabs) g_daw.active_tab = g_daw.num_tabs - 1;
     return &g_daw.tabs[g_daw.active_tab];
@@ -143,6 +151,8 @@ static inline void format_timecode(double seconds, char *out, size_t max_len) {
 
 static inline void push_undo_state(void) {
     ProjectTab *p = get_cur_tab();
+    if (!p) return;
+
     if (p->undo_mgr.head < MAX_UNDO_STACK - 1) {
         p->undo_mgr.head++;
     } else {
@@ -155,10 +165,13 @@ static inline void push_undo_state(void) {
     snap->num_tracks = p->num_tracks;
     memcpy(snap->items, p->items, sizeof(AudioItem) * p->num_items);
     p->undo_mgr.count = p->undo_mgr.head + 1;
+    p->is_dirty = true;
 }
 
 static inline void perform_undo(void) {
     ProjectTab *p = get_cur_tab();
+    if (!p) return;
+
     if (p->undo_mgr.head > 0) {
         p->undo_mgr.head--;
         DawSnapshot *snap = &p->undo_mgr.history[p->undo_mgr.head];
@@ -170,11 +183,14 @@ static inline void perform_undo(void) {
                 p->items[i].raw_file_handle = fopen(p->items[i].raw_audio_path, "rb");
             }
         }
+        p->is_dirty = true;
     }
 }
 
 static inline void perform_redo(void) {
     ProjectTab *p = get_cur_tab();
+    if (!p) return;
+
     if (p->undo_mgr.head + 1 < p->undo_mgr.count) {
         p->undo_mgr.head++;
         DawSnapshot *snap = &p->undo_mgr.history[p->undo_mgr.head];
@@ -186,6 +202,7 @@ static inline void perform_redo(void) {
                 p->items[i].raw_file_handle = fopen(p->items[i].raw_audio_path, "rb");
             }
         }
+        p->is_dirty = true;
     }
 }
 
