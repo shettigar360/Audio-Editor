@@ -396,20 +396,33 @@ int main(int argc, char *argv[]) {
                         int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
                         if (calc_w < cur_tab_w) cur_tab_w = calc_w;
                         if (cur_tab_w < 70) cur_tab_w = 70;
-                    }
+               }
 
-                    int cur_tab_x = 0;
-                    for (int t = 0; t < g_daw.num_tabs; t++) {
-                        if (mx >= cur_tab_x && mx < cur_tab_x + cur_tab_w) {
-                            if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 6) {
-                                request_close_tab(t);
-                            } else {
-                                g_daw.active_tab = t;
-                            }
-                            break;
+                int cur_tab_x = 0;
+                bool clicked_tab = false;
+
+                for (int t = 0; t < g_daw.num_tabs; t++) {
+                    if (mx >= cur_tab_x && mx < cur_tab_x + cur_tab_w) {
+                        clicked_tab = true;
+                        // Right-side close 'x' button hit area
+                        if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4) {
+                            request_close_tab(t);
+                        } else {
+                            g_daw.active_tab = t;
                         }
-                        cur_tab_x += cur_tab_w;
+                        break;
                     }
+                    cur_tab_x += cur_tab_w;
+                }
+
+            // Only click '+' if mouse clicked past tabs inside the '+' box
+            if (!clicked_tab && mx >= cur_tab_x && mx <= cur_tab_x + add_btn_w && g_daw.num_tabs < MAX_TABS) {
+            char name[64]; snprintf(name, sizeof(name), "Project %d", g_daw.num_tabs + 1);
+            init_tab_defaults(g_daw.num_tabs, name);
+            g_daw.active_tab = g_daw.num_tabs++;
+        }
+        continue;
+    }
 
                     // '+' Add Tab Button
                     if (mx >= cur_tab_x && mx <= cur_tab_x + add_btn_w && g_daw.num_tabs < MAX_TABS) {
