@@ -1,43 +1,85 @@
 cmake_minimum_required(VERSION 3.20)
-project(AudioVideoEditor C CXX)
+project(AudioEditor C CXX)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-add_definitions(-DSDL_MAIN_HANDLED)
-
-find_package(PkgConfig REQUIRED)
-
-# 1. FFmpeg
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswresample libswscale)
-
-# 2. Lua
-find_package(Lua REQUIRED)
-
-# 3. SDL2
-find_package(SDL2 REQUIRED)
-list(FILTER SDL2_LIBRARIES EXCLUDE REGEX "SDL2main")
-
-# 4. Embedded Python
-find_package(Python3 COMPONENTS Development REQUIRED)
-
-add_executable(audio_editor src/main.c)
-
-if(WIN32)
-    target_link_options(audio_editor PRIVATE -mwindows)
-    target_link_libraries(audio_editor PRIVATE comdlg32 dwmapi m)
-endif()
-
-target_include_directories(audio_editor PRIVATE
-    include
-    ${LUA_INCLUDE_DIR}
-    ${SDL2_INCLUDE_DIRS}
-    ${Python3_INCLUDE_DIRS}
+# ---------------------------------------------------------
+# Include Directories
+# ---------------------------------------------------------
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_link_libraries(audio_editor PRIVATE
-    PkgConfig::FFMPEG
-    ${LUA_LIBRARIES}
-    ${SDL2_LIBRARIES}
-    Python3::Python
+# ---------------------------------------------------------
+# Source Files
+# ---------------------------------------------------------
+# Automatically picks up all .c files in src/ (main.c, daw_tabs.c, daw_render.c, etc.)
+file(GLOB_RECURSE SRC_FILES 
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
+)
+
+# ---------------------------------------------------------
+# Executable Target
+# ---------------------------------------------------------
+add_executable(audio_engine ${SRC_FILES})
+
+# ---------------------------------------------------------
+# Find Dependencies
+# ---------------------------------------------------------
+find_package(SDL2 REQUIRED)
+
+if(TARGET SDL2::SDL2)
+    target_link_libraries(audio_engine PRIVATE SDL2::SDL2)
+elseif(TARGET SDL2::SDL2-static)
+    target_link_libraries(audio_engine PRIVATE SDL2::SDL2-static)
+else()
+    target_include_directories(audio_engine PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(audio_engine PRIVATE ${SDL2_LIBRARIES})
+endif()
+
+# ---------------------------------------------------------
+# Platform-Specific Linker Libraries & Flags
+# ---------------------------------------------------------
+if(WIN32)
+    # Windows system libraries for DwmSetWindowAttribute and window management
+    target_link_libraries(audio_engine PRIVATE 
+        dwmapi
+        user32
+        gdi32
+        winmm
+        shell32
+        comdlg32
+    )
+
+    # Prevent standard Windows min/max macro collisions
+    target_compile_definitions(audio_engine PRIVATE NOMINMAX)
+else()
+    # Linux / macOS standard math and pthread libraries
+    target_link_libraries(audio_engine PRIVATE 
+        m 
+        pthread 
+        dl
+    )
+endif()
+
+# ---------------------------------------------------------
+# Optional: FFmpeg linking (if using external shared libraries)
+# ---------------------------------------------------------
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(FFMPEG QUIET libavformat libavcodec libswscale libavutil libswresample)
+    if(FFMPEG_FOUND)
+        target_include_directories(audio_engine PRIVATE ${FFMPEG_INCLUDE_DIRS})
+        target_link_libraries(audio_engine PRIVATE ${FFMPEG_LIBRARIES})
+    endif()
+endif()
+
+# ---------------------------------------------------------
+# Output Directory Configuration
+# ---------------------------------------------------------
+set_target_properties(audio_engine PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/dist/bin"
 )
