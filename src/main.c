@@ -21,6 +21,7 @@ DawEngine g_daw;
 static SDL_Cursor *g_cursor_arrow = NULL;
 static SDL_Cursor *g_cursor_size_we = NULL;
 static SDL_Cursor *g_cursor_size_ns = NULL;
+static SDL_Cursor *g_cursor_ibeam = NULL;
 
 void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
     DawEngine *eng = (DawEngine *)userdata;
@@ -111,6 +112,7 @@ int main(int argc, char *argv[]) {
     g_cursor_arrow = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
     g_cursor_size_we = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZEWE);
     g_cursor_size_ns = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZENS);
+    g_cursor_ibeam   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_IBEAM);
 
     memset(&g_daw, 0, sizeof(DawEngine));
     g_daw.num_tabs = 1;
@@ -346,20 +348,23 @@ int main(int argc, char *argv[]) {
                 bool ctrl_pressed = (mod & KMOD_CTRL);
 
                 if (g_daw.save_prompt_open) {
-                    int dia_w = 420, dia_h = 160;
+                    int dia_w = 380, dia_h = 140;
                     int dia_x = (win_w - dia_w) / 2;
                     int dia_y = (win_h - dia_h) / 2;
                     int btn_y = dia_y + dia_h - 44;
 
-                    if (mx >= dia_x + 20 && mx <= dia_x + 130 && my >= btn_y && my <= btn_y + 30) {
+                    // [Save]
+                    if (mx >= dia_x + 18 && mx <= dia_x + 118 && my >= btn_y && my <= btn_y + 30) {
                         handle_save_modal_choice(1, &running);
                         continue;
                     }
-                    if (mx >= dia_x + 150 && mx <= dia_x + 280 && my >= btn_y && my <= btn_y + 30) {
+                    // [Don't Save]
+                    if (mx >= dia_x + 130 && mx <= dia_x + 250 && my >= btn_y && my <= btn_y + 30) {
                         handle_save_modal_choice(2, &running);
                         continue;
                     }
-                    if (mx >= dia_x + 300 && mx <= dia_x + 400 && my >= btn_y && my <= btn_y + 30) {
+                    // [Cancel]
+                    if (mx >= dia_x + 262 && mx <= dia_x + 362 && my >= btn_y && my <= btn_y + 30) {
                         handle_save_modal_choice(3, &running);
                         continue;
                     }
@@ -380,6 +385,7 @@ int main(int argc, char *argv[]) {
                     SDL_StopTextInput();
                 }
 
+                // Chrome-Style Tab Interactions
                 if (my < TABBAR_HEIGHT) {
                     int max_tab_w = 160;
                     int add_btn_w = 34;
@@ -608,6 +614,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // Track Controls & Selection: Any click inside header selects track
                 int header_top_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + m_lane_h;
                 if (mx < g_daw.tcp_width && my > header_top_y) {
                     int cur_y = header_top_y - p->scroll_y_px;
@@ -621,6 +628,16 @@ int main(int argc, char *argv[]) {
                         }
                         if (my >= cur_y && my < cur_y + th) {
                             int rel_y = my - cur_y;
+
+                            if (ctrl_pressed) {
+                                p->track_selected[t] = !p->track_selected[t];
+                            } else if (shift_pressed) {
+                                for (int tr = 0; tr <= t; tr++) p->track_selected[tr] = true;
+                            } else {
+                                for (int tr = 0; tr < p->num_tracks; tr++) p->track_selected[tr] = false;
+                                p->track_selected[t] = true;
+                            }
+
                             if (rel_y >= 30 && rel_y <= 56) {
                                 if (mx >= 8 && mx <= 26) { p->track_db[t] -= 1.0f; p->is_dirty = true; }
                                 else if (mx >= 76 && mx <= 94) { p->track_db[t] += 1.0f; p->is_dirty = true; }
@@ -632,14 +649,6 @@ int main(int argc, char *argv[]) {
                                     g_daw.editing_track_name_idx = t;
                                     strncpy(g_daw.editing_name_buf, p->track_names[t], 63);
                                     SDL_StartTextInput();
-                                }
-                            } else {
-                                if (ctrl_pressed) p->track_selected[t] = !p->track_selected[t];
-                                else if (shift_pressed) {
-                                    for (int tr = 0; tr <= t; tr++) p->track_selected[tr] = true;
-                                } else {
-                                    for (int tr = 0; tr < p->num_tracks; tr++) p->track_selected[tr] = false;
-                                    p->track_selected[t] = true;
                                 }
                             }
                             break;
@@ -730,6 +739,7 @@ int main(int argc, char *argv[]) {
 
                 int header_top_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + m_lane_h;
                 bool hovered_edge = false;
+                bool hovered_ibeam = false;
 
                 if (abs(mx - g_daw.tcp_width) <= 5 && my > TABBAR_HEIGHT + TOPBAR_HEIGHT) {
                     SDL_SetCursor(g_cursor_size_we);
@@ -737,12 +747,18 @@ int main(int argc, char *argv[]) {
                 } else if (mx < g_daw.tcp_width && my > header_top_y) {
                     int cur_y = header_top_y - p->scroll_y_px;
                     for (int t = 0; t < p->num_tracks; t++) {
-                        if (abs(my - (cur_y + p->track_heights[t])) <= 5) {
+                        int th = p->track_heights[t];
+                        if (abs(my - (cur_y + th)) <= 5) {
                             SDL_SetCursor(g_cursor_size_ns);
                             hovered_edge = true;
                             break;
                         }
-                        cur_y += p->track_heights[t];
+                        if (my >= cur_y + 6 && my <= cur_y + 28 && mx >= 8 && mx <= g_daw.tcp_width - 16) {
+                            SDL_SetCursor(g_cursor_ibeam);
+                            hovered_ibeam = true;
+                            break;
+                        }
+                        cur_y += th;
                     }
                 } else if (mx >= g_daw.tcp_width && my > header_top_y) {
                     for (int i = 0; i < p->num_items; i++) {
@@ -759,7 +775,7 @@ int main(int argc, char *argv[]) {
                         }
                     }
                 }
-                if (!hovered_edge && !resizing_tcp_width && resizing_track_idx < 0) {
+                if (!hovered_edge && !hovered_ibeam && !resizing_tcp_width && resizing_track_idx < 0) {
                     SDL_SetCursor(g_cursor_arrow);
                 }
 
@@ -1020,9 +1036,16 @@ int main(int argc, char *argv[]) {
             SDL_RenderDrawLine(ren, gx, header_top_y, gx, header_top_y + view_h);
         }
 
+        // Timeline tracks background and light selection borders
         int track_cur_y = header_top_y - p->scroll_y_px;
         for (int i = 0; i < p->num_tracks; i++) {
-            track_cur_y += p->track_heights[i];
+            int th = p->track_heights[i];
+            if (p->track_selected[i]) {
+                SDL_Rect sel_lane_border = { g_daw.tcp_width, track_cur_y, view_w, th };
+                SDL_SetRenderDrawColor(ren, 40, 75, 50, 255);
+                SDL_RenderDrawRect(ren, &sel_lane_border);
+            }
+            track_cur_y += th;
             SDL_SetRenderDrawColor(ren, 26, 26, 26, 255);
             SDL_RenderDrawLine(ren, g_daw.tcp_width, track_cur_y, g_daw.tcp_width + view_w, track_cur_y);
         }
@@ -1114,24 +1137,44 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < p->num_tracks; i++) {
             int ty = get_track_y_pos(i);
             int th = p->track_heights[i];
+            bool is_sel = p->track_selected[i];
 
             SDL_Rect tp = { 2, ty + 2, g_daw.tcp_width - 4, th - 4 };
-            SDL_SetRenderDrawColor(ren, p->track_selected[i] ? 38 : 28, p->track_selected[i] ? 38 : 28, p->track_selected[i] ? 38 : 28, 255);
+            SDL_SetRenderDrawColor(ren, is_sel ? 32 : 26, is_sel ? 40 : 26, is_sel ? 32 : 26, 255);
             SDL_RenderFillRect(ren, &tp);
 
-            SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 16, 22 };
-            if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME && g_daw.editing_track_name_idx == i) {
-                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-                SDL_RenderFillRect(ren, &name_box);
-                SDL_SetRenderDrawColor(ren, 120, 120, 120, 255);
-                SDL_RenderDrawRect(ren, &name_box);
-                draw_text(ren, g_daw.editing_name_buf, 12, ty + 10, c_white);
-            } else {
-                draw_text(ren, p->track_names[i], 10, ty + 10, c_white);
+            // Dark green strong border for selected track
+            if (is_sel) {
+                SDL_SetRenderDrawColor(ren, 22, 101, 52, 255);
+                SDL_RenderDrawRect(ren, &tp);
+                SDL_Rect inner_green = { tp.x + 1, tp.y + 1, tp.w - 2, tp.h - 2 };
+                SDL_RenderDrawRect(ren, &inner_green);
             }
 
+            // Top Part: Track Name Box with clean border
+            SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 16, 22 };
+            bool is_editing = (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME && g_daw.editing_track_name_idx == i);
+
+            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+            SDL_RenderFillRect(ren, &name_box);
+            SDL_SetRenderDrawColor(ren, is_editing ? 220 : 65, is_editing ? 220 : 65, is_editing ? 220 : 65, 255);
+            SDL_RenderDrawRect(ren, &name_box);
+
+            if (is_editing) {
+                draw_text(ren, g_daw.editing_name_buf, 12, ty + 10, c_white);
+                int text_w = (int)strlen(g_daw.editing_name_buf) * 8;
+                if ((SDL_GetTicks() / 500) % 2 == 0) {
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, 12 + text_w, ty + 8, 12 + text_w, ty + 24);
+                }
+            } else {
+                draw_text(ren, p->track_names[i], 12, ty + 10, c_white);
+            }
+
+            // Bottom Part: Controls
             int bot_y = ty + 34;
 
+            // DB Controls
             SDL_Rect btn_minus = { 8, bot_y, 18, 20 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &btn_minus);
@@ -1146,6 +1189,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &btn_plus);
             draw_text(ren, "+", 81, bot_y + 4, c_white);
 
+            // M & S Buttons
             SDL_Rect m_btn = { 110, bot_y, 22, 20 };
             SDL_SetRenderDrawColor(ren, p->tracks[i].mute ? 180 : 44, p->tracks[i].mute ? 40 : 44, 44, 255);
             SDL_RenderFillRect(ren, &m_btn);
@@ -1315,7 +1359,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &resize_handle);
         }
 
-        // 8. Save Confirmation Dialog Modal
+        // 8. Save Confirmation Dialog Modal (Compact Window)
         if (g_daw.save_prompt_open) {
             SDL_Rect dim_overlay = { 0, 0, win_w, win_h };
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -1323,40 +1367,43 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &dim_overlay);
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
-            int dia_w = 420, dia_h = 160;
+            int dia_w = 380, dia_h = 140;
             int dia_x = (win_w - dia_w) / 2;
             int dia_y = (win_h - dia_h) / 2;
 
             SDL_Rect dia_rect = { dia_x, dia_y, dia_w, dia_h };
-            SDL_SetRenderDrawColor(ren, 32, 32, 32, 255);
+            SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
             SDL_RenderFillRect(ren, &dia_rect);
-            SDL_SetRenderDrawColor(ren, 70, 70, 70, 255);
+            SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
             SDL_RenderDrawRect(ren, &dia_rect);
 
-            draw_text(ren, "Save changes before closing?", dia_x + 24, dia_y + 24, c_white);
+            draw_text(ren, "Save changes before closing?", dia_x + 18, dia_y + 18, c_white);
 
             char prompt_sub[128];
             int t_idx = g_daw.save_prompt_tab_idx;
             const char *pname = (t_idx >= 0 && t_idx < g_daw.num_tabs) ? g_daw.tabs[t_idx].project_name : "Project";
             snprintf(prompt_sub, sizeof(prompt_sub), "Project \"%s\" has unsaved changes.", pname);
-            draw_text(ren, prompt_sub, dia_x + 24, dia_y + 54, c_muted);
+            draw_text(ren, prompt_sub, dia_x + 18, dia_y + 44, c_muted);
 
             int btn_y = dia_y + dia_h - 44;
 
-            SDL_Rect b_save = { dia_x + 20, btn_y, 110, 30 };
+            // [ Save ] (Save and go back to project)
+            SDL_Rect b_save = { dia_x + 18, btn_y, 100, 30 };
             SDL_SetRenderDrawColor(ren, 26, 86, 219, 255);
             SDL_RenderFillRect(ren, &b_save);
-            draw_text(ren, "Save", dia_x + 58, btn_y + 8, c_white);
+            draw_text(ren, "Save", dia_x + 52, btn_y + 8, c_white);
 
-            SDL_Rect b_discard = { dia_x + 150, btn_y, 130, 30 };
+            // [ Don't Save ] (Discard changes and exit/close)
+            SDL_Rect b_discard = { dia_x + 130, btn_y, 120, 30 };
             SDL_SetRenderDrawColor(ren, 55, 55, 55, 255);
             SDL_RenderFillRect(ren, &b_discard);
-            draw_text(ren, "Don't Save", dia_x + 172, btn_y + 8, c_white);
+            draw_text(ren, "Don't Save", dia_x + 148, btn_y + 8, c_white);
 
-            SDL_Rect b_cancel = { dia_x + 300, btn_y, 100, 30 };
+            // [ Cancel ] (Dismiss dialog)
+            SDL_Rect b_cancel = { dia_x + 262, btn_y, 100, 30 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &b_cancel);
-            draw_text(ren, "Cancel", dia_x + 328, btn_y + 8, c_white);
+            draw_text(ren, "Cancel", dia_x + 292, btn_y + 8, c_white);
         }
 
         SDL_RenderPresent(ren);
@@ -1374,6 +1421,7 @@ int main(int argc, char *argv[]) {
     SDL_FreeCursor(g_cursor_arrow);
     SDL_FreeCursor(g_cursor_size_we);
     SDL_FreeCursor(g_cursor_size_ns);
+    SDL_FreeCursor(g_cursor_ibeam);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
