@@ -665,7 +665,8 @@ int main(int argc, char *argv[]) {
                                 strncpy(g_daw.editing_name_buf, p->track_names[t], 63);
                                 SDL_StartTextInput();
                               }
-                            } else {
+                            } 
+                            else {
                                 if (ctrl_pressed) p->track_selected[t] = !p->track_selected[t];
                                 else if (shift_pressed) {
                                     for (int tr = 0; tr <= t; tr++) p->track_selected[tr] = true;
