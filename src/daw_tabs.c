@@ -9,7 +9,7 @@ void init_tab_defaults(int idx, const char *title) {
     p->num_tracks = 4;
     p->pixels_per_second = 80.0f;
     p->project_duration_sec = 300.0;
-    p->show_marker_lane = false; // <-- Markers hidden by default
+    p->show_marker_lane = false; // Disabled by default
     p->is_dirty = false;
     p->video = (SimpleVideoPlayer){ .rect = { 650, 160, 480, 310 }, .is_open = false, .video_stream_idx = -1 };
 
@@ -72,27 +72,24 @@ void handle_save_modal_choice(int choice, bool *running) {
     int t_idx = g_daw.save_prompt_tab_idx;
     bool quit_after = g_daw.save_prompt_quit_app;
 
-    // Reset prompt state
+    // Close the popup window
     g_daw.save_prompt_open = false;
     g_daw.save_prompt_tab_idx = -1;
     g_daw.save_prompt_quit_app = false;
 
-    if (choice == 1) { // Save
+    if (choice == 1) {
+        // [Save]: Save project and return back to project (do not exit/close)
         if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
             save_project_file();
             g_daw.tabs[t_idx].is_dirty = false;
         }
-        if (quit_after) {
-            if (running) *running = false;
-        } else {
-            force_close_tab(t_idx);
-        }
-    } else if (choice == 2) { // Don't Save
+    } else if (choice == 2) {
+        // [Don't Save]: Discard and exit/close
         if (quit_after) {
             if (running) *running = false;
         } else {
             force_close_tab(t_idx);
         }
     }
-    // choice == 3 (Cancel) -> Does nothing, tab remains open
+    // choice == 3 ([Cancel]): Discard modal and return back to project
 }
