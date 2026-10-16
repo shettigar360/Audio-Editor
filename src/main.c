@@ -89,6 +89,30 @@ static inline int get_total_tracks_height() {
     return total;
 }
 
+// Selects top-most video clip (lowest track_idx) under current playhead
+AudioItem* get_active_video_clip_at_playhead(ProjectTab *p) {
+    if (!p) return NULL;
+    
+    AudioItem *top_clip = NULL;
+    int top_track_idx = 999999;
+    double cur_t = p->playhead_seconds;
+
+    for (int i = 0; i < p->num_items; i++) {
+        AudioItem *it = &p->items[i];
+        double clip_start = it->start_time;
+        double clip_end = it->start_time + it->duration;
+
+        if (cur_t >= clip_start && cur_t <= clip_end) {
+            // Lower track index has higher display priority
+            if (it->track_idx < top_track_idx) {
+                top_track_idx = it->track_idx;
+                top_clip = it;
+            }
+        }
+    }
+    return top_clip;
+}
+
 int main(int argc, char *argv[]) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
 
@@ -109,7 +133,7 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    g_cursor_arrow = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
+    g_cursor_arrow   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
     g_cursor_size_we = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZEWE);
     g_cursor_size_ns = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZENS);
     g_cursor_ibeam   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_IBEAM);
@@ -248,6 +272,7 @@ int main(int argc, char *argv[]) {
                     if (process_media_cache(file, it) == 0) p->num_items++;
                 }
                 open_video_by_path(&p->video, file, ren);
+                strncpy(p->video.current_loaded_path, file, sizeof(p->video.current_loaded_path) - 1);
                 SDL_free(file);
             } else if (e.type == SDL_KEYDOWN) {
                 if (g_daw.save_prompt_open) {
@@ -490,6 +515,7 @@ int main(int argc, char *argv[]) {
                                 it->track_idx = 0; it->start_time = p->playhead_seconds;
                                 if (process_media_cache(pth, it) == 0) p->num_items++;
                                 open_video_by_path(&p->video, pth, ren);
+                                strncpy(p->video.current_loaded_path, pth, sizeof(p->video.current_loaded_path) - 1);
                             }
                             g_daw.menu_file_open = false;
                             continue;
@@ -614,7 +640,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Track Controls & Selection: Any click inside header selects track
+                // Track Controls & Header Selection
                 int header_top_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + m_lane_h;
                 if (mx < g_daw.tcp_width && my > header_top_y) {
                     int cur_y = header_top_y - p->scroll_y_px;
@@ -846,8 +872,23 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (p->video.is_open && p->video.video_stream_idx != -1) {
-            sync_video_to_audio_clock(&p->video, p->playhead_seconds, scrubbing_ruler || !p->is_playing);
+        // ================= TOP-TRACK VIDEO SYNCHRONIZATION =================
+        if (p->video.is_open) {
+            AudioItem *v_clip = get_active_video_clip_at_playhead(p);
+
+            if (v_clip != NULL) {
+                double media_internal_time = (p->playhead_seconds - v_clip->start_time) + v_clip->offset_in_file;
+                
+                if (strncmp(p->video.current_loaded_path, v_clip->raw_audio_path, sizeof(p->video.current_loaded_path)) != 0) {
+                    open_video_by_path(&p->video, v_clip->raw_audio_path, ren);
+                    strncpy(p->video.current_loaded_path, v_clip->raw_audio_path, sizeof(p->video.current_loaded_path) - 1);
+                }
+
+                sync_video_to_audio_clock(&p->video, media_internal_time, scrubbing_ruler || !p->is_playing);
+                p->video.has_active_frame = true;
+            } else {
+                p->video.has_active_frame = false;
+            }
         }
 
         // ================= RENDERING =================
@@ -1143,7 +1184,6 @@ int main(int argc, char *argv[]) {
             SDL_SetRenderDrawColor(ren, is_sel ? 32 : 26, is_sel ? 40 : 26, is_sel ? 32 : 26, 255);
             SDL_RenderFillRect(ren, &tp);
 
-            // Dark green strong border for selected track
             if (is_sel) {
                 SDL_SetRenderDrawColor(ren, 22, 101, 52, 255);
                 SDL_RenderDrawRect(ren, &tp);
@@ -1332,7 +1372,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Floating Video Monitor
+        // Floating Video Monitor (With Black Gap Handling)
         if (p->video.is_open) {
             SDL_Rect s_rect = { p->video.rect.x + 4, p->video.rect.y + 4, p->video.rect.w, p->video.rect.h };
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
@@ -1346,11 +1386,14 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "X", p->video.rect.x + p->video.rect.w - 18, p->video.rect.y + 7, c_white);
 
             SDL_Rect v_canvas = { p->video.rect.x, p->video.rect.y + 24, p->video.rect.w, p->video.rect.h - 24 };
-            if (p->video.texture) {
+            
+            // Background is always solid black
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+            SDL_RenderFillRect(ren, &v_canvas);
+
+            if (p->video.has_active_frame && p->video.texture) {
                 SDL_RenderCopy(ren, p->video.texture, NULL, &v_canvas);
-            } else {
-                SDL_SetRenderDrawColor(ren, 12, 12, 12, 255);
-                SDL_RenderFillRect(ren, &v_canvas);
+            } else if (!p->video.texture) {
                 draw_text(ren, "No Video Stream Loaded", p->video.rect.x + 120, p->video.rect.y + 140, c_muted);
             }
 
@@ -1359,7 +1402,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &resize_handle);
         }
 
-        // 8. Save Confirmation Dialog Modal (Compact Window)
+        // 8. Save Confirmation Dialog Modal
         if (g_daw.save_prompt_open) {
             SDL_Rect dim_overlay = { 0, 0, win_w, win_h };
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -1387,19 +1430,19 @@ int main(int argc, char *argv[]) {
 
             int btn_y = dia_y + dia_h - 44;
 
-            // [ Save ] (Save and go back to project)
+            // [ Save ]
             SDL_Rect b_save = { dia_x + 18, btn_y, 100, 30 };
             SDL_SetRenderDrawColor(ren, 26, 86, 219, 255);
             SDL_RenderFillRect(ren, &b_save);
             draw_text(ren, "Save", dia_x + 52, btn_y + 8, c_white);
 
-            // [ Don't Save ] (Discard changes and exit/close)
+            // [ Don't Save ]
             SDL_Rect b_discard = { dia_x + 130, btn_y, 120, 30 };
             SDL_SetRenderDrawColor(ren, 55, 55, 55, 255);
             SDL_RenderFillRect(ren, &b_discard);
             draw_text(ren, "Don't Save", dia_x + 148, btn_y + 8, c_white);
 
-            // [ Cancel ] (Dismiss dialog)
+            // [ Cancel ]
             SDL_Rect b_cancel = { dia_x + 262, btn_y, 100, 30 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &b_cancel);
