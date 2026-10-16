@@ -1,4 +1,4 @@
-    #ifndef SDL_MAIN_HANDLED
+#ifndef SDL_MAIN_HANDLED
 #define SDL_MAIN_HANDLED
 #endif
 #include <SDL2/SDL.h>
@@ -345,26 +345,20 @@ int main(int argc, char *argv[]) {
                 bool shift_pressed = (mod & KMOD_SHIFT);
                 bool ctrl_pressed = (mod & KMOD_CTRL);
 
-                // Modal dialog interaction
                 if (g_daw.save_prompt_open) {
                     int dia_w = 420, dia_h = 160;
                     int dia_x = (win_w - dia_w) / 2;
                     int dia_y = (win_h - dia_h) / 2;
                     int btn_y = dia_y + dia_h - 44;
 
-                    // [Save]
                     if (mx >= dia_x + 20 && mx <= dia_x + 130 && my >= btn_y && my <= btn_y + 30) {
                         handle_save_modal_choice(1, &running);
                         continue;
                     }
-
-                    // [Don't Save]
                     if (mx >= dia_x + 150 && mx <= dia_x + 280 && my >= btn_y && my <= btn_y + 30) {
                         handle_save_modal_choice(2, &running);
                         continue;
                     }
-
-                    // [Cancel]
                     if (mx >= dia_x + 300 && mx <= dia_x + 400 && my >= btn_y && my <= btn_y + 30) {
                         handle_save_modal_choice(3, &running);
                         continue;
@@ -372,7 +366,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Commit inputs on unfocus
                 if (g_daw.input_focus != INPUT_FOCUS_NONE) {
                     if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME) {
                         strncpy(p->track_names[g_daw.editing_track_name_idx], g_daw.editing_name_buf, 63);
@@ -387,7 +380,6 @@ int main(int argc, char *argv[]) {
                     SDL_StopTextInput();
                 }
 
-                // Chrome-Style Tab Interactions
                 if (my < TABBAR_HEIGHT) {
                     int max_tab_w = 160;
                     int add_btn_w = 34;
@@ -396,36 +388,24 @@ int main(int argc, char *argv[]) {
                         int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
                         if (calc_w < cur_tab_w) cur_tab_w = calc_w;
                         if (cur_tab_w < 70) cur_tab_w = 70;
-               }
-
-                int cur_tab_x = 0;
-                bool clicked_tab = false;
-
-                for (int t = 0; t < g_daw.num_tabs; t++) {
-                    if (mx >= cur_tab_x && mx < cur_tab_x + cur_tab_w) {
-                        clicked_tab = true;
-                        // Right-side close 'x' button hit area
-                        if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4) {
-                            request_close_tab(t);
-                        } else {
-                            g_daw.active_tab = t;
-                        }
-                        break;
                     }
-                    cur_tab_x += cur_tab_w;
-                }
 
-            // Only click '+' if mouse clicked past tabs inside the '+' box
-            if (!clicked_tab && mx >= cur_tab_x && mx <= cur_tab_x + add_btn_w && g_daw.num_tabs < MAX_TABS) {
-            char name[64]; snprintf(name, sizeof(name), "Project %d", g_daw.num_tabs + 1);
-            init_tab_defaults(g_daw.num_tabs, name);
-            g_daw.active_tab = g_daw.num_tabs++;
-        }
-        continue;
-    }
+                    int cur_tab_x = 0;
+                    bool clicked_tab = false;
+                    for (int t = 0; t < g_daw.num_tabs; t++) {
+                        if (mx >= cur_tab_x && mx < cur_tab_x + cur_tab_w) {
+                            clicked_tab = true;
+                            if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4) {
+                                request_close_tab(t);
+                            } else {
+                                g_daw.active_tab = t;
+                            }
+                            break;
+                        }
+                        cur_tab_x += cur_tab_w;
+                    }
 
-                    // '+' Add Tab Button
-                    if (mx >= cur_tab_x && mx <= cur_tab_x + add_btn_w && g_daw.num_tabs < MAX_TABS) {
+                    if (!clicked_tab && mx >= cur_tab_x && mx <= cur_tab_x + add_btn_w && g_daw.num_tabs < MAX_TABS) {
                         char name[64]; snprintf(name, sizeof(name), "Project %d", g_daw.num_tabs + 1);
                         init_tab_defaults(g_daw.num_tabs, name);
                         g_daw.active_tab = g_daw.num_tabs++;
@@ -433,7 +413,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Script Manager Modal
                 if (g_daw.script_manager_open) {
                     SDL_Rect *sr = &g_daw.script_win_rect;
                     if (mx >= sr->x && mx <= sr->x + sr->w && my >= sr->y && my <= sr->y + 26) {
@@ -484,7 +463,6 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Close menus
                 if ((g_daw.menu_file_open || g_daw.menu_action_open) && (mx > 260 || my > 260)) {
                     g_daw.menu_file_open = false;
                     g_daw.menu_action_open = false;
@@ -493,7 +471,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // File Menu
                 if (g_daw.menu_file_open) {
                     if (mx >= 8 && mx <= 200) {
                         int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
@@ -524,7 +501,6 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Action Menu
                 if (g_daw.menu_action_open) {
                     if (mx >= 56 && mx <= 190) {
                         int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
@@ -542,7 +518,6 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Top Bar
                 if (my >= TABBAR_HEIGHT && my <= TABBAR_HEIGHT + TOPBAR_HEIGHT) {
                     if (mx >= 8 && mx <= 50) { g_daw.menu_file_open = !g_daw.menu_file_open; g_daw.menu_action_open = false; }
                     else if (mx >= 56 && mx <= 116) { g_daw.menu_action_open = !g_daw.menu_action_open; g_daw.menu_file_open = false; }
@@ -557,13 +532,11 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // TCP Resizing
                 if (abs(mx - g_daw.tcp_width) <= 5 && my > TABBAR_HEIGHT + TOPBAR_HEIGHT) {
                     resizing_tcp_width = true;
                     continue;
                 }
 
-                // Corner Area
                 int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
                 if (mx < g_daw.tcp_width && my > corner_y && my <= corner_y + RULER_HEIGHT + m_lane_h) {
                     if (mx >= 8 && mx <= 88) {
@@ -575,7 +548,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Video Window
                 if (p->video.is_open && mx >= p->video.rect.x && mx <= p->video.rect.x + p->video.rect.w &&
                     my >= p->video.rect.y && my <= p->video.rect.y + p->video.rect.h) {
                     if (mx >= p->video.rect.x + p->video.rect.w - 18 && my >= p->video.rect.y + p->video.rect.h - 18) {
@@ -590,7 +562,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Scrollbars
                 if (my >= win_h - SCROLLBAR_SIZE && mx >= g_daw.tcp_width && mx < win_w - SCROLLBAR_SIZE) {
                     dragging_scrollbar_h = true; scrollbar_h_start_mx = mx; orig_scroll_x = p->scroll_x_sec;
                     continue;
@@ -600,7 +571,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Markers
                 int marker_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT;
                 if (p->show_marker_lane && mx >= g_daw.tcp_width && my > marker_y && my <= marker_y + MARKER_BAR_HEIGHT) {
                     double m_time = p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second;
@@ -630,7 +600,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Ruler scrubbing
                 int ruler_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
                 if (mx >= g_daw.tcp_width && my > ruler_y && my <= ruler_y + RULER_HEIGHT) {
                     scrubbing_ruler = true;
@@ -639,7 +608,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Track Controls & Heights
                 int header_top_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + m_lane_h;
                 if (mx < g_daw.tcp_width && my > header_top_y) {
                     int cur_y = header_top_y - p->scroll_y_px;
@@ -658,15 +626,14 @@ int main(int argc, char *argv[]) {
                                 else if (mx >= 76 && mx <= 94) { p->track_db[t] += 1.0f; p->is_dirty = true; }
                                 else if (mx >= 110 && mx <= 132) { p->tracks[t].mute = !p->tracks[t].mute; p->is_dirty = true; }
                                 else if (mx >= 138 && mx <= 160) { p->tracks[t].solo = !p->tracks[t].solo; p->is_dirty = true; }
-}                         else if (rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx <= g_daw.tcp_width - 16) {
-                             if (e.button.clicks == 2) {
-                                g_daw.input_focus = INPUT_FOCUS_TRACK_NAME;
-                                g_daw.editing_track_name_idx = t;
-                                strncpy(g_daw.editing_name_buf, p->track_names[t], 63);
-                                SDL_StartTextInput();
-                              }
-                            } 
-                            else {
+                            } else if (rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx <= g_daw.tcp_width - 16) {
+                                if (e.button.clicks == 2) {
+                                    g_daw.input_focus = INPUT_FOCUS_TRACK_NAME;
+                                    g_daw.editing_track_name_idx = t;
+                                    strncpy(g_daw.editing_name_buf, p->track_names[t], 63);
+                                    SDL_StartTextInput();
+                                }
+                            } else {
                                 if (ctrl_pressed) p->track_selected[t] = !p->track_selected[t];
                                 else if (shift_pressed) {
                                     for (int tr = 0; tr <= t; tr++) p->track_selected[tr] = true;
@@ -682,7 +649,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Track Lanes
                 if (mx >= g_daw.tcp_width && my > header_top_y && my < win_h - SCROLLBAR_SIZE) {
                     double click_time = p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second;
                     int cur_y = header_top_y - p->scroll_y_px;
@@ -1145,17 +1111,14 @@ int main(int argc, char *argv[]) {
         // 6. Track Header (TCP)
         SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
-
         for (int i = 0; i < p->num_tracks; i++) {
             int ty = get_track_y_pos(i);
             int th = p->track_heights[i];
 
-            // Background card
             SDL_Rect tp = { 2, ty + 2, g_daw.tcp_width - 4, th - 4 };
             SDL_SetRenderDrawColor(ren, p->track_selected[i] ? 38 : 28, p->track_selected[i] ? 38 : 28, p->track_selected[i] ? 38 : 28, 255);
             SDL_RenderFillRect(ren, &tp);
 
-            // ================= TOP PART: TRACK NAME (Clean Text Box) =================
             SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 16, 22 };
             if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME && g_daw.editing_track_name_idx == i) {
                 SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
@@ -1167,10 +1130,8 @@ int main(int argc, char *argv[]) {
                 draw_text(ren, p->track_names[i], 10, ty + 10, c_white);
             }
 
-            // ================= BOTTOM PART (Split into 2) =================
             int bot_y = ty + 34;
 
-            // LEFT: DB Controls [-] [-0.0] [+]
             SDL_Rect btn_minus = { 8, bot_y, 18, 20 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &btn_minus);
@@ -1185,7 +1146,6 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &btn_plus);
             draw_text(ren, "+", 81, bot_y + 4, c_white);
 
-            // RIGHT: M & S Buttons
             SDL_Rect m_btn = { 110, bot_y, 22, 20 };
             SDL_SetRenderDrawColor(ren, p->tracks[i].mute ? 180 : 44, p->tracks[i].mute ? 40 : 44, 44, 255);
             SDL_RenderFillRect(ren, &m_btn);
@@ -1196,7 +1156,6 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &s_btn);
             draw_text(ren, "S", 145, bot_y + 4, c_white);
 
-            // Divider line between tracks
             SDL_SetRenderDrawColor(ren, 18, 18, 18, 255);
             SDL_RenderDrawLine(ren, 0, ty + th, g_daw.tcp_width, ty + th);
         }
@@ -1384,19 +1343,16 @@ int main(int argc, char *argv[]) {
 
             int btn_y = dia_y + dia_h - 44;
 
-            // [ Save ]
             SDL_Rect b_save = { dia_x + 20, btn_y, 110, 30 };
             SDL_SetRenderDrawColor(ren, 26, 86, 219, 255);
             SDL_RenderFillRect(ren, &b_save);
             draw_text(ren, "Save", dia_x + 58, btn_y + 8, c_white);
 
-            // [ Don't Save ]
             SDL_Rect b_discard = { dia_x + 150, btn_y, 130, 30 };
             SDL_SetRenderDrawColor(ren, 55, 55, 55, 255);
             SDL_RenderFillRect(ren, &b_discard);
             draw_text(ren, "Don't Save", dia_x + 172, btn_y + 8, c_white);
 
-            // [ Cancel ]
             SDL_Rect b_cancel = { dia_x + 300, btn_y, 100, 30 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &b_cancel);
