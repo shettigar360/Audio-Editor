@@ -4,6 +4,41 @@
 #include <string.h>
 #include <math.h>
 
+static double get_frame_pts(const SimpleVideoPlayer *player, const AVFrame *frame) {
+    if (!player || !frame) return 0.0;
+    int64_t pts = frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) {
+        pts = frame->pts;
+    }
+    if (pts == AV_NOPTS_VALUE) {
+        return player->current_pts_sec;
+    }
+    return (double)pts * player->time_base;
+}
+
+static void upload_frame_to_texture(SimpleVideoPlayer *player) {
+    if (!player || !player->sws_ctx || !player->texture || !player->frame || !player->frame_rgb) return;
+
+    sws_scale(
+        player->sws_ctx,
+        (const uint8_t *const *)player->frame->data,
+        player->frame->linesize,
+        0,
+        player->height,
+        player->frame_rgb->data,
+        player->frame_rgb->linesize
+    );
+
+    SDL_UpdateTexture(
+        player->texture,
+        NULL,
+        player->frame_rgb->data[0],
+        player->frame_rgb->linesize[0]
+    );
+
+    player->has_active_frame = true;
+}
+
 int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Renderer *renderer) {
     if (!player || !filepath || !renderer) return -1;
 
@@ -95,10 +130,16 @@ int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Rend
         player->height
     );
 
+    if (!player->texture) {
+        close_video(player);
+        return -1;
+    }
+
     player->is_open = true;
     player->current_pts_sec = 0.0;
-    player->has_active_frame = true;
+    player->has_active_frame = false;
     strncpy(player->current_loaded_path, filepath, sizeof(player->current_loaded_path) - 1);
+    player->current_loaded_path[sizeof(player->current_loaded_path) - 1] = '\0';
 
     seek_video(player, 0.0);
     return 0;
@@ -139,85 +180,82 @@ void close_video(SimpleVideoPlayer *player) {
     player->video_stream_idx = -1;
     player->is_open = false;
     player->has_active_frame = false;
+    player->current_pts_sec = 0.0;
     player->current_loaded_path[0] = '\0';
 }
 
 void seek_video(SimpleVideoPlayer *player, double seconds) {
-    if (!player || !player->fmt_ctx || player->video_stream_idx == -1) return;
+    if (!player || !player->fmt_ctx || player->video_stream_idx == -1 || !player->codec_ctx) return;
 
+    if (seconds < 0.0) seconds = 0.0;
     int64_t target_pts = (int64_t)(seconds / player->time_base);
+
     av_seek_frame(player->fmt_ctx, player->video_stream_idx, target_pts, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(player->codec_ctx);
 
     AVPacket packet;
+    bool frame_found = false;
+
     while (av_read_frame(player->fmt_ctx, &packet) >= 0) {
         if (packet.stream_index == player->video_stream_idx) {
             int ret = avcodec_send_packet(player->codec_ctx, &packet);
             if (ret >= 0) {
-                ret = avcodec_receive_frame(player->codec_ctx, player->frame);
-                if (ret == 0) {
-                    double pts = player->frame->pts * player->time_base;
-                    sws_scale(
-                        player->sws_ctx,
-                        (const uint8_t *const *)player->frame->data,
-                        player->frame->linesize,
-                        0,
-                        player->height,
-                        player->frame_rgb->data,
-                        player->frame_rgb->linesize
-                    );
-                    SDL_UpdateTexture(
-                        player->texture,
-                        NULL,
-                        player->frame_rgb->data[0],
-                        player->frame_rgb->linesize[0]
-                    );
+                while (avcodec_receive_frame(player->codec_ctx, player->frame) == 0) {
+                    double pts = get_frame_pts(player, player->frame);
+                    upload_frame_to_texture(player);
                     player->current_pts_sec = pts;
-                    av_packet_unref(&packet);
-                    break;
+                    
+                    if (pts >= seconds || (seconds - pts) < 0.04) {
+                        frame_found = true;
+                        break;
+                    }
                 }
             }
         }
         av_packet_unref(&packet);
+        if (frame_found) break;
+    }
+
+    if (!frame_found) {
+        avcodec_send_packet(player->codec_ctx, NULL);
+        if (avcodec_receive_frame(player->codec_ctx, player->frame) == 0) {
+            player->current_pts_sec = get_frame_pts(player, player->frame);
+            upload_frame_to_texture(player);
+        }
     }
 }
 
 void sync_video_to_audio_clock(SimpleVideoPlayer *player, double target_sec, bool force_seek) {
-    if (!player || !player->fmt_ctx || player->video_stream_idx == -1) return;
+    if (!player || !player->fmt_ctx || player->video_stream_idx == -1 || !player->codec_ctx) return;
 
-    if (force_seek || fabs(target_sec - player->current_pts_sec) > 0.5) {
+    if (force_seek || fabs(target_sec - player->current_pts_sec) > 0.5 || target_sec < player->current_pts_sec) {
         seek_video(player, target_sec);
         return;
     }
 
-    if (target_sec < player->current_pts_sec) {
-        seek_video(player, target_sec);
-        return;
+    while (avcodec_receive_frame(player->codec_ctx, player->frame) == 0) {
+        double pts = get_frame_pts(player, player->frame);
+        player->current_pts_sec = pts;
+        upload_frame_to_texture(player);
+        if (pts >= target_sec) return;
     }
 
     AVPacket packet;
-    while (player->current_pts_sec < target_sec && av_read_frame(player->fmt_ctx, &packet) >= 0) {
+    int max_packets_per_tick = 30;
+
+    while (player->current_pts_sec < target_sec && max_packets_per_tick-- > 0 && av_read_frame(player->fmt_ctx, &packet) >= 0) {
         if (packet.stream_index == player->video_stream_idx) {
             int ret = avcodec_send_packet(player->codec_ctx, &packet);
             if (ret >= 0) {
                 while (avcodec_receive_frame(player->codec_ctx, player->frame) == 0) {
-                    double pts = player->frame->pts * player->time_base;
-                    sws_scale(
-                        player->sws_ctx,
-                        (const uint8_t *const *)player->frame->data,
-                        player->frame->linesize,
-                        0,
-                        player->height,
-                        player->frame_rgb->data,
-                        player->frame_rgb->linesize
-                    );
-                    SDL_UpdateTexture(
-                        player->texture,
-                        NULL,
-                        player->frame_rgb->data[0],
-                        player->frame_rgb->linesize[0]
-                    );
+                    double pts = get_frame_pts(player, player->frame);
                     player->current_pts_sec = pts;
+                    upload_frame_to_texture(player);
+
+                    if (pts >= target_sec) {
+                        av_packet_unref(&packet);
+                        return;
+                    }
                 }
             }
         }
