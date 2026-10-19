@@ -23,7 +23,9 @@ static SDL_Cursor *g_cursor_size_we = NULL;
 static SDL_Cursor *g_cursor_size_ns = NULL;
 static SDL_Cursor *g_cursor_ibeam = NULL;
 
-// Per-tab Crossfade mode state (true = Crossfade ON, false = Crossfade OFF / edge-touch only)
+// Per-tab Crossfade drag mode state:
+// true  = Crossfade ON  (clips can be moved/trimmed to overlap and crossfade)
+// false = Crossfade OFF (existing overlapped clips stay as-is; newly moved/trimmed clips stop edge-to-edge)
 static bool g_tab_crossfade[MAX_TABS] = { true, true, true, true, true, true, true, true };
 
 static inline bool is_crossfade_active(void) {
@@ -38,8 +40,8 @@ static inline void set_crossfade_active(bool active) {
     g_tab_crossfade[idx] = active;
 }
 
-// Computes equal-power crossfade gain (sin/cos S-law) and micro de-click ramps at sample time t_sec
-static float compute_item_crossfade_gain(ProjectTab *p, int item_idx, double t_sec, bool crossfade_on) {
+// Computes equal-power crossfade gain (sin/cos S-law) for any overlapping clips and micro de-click ramps at sample time t_sec
+static float compute_item_crossfade_gain(ProjectTab *p, int item_idx, double t_sec) {
     AudioItem *it = &p->items[item_idx];
     double it_s = it->start_time;
     double it_e = it->start_time + it->duration;
@@ -49,37 +51,35 @@ static float compute_item_crossfade_gain(ProjectTab *p, int item_idx, double t_s
     bool has_left_xfade = false;
     bool has_right_xfade = false;
 
-    if (crossfade_on) {
-        for (int o = 0; o < p->num_items; o++) {
-            if (o == item_idx) continue;
-            AudioItem *ot = &p->items[o];
-            if (ot->track_idx != it->track_idx) continue;
+    for (int o = 0; o < p->num_items; o++) {
+        if (o == item_idx) continue;
+        AudioItem *ot = &p->items[o];
+        if (ot->track_idx != it->track_idx) continue;
 
-            double ot_s = ot->start_time;
-            double ot_e = ot->start_time + ot->duration;
-            double ov_s = fmax(it_s, ot_s);
-            double ov_e = fmin(it_e, ot_e);
+        double ot_s = ot->start_time;
+        double ot_e = ot->start_time + ot->duration;
+        double ov_s = fmax(it_s, ot_s);
+        double ov_e = fmin(it_e, ot_e);
 
-            if (ov_e > ov_s + 0.0005) {
-                bool ot_is_earlier = (ot_s < it_s - 1e-6) || (fabs(ot_s - it_s) <= 1e-6 && o < item_idx);
-                if (ot_is_earlier) {
-                    has_left_xfade = true;
-                    if (t_sec >= ov_s && t_sec <= ov_e) {
-                        float u = (float)((t_sec - ov_s) / (ov_e - ov_s));
-                        if (u < 0.0f) u = 0.0f;
-                        if (u > 1.0f) u = 1.0f;
-                        // Standard Equal-Power (Constant-Power) Fade-In: sin(u * pi/2)
-                        env *= sinf(u * 1.57079632679f);
-                    }
-                } else {
-                    has_right_xfade = true;
-                    if (t_sec >= ov_s && t_sec <= ov_e) {
-                        float u = (float)((t_sec - ov_s) / (ov_e - ov_s));
-                        if (u < 0.0f) u = 0.0f;
-                        if (u > 1.0f) u = 1.0f;
-                        // Standard Equal-Power (Constant-Power) Fade-Out: cos(u * pi/2)
-                        env *= cosf(u * 1.57079632679f);
-                    }
+        if (ov_e > ov_s + 0.0005) {
+            bool ot_is_earlier = (ot_s < it_s - 1e-6) || (fabs(ot_s - it_s) <= 1e-6 && o < item_idx);
+            if (ot_is_earlier) {
+                has_left_xfade = true;
+                if (t_sec >= ov_s && t_sec <= ov_e) {
+                    float u = (float)((t_sec - ov_s) / (ov_e - ov_s));
+                    if (u < 0.0f) u = 0.0f;
+                    if (u > 1.0f) u = 1.0f;
+                    // Standard Equal-Power (Constant-Power) Fade-In: sin(u * pi/2)
+                    env *= sinf(u * 1.57079632679f);
+                }
+            } else {
+                has_right_xfade = true;
+                if (t_sec >= ov_s && t_sec <= ov_e) {
+                    float u = (float)((t_sec - ov_s) / (ov_e - ov_s));
+                    if (u < 0.0f) u = 0.0f;
+                    if (u > 1.0f) u = 1.0f;
+                    // Standard Equal-Power (Constant-Power) Fade-Out: cos(u * pi/2)
+                    env *= cosf(u * 1.57079632679f);
                 }
             }
         }
@@ -116,7 +116,7 @@ static bool interval_overlaps_on_track(ProjectTab *p, int ignore_idx, int track_
     return false;
 }
 
-// When Crossfade is OFF, clamps a dragged/placed clip's start_time so it touches edges without overlapping
+// When Crossfade is OFF, clamps a moved/placed clip's start_time so it stops at the neighbor clip's edge without overlapping
 static double clamp_non_overlapping_start(ProjectTab *p, int item_idx, int track_idx, double desired_start, double dur) {
     if (desired_start < 0.0) desired_start = 0.0;
     if (!interval_overlaps_on_track(p, item_idx, track_idx, desired_start, dur)) {
@@ -160,40 +160,6 @@ static double clamp_non_overlapping_start(ProjectTab *p, int item_idx, int track
     return (best_start >= 0.0) ? best_start : desired_start;
 }
 
-// Resolves any existing overlaps on all tracks by snapping overlapping clips edge-to-edge
-static void resolve_all_track_overlaps_edge_to_edge(ProjectTab *p) {
-    if (!p) return;
-    for (int t = 0; t < p->num_tracks; t++) {
-        int idxs[MAX_ITEMS];
-        int cnt = 0;
-        for (int i = 0; i < p->num_items; i++) {
-            if (p->items[i].track_idx == t) {
-                idxs[cnt++] = i;
-            }
-        }
-        // Sort clips on track t by start_time
-        for (int a = 0; a < cnt - 1; a++) {
-            for (int b = a + 1; b < cnt; b++) {
-                if (p->items[idxs[b]].start_time < p->items[idxs[a]].start_time) {
-                    int tmp = idxs[a];
-                    idxs[a] = idxs[b];
-                    idxs[b] = tmp;
-                }
-            }
-        }
-        // Push any overlapping clip so its left edge touches the preceding clip's right edge
-        for (int k = 1; k < cnt; k++) {
-            AudioItem *prev = &p->items[idxs[k - 1]];
-            AudioItem *curr = &p->items[idxs[k]];
-            double prev_end = prev->start_time + prev->duration;
-            if (curr->start_time < prev_end) {
-                curr->start_time = prev_end;
-                p->is_dirty = true;
-            }
-        }
-    }
-}
-
 void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
     DawEngine *eng = (DawEngine *)userdata;
     if (eng->num_tabs <= 0) return;
@@ -209,7 +175,6 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
         if (p->tracks[t].solo) { any_solo = true; break; }
     }
 
-    bool xfade_on = g_tab_crossfade[eng->active_tab >= 0 && eng->active_tab < MAX_TABS ? eng->active_tab : 0];
     double st = p->playhead_seconds;
     double et = st + ((double)frames_needed / SAMPLE_RATE);
 
@@ -251,7 +216,7 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
             for (size_t f = 0; f < read_frames; f++) {
                 int out_idx = f_start + (int)f;
                 double sample_t = st + ((double)out_idx / SAMPLE_RATE);
-                float xfade_gain = compute_item_crossfade_gain(p, i, sample_t, xfade_on);
+                float xfade_gain = compute_item_crossfade_gain(p, i, sample_t);
                 float total_gain = linear_gain * xfade_gain;
                 out[out_idx * 2]     += chunk[f * 2]     * total_gain;
                 out[out_idx * 2 + 1] += chunk[f * 2 + 1] * total_gain;
@@ -788,12 +753,8 @@ int main(int argc, char *argv[]) {
                     }
                     else if (mx >= 192 && mx <= 284) p->video.is_open = !p->video.is_open;
                     else if (mx >= 288 && mx <= 412) {
-                        bool next_xfade = !is_crossfade_active();
-                        set_crossfade_active(next_xfade);
-                        if (!next_xfade) {
-                            push_undo_state();
-                            resolve_all_track_overlaps_edge_to_edge(p);
-                        }
+                        // Toggle Crossfade mode without moving any existing overlapped clips
+                        set_crossfade_active(!is_crossfade_active());
                     }
                     else if (mx >= win_w - 228 && mx < win_w - 176) perform_undo();
                     else if (mx >= win_w - 172 && mx < win_w - 120) perform_redo();
@@ -1431,7 +1392,7 @@ int main(int argc, char *argv[]) {
                     int bin_idx = (int)((cur_item_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
 
                     if (bin_idx >= 0 && bin_idx < it->peak_count) {
-                        float xfade_env = compute_item_crossfade_gain(p, i, timeline_sec, xfade_active);
+                        float xfade_env = compute_item_crossfade_gain(p, i, timeline_sec);
                         float env_gain = gain_multiplier * xfade_env;
                         float mn = it->peaks[bin_idx].min_val * env_gain;
                         float mx = it->peaks[bin_idx].max_val * env_gain;
@@ -1459,114 +1420,112 @@ int main(int argc, char *argv[]) {
             draw_text(ren, it->label, ix + 6, iy + 4, c_white);
         }
 
-        // Pass 2: Standard Audio Editing Crossfade Box & Equal-Power X-Curves on Overlapping Clips
-        if (xfade_active) {
-            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-            for (int i = 0; i < p->num_items; i++) {
-                AudioItem *it = &p->items[i];
-                double it_s = it->start_time;
-                double it_e = it->start_time + it->duration;
+        // Pass 2: Standard Audio Editing Crossfade Box & Equal-Power X-Curves on any Overlapping Clips
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        for (int i = 0; i < p->num_items; i++) {
+            AudioItem *it = &p->items[i];
+            double it_s = it->start_time;
+            double it_e = it->start_time + it->duration;
 
-                for (int o = 0; o < p->num_items; o++) {
-                    if (o == i) continue;
-                    AudioItem *ot = &p->items[o];
-                    if (ot->track_idx != it->track_idx) continue;
+            for (int o = 0; o < p->num_items; o++) {
+                if (o == i) continue;
+                AudioItem *ot = &p->items[o];
+                if (ot->track_idx != it->track_idx) continue;
 
-                    double ot_s = ot->start_time;
-                    double ot_e = ot->start_time + ot->duration;
+                double ot_s = ot->start_time;
+                double ot_e = ot->start_time + ot->duration;
 
-                    // Process each ordered pair once (ot = outgoing earlier clip, it = incoming later clip)
-                    bool ot_is_earlier = (ot_s < it_s - 1e-6) || (fabs(ot_s - it_s) <= 1e-6 && o < i);
-                    if (!ot_is_earlier) continue;
+                // Process each ordered pair once (ot = outgoing earlier clip, it = incoming later clip)
+                bool ot_is_earlier = (ot_s < it_s - 1e-6) || (fabs(ot_s - it_s) <= 1e-6 && o < i);
+                if (!ot_is_earlier) continue;
 
-                    double overlap_s = it_s;
-                    double overlap_e = fmin(it_e, ot_e);
-                    if (overlap_e <= overlap_s + 0.001) continue;
+                double overlap_s = it_s;
+                double overlap_e = fmin(it_e, ot_e);
+                if (overlap_e <= overlap_s + 0.001) continue;
 
-                    int iy = get_track_y_pos(it->track_idx) + 2;
-                    int ih = p->track_heights[it->track_idx] - 4;
-                    int ox = g_daw.tcp_width + (int)((overlap_s - p->scroll_x_sec) * p->pixels_per_second);
-                    int ox_end = g_daw.tcp_width + (int)((overlap_e - p->scroll_x_sec) * p->pixels_per_second);
-                    int ow = ox_end - ox;
-                    if (ow < 2) ow = 2;
+                int iy = get_track_y_pos(it->track_idx) + 2;
+                int ih = p->track_heights[it->track_idx] - 4;
+                int ox = g_daw.tcp_width + (int)((overlap_s - p->scroll_x_sec) * p->pixels_per_second);
+                int ox_end = g_daw.tcp_width + (int)((overlap_e - p->scroll_x_sec) * p->pixels_per_second);
+                int ow = ox_end - ox;
+                if (ow < 2) ow = 2;
 
-                    if (ox + ow < g_daw.tcp_width || ox > g_daw.tcp_width + view_w) continue;
+                if (ox + ow < g_daw.tcp_width || ox > g_daw.tcp_width + view_w) continue;
 
-                    // 1. Translucent crossfade zone highlight box
-                    SDL_Rect xf_box = { ox, iy, ow, ih };
-                    SDL_SetRenderDrawColor(ren, 245, 175, 55, 28);
-                    SDL_RenderFillRect(ren, &xf_box);
+                // 1. Translucent crossfade zone highlight box
+                SDL_Rect xf_box = { ox, iy, ow, ih };
+                SDL_SetRenderDrawColor(ren, 245, 175, 55, 28);
+                SDL_RenderFillRect(ren, &xf_box);
 
-                    int top_pad = iy + 3;
-                    int bot_pad = iy + ih - 4;
-                    int curve_h = bot_pad - top_pad;
-                    if (curve_h < 8) curve_h = 8;
+                int top_pad = iy + 3;
+                int bot_pad = iy + ih - 4;
+                int curve_h = bot_pad - top_pad;
+                if (curve_h < 8) curve_h = 8;
 
-                    int prev_x = ox;
-                    int prev_y_out = top_pad;
-                    int prev_y_in  = bot_pad;
+                int prev_x = ox;
+                int prev_y_out = top_pad;
+                int prev_y_in  = bot_pad;
 
-                    // 2. Shade upper exterior region and draw continuous 2px Equal-Power S/Cosine Crossfade X-Curves
-                    for (int px = 0; px < ow; px++) {
-                        int cur_x = ox + px;
-                        float u = (ow > 1) ? ((float)px / (float)(ow - 1)) : 0.5f;
+                // 2. Shade upper exterior region and draw continuous 2px Equal-Power S/Cosine Crossfade X-Curves
+                for (int px = 0; px < ow; px++) {
+                    int cur_x = ox + px;
+                    float u = (ow > 1) ? ((float)px / (float)(ow - 1)) : 0.5f;
 
-                        // Equal-power / smooth S-curve envelope values in [0..1]
-                        float gain_out = cosf(u * 1.57079632679f);
-                        float gain_in  = sinf(u * 1.57079632679f);
+                    // Equal-power / smooth S-curve envelope values in [0..1]
+                    float gain_out = cosf(u * 1.57079632679f);
+                    float gain_in  = sinf(u * 1.57079632679f);
 
-                        int y_out = bot_pad - (int)(gain_out * curve_h);
-                        int y_in  = bot_pad - (int)(gain_in  * curve_h);
+                    int y_out = bot_pad - (int)(gain_out * curve_h);
+                    int y_in  = bot_pad - (int)(gain_in  * curve_h);
 
-                        // Darken region above the active crossfade envelope (standard DAW crossfade shading)
-                        int y_top_env = (y_out < y_in) ? y_out : y_in;
-                        if (cur_x >= g_daw.tcp_width && cur_x <= g_daw.tcp_width + view_w && y_top_env > iy + 1) {
-                            SDL_SetRenderDrawColor(ren, 12, 14, 18, 115);
-                            SDL_RenderDrawLine(ren, cur_x, iy + 1, cur_x, y_top_env);
-                        }
-
-                        if (px > 0) {
-                            // Outgoing Fade-Out Curve (warm coral-amber)
-                            SDL_SetRenderDrawColor(ren, 245, 115, 75, 245);
-                            SDL_RenderDrawLine(ren, prev_x, prev_y_out, cur_x, y_out);
-                            SDL_RenderDrawLine(ren, prev_x, prev_y_out + 1, cur_x, y_out + 1);
-
-                            // Incoming Fade-In Curve (bright gold-cyan studio accent)
-                            SDL_SetRenderDrawColor(ren, 85, 215, 240, 245);
-                            SDL_RenderDrawLine(ren, prev_x, prev_y_in, cur_x, y_in);
-                            SDL_RenderDrawLine(ren, prev_x, prev_y_in + 1, cur_x, y_in + 1);
-                        }
-
-                        prev_x = cur_x;
-                        prev_y_out = y_out;
-                        prev_y_in  = y_in;
+                    // Darken region above the active crossfade envelope (standard DAW crossfade shading)
+                    int y_top_env = (y_out < y_in) ? y_out : y_in;
+                    if (cur_x >= g_daw.tcp_width && cur_x <= g_daw.tcp_width + view_w && y_top_env > iy + 1) {
+                        SDL_SetRenderDrawColor(ren, 12, 14, 18, 115);
+                        SDL_RenderDrawLine(ren, cur_x, iy + 1, cur_x, y_top_env);
                     }
 
-                    // 3. Crisp Crossfade Boundary Frame & Corner Handles
-                    SDL_SetRenderDrawColor(ren, 235, 175, 65, 215);
-                    SDL_RenderDrawRect(ren, &xf_box);
+                    if (px > 0) {
+                        // Outgoing Fade-Out Curve (warm coral-amber)
+                        SDL_SetRenderDrawColor(ren, 245, 115, 75, 245);
+                        SDL_RenderDrawLine(ren, prev_x, prev_y_out, cur_x, y_out);
+                        SDL_RenderDrawLine(ren, prev_x, prev_y_out + 1, cur_x, y_out + 1);
 
-                    // 4. Center Equal-Power Crossing Handle (-3dB intersection point at u = 0.5)
-                    int cross_x = ox + ow / 2;
-                    int cross_y = bot_pad - (int)(0.70710678f * curve_h);
-                    SDL_Rect cross_handle = { cross_x - 3, cross_y - 3, 6, 6 };
-                    SDL_SetRenderDrawColor(ren, 255, 235, 180, 255);
-                    SDL_RenderFillRect(ren, &cross_handle);
+                        // Incoming Fade-In Curve (bright gold-cyan studio accent)
+                        SDL_SetRenderDrawColor(ren, 85, 215, 240, 245);
+                        SDL_RenderDrawLine(ren, prev_x, prev_y_in, cur_x, y_in);
+                        SDL_RenderDrawLine(ren, prev_x, prev_y_in + 1, cur_x, y_in + 1);
+                    }
 
-                    // Top/bottom corner fade handles
-                    SDL_Rect h_tl = { ox, iy, 5, 5 };
-                    SDL_Rect h_tr = { ox + ow - 5, iy, 5, 5 };
-                    SDL_Rect h_bl = { ox, iy + ih - 5, 5, 5 };
-                    SDL_Rect h_br = { ox + ow - 5, iy + ih - 5, 5, 5 };
-                    SDL_SetRenderDrawColor(ren, 235, 175, 65, 255);
-                    SDL_RenderFillRect(ren, &h_tl);
-                    SDL_RenderFillRect(ren, &h_tr);
-                    SDL_RenderFillRect(ren, &h_bl);
-                    SDL_RenderFillRect(ren, &h_br);
+                    prev_x = cur_x;
+                    prev_y_out = y_out;
+                    prev_y_in  = y_in;
                 }
+
+                // 3. Crisp Crossfade Boundary Frame & Corner Handles
+                SDL_SetRenderDrawColor(ren, 235, 175, 65, 215);
+                SDL_RenderDrawRect(ren, &xf_box);
+
+                // 4. Center Equal-Power Crossing Handle (-3dB intersection point at u = 0.5)
+                int cross_x = ox + ow / 2;
+                int cross_y = bot_pad - (int)(0.70710678f * curve_h);
+                SDL_Rect cross_handle = { cross_x - 3, cross_y - 3, 6, 6 };
+                SDL_SetRenderDrawColor(ren, 255, 235, 180, 255);
+                SDL_RenderFillRect(ren, &cross_handle);
+
+                // Top/bottom corner fade handles
+                SDL_Rect h_tl = { ox, iy, 5, 5 };
+                SDL_Rect h_tr = { ox + ow - 5, iy, 5, 5 };
+                SDL_Rect h_bl = { ox, iy + ih - 5, 5, 5 };
+                SDL_Rect h_br = { ox + ow - 5, iy + ih - 5, 5, 5 };
+                SDL_SetRenderDrawColor(ren, 235, 175, 65, 255);
+                SDL_RenderFillRect(ren, &h_tl);
+                SDL_RenderFillRect(ren, &h_tr);
+                SDL_RenderFillRect(ren, &h_bl);
+                SDL_RenderFillRect(ren, &h_br);
             }
-            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
         }
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
         if (marquee_selecting) {
             int mx1 = fmin(marquee_start_x, marquee_cur_x);
