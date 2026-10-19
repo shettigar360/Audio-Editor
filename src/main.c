@@ -5,6 +5,7 @@
 #include <SDL2/SDL_syswm.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
@@ -28,6 +29,11 @@ static SDL_Cursor *g_cursor_ibeam = NULL;
 // false = Crossfade OFF (existing overlapped clips stay as-is; newly moved/trimmed clips stop edge-to-edge)
 static bool g_tab_crossfade[MAX_TABS] = { true, true, true, true, true, true, true, true };
 
+// Per-tab Logic Pro style Cycle Range selection state
+static bool   g_tab_range_active[MAX_TABS] = { false };
+static double g_tab_range_start[MAX_TABS]  = { 0.0 };
+static double g_tab_range_end[MAX_TABS]    = { 0.0 };
+
 // Extended marker text storage (allows typing long marker text beyond 63 chars)
 #define MARKER_TEXT_MAX 256
 static char g_marker_full_text[MAX_TABS][MAX_MARKERS][MARKER_TEXT_MAX];
@@ -41,21 +47,184 @@ static int g_marker_context_target_idx = -1;
 static int g_marker_context_x = 0;
 static int g_marker_context_y = 0;
 
-static inline bool is_crossfade_active(void) {
+// ================= UNIFIED EXPORT MEDIA POPUP WINDOW STATE =================
+typedef enum {
+    EXPORT_SRC_MASTER = 0,          // Master mix
+    EXPORT_SRC_STEMS  = 1,          // Selected tracks (stems)
+    EXPORT_SRC_ITEMS  = 2           // Selected media items
+} ExportSourceType;
+
+typedef enum {
+    EXPORT_FMT_WAV = 0,             // WAV (16 / 24 / 32 bit PCM)
+    EXPORT_FMT_MP3 = 1,             // MP3 (128 / 192 / 320 kbps)
+    EXPORT_FMT_MP4 = 2              // MP4 (Resolution, Framerate, Video kbps, Audio codec + kbps)
+} ExportFormatType;
+
+typedef enum {
+    EXPORT_MP4_AUDIO_AAC = 0,
+    EXPORT_MP4_AUDIO_WAV = 1,
+    EXPORT_MP4_AUDIO_MP3 = 2
+} ExportMp4AudioCodec;
+
+typedef enum {
+    EXP_FIELD_NONE = 0,
+    EXP_FIELD_DIR,
+    EXP_FIELD_FILENAME,
+    EXP_FIELD_MP4_WIDTH,
+    EXP_FIELD_MP4_HEIGHT,
+    EXP_FIELD_MP4_FPS,
+    EXP_FIELD_MP4_V_KBPS,
+    EXP_FIELD_MP4_A_KBPS
+} ExportInputField;
+
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+
+    ExportSourceType source;        // Master mix / Selected tracks (stems) / Selected media items
+    char directory[512];            // Output directory
+    char filename[128];             // Output base file name
+
+    int sample_rate;                // 48000 or 44100
+    int channels;                   // 1 = Mono, 2 = Stereo
+
+    ExportFormatType format;        // WAV, MP3, MP4
+    int wav_bit_depth;              // 16, 24, or 32
+    int mp3_bitrate;                // 128, 192, or 320
+
+    // MP4 specific settings (matching REAPER/studio layout)
+    char mp4_width_str[16];         // e.g. "1920"
+    char mp4_height_str[16];        // e.g. "1080"
+    char mp4_fps_str[16];           // e.g. "25.00"
+    char mp4_video_kbps_str[16];    // e.g. "2048"
+    ExportMp4AudioCodec mp4_audio_codec; // AAC, WAV, MP3
+    char mp4_audio_kbps_str[16];    // e.g. "128"
+
+    bool two_pass_render;           // Option: two pass render
+
+    ExportInputField active_field;  // Active text input field inside Export Popup
+    char status_msg[256];           // Render status message
+} ExportDialogState;
+
+static ExportDialogState g_export = {
+    false,
+    { 300, 86, 680, 548 },
+    false, 0, 0,
+    EXPORT_SRC_MASTER,
+    ".",
+    "output",
+    48000,
+    2,
+    EXPORT_FMT_WAV,
+    24,
+    192,
+    "1920",
+    "1080",
+    "25.00",
+    "2048",
+    EXPORT_MP4_AUDIO_AAC,
+    "128",
+    false,
+    EXP_FIELD_NONE,
+    ""
+};
+
+static char* get_active_export_field_buf(size_t *out_max_len) {
+    switch (g_export.active_field) {
+        case EXP_FIELD_DIR:        if (out_max_len) *out_max_len = sizeof(g_export.directory) - 1; return g_export.directory;
+        case EXP_FIELD_FILENAME:   if (out_max_len) *out_max_len = sizeof(g_export.filename) - 1; return g_export.filename;
+        case EXP_FIELD_MP4_WIDTH:  if (out_max_len) *out_max_len = sizeof(g_export.mp4_width_str) - 1; return g_export.mp4_width_str;
+        case EXP_FIELD_MP4_HEIGHT: if (out_max_len) *out_max_len = sizeof(g_export.mp4_height_str) - 1; return g_export.mp4_height_str;
+        case EXP_FIELD_MP4_FPS:    if (out_max_len) *out_max_len = sizeof(g_export.mp4_fps_str) - 1; return g_export.mp4_fps_str;
+        case EXP_FIELD_MP4_V_KBPS: if (out_max_len) *out_max_len = sizeof(g_export.mp4_video_kbps_str) - 1; return g_export.mp4_video_kbps_str;
+        case EXP_FIELD_MP4_A_KBPS: if (out_max_len) *out_max_len = sizeof(g_export.mp4_audio_kbps_str) - 1; return g_export.mp4_audio_kbps_str;
+        default:                   if (out_max_len) *out_max_len = 0; return NULL;
+    }
+}
+
+static inline int get_valid_tab_idx(void) {
     int idx = g_daw.active_tab;
     if (idx < 0 || idx >= MAX_TABS) idx = 0;
-    return g_tab_crossfade[idx];
+    return idx;
+}
+
+static inline bool is_crossfade_active(void) {
+    return g_tab_crossfade[get_valid_tab_idx()];
 }
 
 static inline void set_crossfade_active(bool active) {
-    int idx = g_daw.active_tab;
-    if (idx < 0 || idx >= MAX_TABS) idx = 0;
-    g_tab_crossfade[idx] = active;
+    g_tab_crossfade[get_valid_tab_idx()] = active;
+}
+
+static inline bool is_range_active(void) {
+    int idx = get_valid_tab_idx();
+    return g_tab_range_active[idx] && (g_tab_range_end[idx] > g_tab_range_start[idx] + 0.01);
+}
+
+static inline double get_range_start(void) {
+    return g_tab_range_start[get_valid_tab_idx()];
+}
+
+static inline double get_range_end(void) {
+    return g_tab_range_end[get_valid_tab_idx()];
+}
+
+static inline void set_tab_range(double start_sec, double end_sec, bool active) {
+    int idx = get_valid_tab_idx();
+    if (start_sec < 0.0) start_sec = 0.0;
+    if (end_sec < start_sec + 0.05) end_sec = start_sec + 0.05;
+    g_tab_range_start[idx]  = start_sec;
+    g_tab_range_end[idx]    = end_sec;
+    g_tab_range_active[idx] = active;
+}
+
+// Activated when clicking the top-bar "Range" button:
+// If any clip(s) are selected, sets the Logic Pro style yellow cycle range to the selected clip(s) bounds.
+// Clicking "Range" again when already matching (or when no clip is selected) toggles the cycle range on/off.
+static void handle_top_menu_range_button(ProjectTab *p) {
+    if (!p) return;
+    int idx = get_valid_tab_idx();
+
+    bool has_sel_clip = false;
+    double min_s = 1e18;
+    double max_e = 0.0;
+
+    for (int i = 0; i < p->num_items; i++) {
+        if (p->items[i].is_selected) {
+            has_sel_clip = true;
+            if (p->items[i].start_time < min_s) min_s = p->items[i].start_time;
+            double ie = p->items[i].start_time + p->items[i].duration;
+            if (ie > max_e) max_e = ie;
+        }
+    }
+
+    if (has_sel_clip && max_e > min_s + 0.01) {
+        if (g_tab_range_active[idx] &&
+            fabs(g_tab_range_start[idx] - min_s) < 1e-3 &&
+            fabs(g_tab_range_end[idx] - max_e) < 1e-3) {
+            g_tab_range_active[idx] = false;
+        } else {
+            set_tab_range(min_s, max_e, true);
+        }
+    } else {
+        if (g_tab_range_active[idx]) {
+            g_tab_range_active[idx] = false;
+        } else {
+            if (g_tab_range_end[idx] > g_tab_range_start[idx] + 0.05) {
+                g_tab_range_active[idx] = true;
+            } else {
+                double st = p->playhead_seconds;
+                set_tab_range(st, st + 5.0, true);
+            }
+        }
+    }
 }
 
 static const char* get_marker_full_str(ProjectTab *p, int m_idx) {
-    int tab_idx = g_daw.active_tab;
-    if (tab_idx < 0 || tab_idx >= MAX_TABS) tab_idx = 0;
+    int tab_idx = get_valid_tab_idx();
     if (!p || m_idx < 0 || m_idx >= p->num_markers) return "";
     if (strncmp(g_marker_full_text[tab_idx][m_idx], p->markers[m_idx].text, 63) != 0) {
         strncpy(g_marker_full_text[tab_idx][m_idx], p->markers[m_idx].text, 63);
@@ -65,8 +234,7 @@ static const char* get_marker_full_str(ProjectTab *p, int m_idx) {
 }
 
 static void set_marker_full_str(ProjectTab *p, int m_idx, const char *str) {
-    int tab_idx = g_daw.active_tab;
-    if (tab_idx < 0 || tab_idx >= MAX_TABS) tab_idx = 0;
+    int tab_idx = get_valid_tab_idx();
     if (!p || m_idx < 0 || m_idx >= MAX_MARKERS || !str) return;
     strncpy(g_marker_full_text[tab_idx][m_idx], str, MARKER_TEXT_MAX - 1);
     g_marker_full_text[tab_idx][m_idx][MARKER_TEXT_MAX - 1] = '\0';
@@ -115,8 +283,7 @@ static int get_marker_clamped_width(ProjectTab *p, int m_idx, int mk_x) {
 // Deletes marker at idx in the current tab
 static void delete_marker_at(ProjectTab *p, int idx) {
     if (!p || idx < 0 || idx >= p->num_markers) return;
-    int tab_idx = g_daw.active_tab;
-    if (tab_idx < 0 || tab_idx >= MAX_TABS) tab_idx = 0;
+    int tab_idx = get_valid_tab_idx();
 
     push_undo_state();
     for (int m = idx; m < p->num_markers - 1; m++) {
@@ -179,26 +346,26 @@ static void swap_tracks(ProjectTab *p, int t1, int t2) {
     p->is_dirty = true;
 }
 
-// Helper to draw a 1px or 2px purple border rectangle
-static inline void draw_purple_border_rect(SDL_Renderer *ren, const SDL_Rect *r, bool thick, bool faded) {
+// Helper to draw a 1px or 2px BROWN border rectangle across all UI elements
+static inline void draw_brown_border_rect(SDL_Renderer *ren, const SDL_Rect *r, bool thick, bool faded) {
     if (!r || r->w <= 0 || r->h <= 0) return;
     if (thick) {
-        SDL_SetRenderDrawColor(ren, 175, 108, 245, 255);
+        SDL_SetRenderDrawColor(ren, 205, 138, 72, 255);
         SDL_RenderDrawRect(ren, r);
         if (r->w > 2 && r->h > 2) {
             SDL_Rect inner = { r->x + 1, r->y + 1, r->w - 2, r->h - 2 };
             SDL_RenderDrawRect(ren, &inner);
         }
     } else if (faded) {
-        SDL_SetRenderDrawColor(ren, 108, 66, 156, 255);
+        SDL_SetRenderDrawColor(ren, 118, 78, 46, 255);
         SDL_RenderDrawRect(ren, r);
     } else {
-        SDL_SetRenderDrawColor(ren, 140, 84, 208, 255);
+        SDL_SetRenderDrawColor(ren, 152, 98, 54, 255);
         SDL_RenderDrawRect(ren, r);
     }
 }
 
-// Helper to draw text clipped strictly inside max_bounds intersected with active_clip
+// Helper to draw text clipped strictly inside box_bounds intersected with parent_clip
 static void draw_text_clipped(SDL_Renderer *ren, const char *text, int x, int y, SDL_Color col,
                               const SDL_Rect *box_bounds, const SDL_Rect *parent_clip) {
     if (!text || !box_bounds) return;
@@ -281,6 +448,419 @@ static float compute_item_crossfade_gain(ProjectTab *p, int item_idx, double t_s
     return env;
 }
 
+// Writes a standard PCM WAV header for 16-bit, 24-bit, or 32-bit integer PCM at the chosen sample_rate and channels
+static void write_wav_pcm_header(FILE *f, uint32_t total_frames, int sample_rate, int channels, int bit_depth) {
+    uint32_t sr = (uint32_t)(sample_rate > 0 ? sample_rate : 48000);
+    uint32_t ch = (uint32_t)(channels == 1 ? 1 : 2);
+    uint32_t bps = (uint32_t)((bit_depth == 16 || bit_depth == 24 || bit_depth == 32) ? bit_depth : 24);
+    uint32_t bytes_per_sample = bps / 8;
+    uint16_t block_align = (uint16_t)(ch * bytes_per_sample);
+    uint32_t byte_rate = sr * (uint32_t)block_align;
+    uint32_t data_bytes = total_frames * (uint32_t)block_align;
+    uint32_t riff_size = 36 + data_bytes;
+    uint32_t fmt_size = 16;
+    uint16_t audio_fmt = 1; // 1 = Integer PCM
+    uint16_t ch16 = (uint16_t)ch;
+    uint16_t bps16 = (uint16_t)bps;
+
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&riff_size, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);
+    fwrite(&fmt_size, 4, 1, f);
+    fwrite(&audio_fmt, 2, 1, f);
+    fwrite(&ch16, 2, 1, f);
+    fwrite(&sr, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&block_align, 2, 1, f);
+    fwrite(&bps16, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&data_bytes, 4, 1, f);
+}
+
+static inline float clamp_sample_f(float v) {
+    if (v > 1.0f) return 1.0f;
+    if (v < -1.0f) return -1.0f;
+    return v;
+}
+
+static void write_pcm_frame_samples(FILE *f, float l, float r, int channels, int bit_depth) {
+    float vals[2];
+    if (channels == 1) {
+        vals[0] = clamp_sample_f((l + r) * 0.5f);
+    } else {
+        vals[0] = clamp_sample_f(l);
+        vals[1] = clamp_sample_f(r);
+    }
+
+    int count = (channels == 1) ? 1 : 2;
+    for (int c = 0; c < count; c++) {
+        float s = vals[c];
+        if (bit_depth == 16) {
+            int16_t v16 = (int16_t)(s * 32767.0f);
+            fwrite(&v16, sizeof(int16_t), 1, f);
+        } else if (bit_depth == 24) {
+            int32_t v24 = (int32_t)(s * 8388607.0f);
+            uint8_t b[3];
+            b[0] = (uint8_t)(v24 & 0xFF);
+            b[1] = (uint8_t)((v24 >> 8) & 0xFF);
+            b[2] = (uint8_t)((v24 >> 16) & 0xFF);
+            fwrite(b, 1, 3, f);
+        } else {
+            int32_t v32 = (int32_t)((double)s * 2147483647.0);
+            fwrite(&v32, sizeof(int32_t), 1, f);
+        }
+    }
+}
+
+// Renders a specific time range [exp_start, exp_end] into a WAV file at out_wav_path
+// Filter options:
+//   only_track_idx >= 0  -> only mix items on that track
+//   only_item_idx  >= 0  -> only mix that single item
+static bool render_range_to_wav_file(ProjectTab *p, const char *out_wav_path,
+                                     double exp_start, double exp_end,
+                                     int only_track_idx, int only_item_idx,
+                                     int target_sr, int channels, int bit_depth,
+                                     bool two_pass) {
+    if (!p || !out_wav_path || exp_end <= exp_start + 0.001) return false;
+    if (target_sr != 44100 && target_sr != 48000) target_sr = 48000;
+    if (channels != 1 && channels != 2) channels = 2;
+    if (bit_depth != 16 && bit_depth != 24 && bit_depth != 32) bit_depth = 24;
+
+    uint32_t total_out_frames = (uint32_t)((exp_end - exp_start) * (double)target_sr);
+    if (total_out_frames == 0) total_out_frames = 1;
+
+    bool any_solo = false;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->tracks[t].solo) { any_solo = true; break; }
+    }
+
+    float norm_gain = 1.0f;
+
+    // Pass 1 (if Two-Pass Render is checked): scan peak amplitude across the target range
+    if (two_pass) {
+        float max_peak = 0.0f;
+        const int scan_step = 4; // Fast peak scan
+        for (uint32_t f_idx = 0; f_idx < total_out_frames; f_idx += scan_step) {
+            double t_sec = exp_start + ((double)f_idx / (double)target_sr);
+            float mix_l = 0.0f, mix_r = 0.0f;
+
+            for (int i = 0; i < p->num_items; i++) {
+                if (only_item_idx >= 0 && i != only_item_idx) continue;
+                AudioItem *it = &p->items[i];
+                if (only_track_idx >= 0 && it->track_idx != only_track_idx) continue;
+                if (!it->raw_file_handle) continue;
+
+                if (only_track_idx < 0 && only_item_idx < 0 && it->track_idx >= 0 && it->track_idx < p->num_tracks) {
+                    if (p->tracks[it->track_idx].mute) continue;
+                    if (any_solo && !p->tracks[it->track_idx].solo) continue;
+                }
+
+                if (t_sec >= it->start_time && t_sec <= it->start_time + it->duration) {
+                    int64_t src_frame = (int64_t)(((t_sec - it->start_time) + it->offset_in_file) * SAMPLE_RATE);
+                    if (src_frame >= 0) {
+                        float lr[2] = {0.0f, 0.0f};
+                        fseek(it->raw_file_handle, (long)(src_frame * sizeof(float) * 2), SEEK_SET);
+                        if (fread(lr, sizeof(float) * 2, 1, it->raw_file_handle) == 1) {
+                            float gain = db_to_linear(p->track_db[it->track_idx]) * compute_item_crossfade_gain(p, i, t_sec);
+                            mix_l += lr[0] * gain;
+                            mix_r += lr[1] * gain;
+                        }
+                    }
+                }
+            }
+            float pk = fmaxf(fabsf(mix_l), fabsf(mix_r));
+            if (pk > max_peak) max_peak = pk;
+        }
+        if (max_peak > 0.99f) {
+            norm_gain = 0.98f / max_peak;
+        }
+    }
+
+    FILE *out_f = fopen(out_wav_path, "wb");
+    if (!out_f) return false;
+
+    write_wav_pcm_header(out_f, total_out_frames, target_sr, channels, bit_depth);
+
+    const int chunk_size = 1024;
+    float mix_l[1024];
+    float mix_r[1024];
+
+    uint32_t written = 0;
+    while (written < total_out_frames) {
+        int cur_n = (int)(total_out_frames - written);
+        if (cur_n > chunk_size) cur_n = chunk_size;
+
+        for (int k = 0; k < cur_n; k++) {
+            mix_l[k] = 0.0f;
+            mix_r[k] = 0.0f;
+        }
+
+        double st = exp_start + ((double)written / (double)target_sr);
+        double et = exp_start + ((double)(written + (uint32_t)cur_n) / (double)target_sr);
+
+        for (int i = 0; i < p->num_items; i++) {
+            if (only_item_idx >= 0 && i != only_item_idx) continue;
+            AudioItem *it = &p->items[i];
+            if (only_track_idx >= 0 && it->track_idx != only_track_idx) continue;
+            if (!it->raw_file_handle) continue;
+
+            if (only_track_idx < 0 && only_item_idx < 0 && it->track_idx >= 0 && it->track_idx < p->num_tracks) {
+                if (p->tracks[it->track_idx].mute) continue;
+                if (any_solo && !p->tracks[it->track_idx].solo) continue;
+            }
+
+            double it_s = it->start_time;
+            double it_e = it->start_time + it->duration;
+            if (it_e <= st || it_s >= et) continue;
+
+            float linear_gain = db_to_linear(p->track_db[it->track_idx]) * norm_gain;
+
+            for (int k = 0; k < cur_n; k++) {
+                double sample_t = exp_start + ((double)(written + (uint32_t)k) / (double)target_sr);
+                if (sample_t < it_s || sample_t > it_e) continue;
+
+                int64_t src_frame = (int64_t)(((sample_t - it_s) + it->offset_in_file) * SAMPLE_RATE);
+                if (src_frame < 0) src_frame = 0;
+
+                float lr[2] = {0.0f, 0.0f};
+                fseek(it->raw_file_handle, (long)(src_frame * sizeof(float) * 2), SEEK_SET);
+                if (fread(lr, sizeof(float) * 2, 1, it->raw_file_handle) == 1) {
+                    float xfade_gain = compute_item_crossfade_gain(p, i, sample_t);
+                    float g = linear_gain * xfade_gain;
+                    mix_l[k] += lr[0] * g;
+                    mix_r[k] += lr[1] * g;
+                }
+            }
+        }
+
+        for (int k = 0; k < cur_n; k++) {
+            write_pcm_frame_samples(out_f, mix_l[k], mix_r[k], channels, bit_depth);
+        }
+        written += (uint32_t)cur_n;
+    }
+
+    fclose(out_f);
+    return true;
+}
+
+// Converts or muxes the rendered WAV into MP3 or MP4 according to g_export settings
+static void finalize_format_from_wav(ProjectTab *p, const char *wav_src_path, const char *final_out_path,
+                                     double exp_start, double exp_end) {
+    if (g_export.format == EXPORT_FMT_WAV) {
+        return; // Already written directly to final_out_path
+    }
+
+    char cmd[2048];
+    if (g_export.format == EXPORT_FMT_MP3) {
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -y -loglevel error -i \"%s\" -vn -ar %d -ac %d -b:a %dk \"%s\"",
+                 wav_src_path, g_export.sample_rate, g_export.channels, g_export.mp3_bitrate, final_out_path);
+        int rc = system(cmd);
+        if (rc != 0) {
+            // Fallback if ffmpeg CLI is not in PATH: copy rendered audio stream to destination
+            FILE *src = fopen(wav_src_path, "rb");
+            FILE *dst = fopen(final_out_path, "wb");
+            if (src && dst) {
+                char buf[4096];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
+            }
+            if (src) fclose(src);
+            if (dst) fclose(dst);
+        }
+        remove(wav_src_path);
+        return;
+    }
+
+    if (g_export.format == EXPORT_FMT_MP4) {
+        int w = atoi(g_export.mp4_width_str);
+        int h = atoi(g_export.mp4_height_str);
+        double fps = atof(g_export.mp4_fps_str);
+        int v_kbps = atoi(g_export.mp4_video_kbps_str);
+        int a_kbps = atoi(g_export.mp4_audio_kbps_str);
+        if (w <= 0) w = 1920;
+        if (h <= 0) h = 1080;
+        if (w % 2 != 0) w++;
+        if (h % 2 != 0) h++;
+        if (fps <= 0.0) fps = 25.0;
+        if (v_kbps <= 0) v_kbps = 2048;
+        if (a_kbps <= 0) a_kbps = 128;
+
+        const char *a_codec = "aac";
+        if (g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_MP3) a_codec = "libmp3lame";
+        else if (g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_WAV) a_codec = "pcm_s16le";
+
+        // Find top-most video clip overlapping [exp_start, exp_end], if any
+        const char *video_src = NULL;
+        double v_offset = 0.0;
+        if (p) {
+            int best_trk = 999999;
+            for (int i = 0; i < p->num_items; i++) {
+                AudioItem *it = &p->items[i];
+                if (!it->has_video || !it->file_path[0]) continue;
+                if (it->start_time + it->duration > exp_start && it->start_time < exp_end) {
+                    if (it->track_idx < best_trk) {
+                        best_trk = it->track_idx;
+                        video_src = it->file_path;
+                        v_offset = fmax(0.0, (exp_start - it->start_time) + it->offset_in_file);
+                    }
+                }
+            }
+        }
+
+        double dur = exp_end - exp_start;
+        if (dur <= 0.01) dur = 1.0;
+
+        if (video_src) {
+            snprintf(cmd, sizeof(cmd),
+                     "ffmpeg -y -loglevel error -ss %.3f -i \"%s\" -i \"%s\" -t %.3f "
+                     "-map 0:v:0 -map 1:a:0 -vf \"scale=%d:%d\" -r %.2f -c:v libx264 -b:v %dk "
+                     "-c:a %s -b:a %dk -ar %d -ac %d \"%s\"",
+                     v_offset, video_src, wav_src_path, dur,
+                     w, h, fps, v_kbps, a_codec, a_kbps, g_export.sample_rate, g_export.channels, final_out_path);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "ffmpeg -y -loglevel error -f lavfi -i color=c=black:s=%dx%d:r=%.2f -i \"%s\" -t %.3f "
+                     "-c:v libx264 -b:v %dk -c:a %s -b:a %dk -ar %d -ac %d -shortest \"%s\"",
+                     w, h, fps, wav_src_path, dur,
+                     v_kbps, a_codec, a_kbps, g_export.sample_rate, g_export.channels, final_out_path);
+        }
+        int rc = system(cmd);
+        if (rc != 0) {
+            FILE *src = fopen(wav_src_path, "rb");
+            FILE *dst = fopen(final_out_path, "wb");
+            if (src && dst) {
+                char buf[4096];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
+            }
+            if (src) fclose(src);
+            if (dst) fclose(dst);
+        }
+        remove(wav_src_path);
+    }
+}
+
+static const char* get_export_ext(void) {
+    if (g_export.format == EXPORT_FMT_MP3) return "mp3";
+    if (g_export.format == EXPORT_FMT_MP4) return "mp4";
+    return "wav";
+}
+
+// Executes the unified Export Media workflow based on all settings in g_export
+static void execute_unified_export(ProjectTab *p) {
+    if (!p) return;
+
+    const char *ext = get_export_ext();
+    const char *dir = (g_export.directory[0] != '\0') ? g_export.directory : ".";
+    const char *base = (g_export.filename[0] != '\0') ? g_export.filename : "output";
+
+    double exp_start = 0.0;
+    double exp_end = 0.0;
+    if (is_range_active()) {
+        exp_start = get_range_start();
+        exp_end   = get_range_end();
+    } else {
+        for (int i = 0; i < p->num_items; i++) {
+            double ie = p->items[i].start_time + p->items[i].duration;
+            if (ie > exp_end) exp_end = ie;
+        }
+    }
+    if (exp_end <= exp_start + 0.001) exp_end = exp_start + 1.0;
+
+    int exported_files = 0;
+
+    if (g_export.source == EXPORT_SRC_MASTER) {
+        char final_path[1024];
+        snprintf(final_path, sizeof(final_path), "%s/%s.%s", dir, base, ext);
+
+        const char *wav_target = (g_export.format == EXPORT_FMT_WAV) ? final_path : ".cache/export_tmp_master.wav";
+        if (render_range_to_wav_file(p, wav_target, exp_start, exp_end, -1, -1,
+                                     g_export.sample_rate, g_export.channels, g_export.wav_bit_depth,
+                                     g_export.two_pass_render)) {
+            finalize_format_from_wav(p, wav_target, final_path, exp_start, exp_end);
+            exported_files++;
+        }
+    } else if (g_export.source == EXPORT_SRC_STEMS) {
+        bool any_trk_sel = false;
+        for (int t = 0; t < p->num_tracks; t++) {
+            if (p->track_selected[t]) { any_trk_sel = true; break; }
+        }
+        for (int t = 0; t < p->num_tracks; t++) {
+            if (any_trk_sel && !p->track_selected[t]) continue;
+            char final_path[1024];
+            snprintf(final_path, sizeof(final_path), "%s/%s_Track_%d.%s", dir, base, t + 1, ext);
+            const char *wav_target = (g_export.format == EXPORT_FMT_WAV) ? final_path : ".cache/export_tmp_stem.wav";
+            if (render_range_to_wav_file(p, wav_target, exp_start, exp_end, t, -1,
+                                         g_export.sample_rate, g_export.channels, g_export.wav_bit_depth,
+                                         g_export.two_pass_render)) {
+                finalize_format_from_wav(p, wav_target, final_path, exp_start, exp_end);
+                exported_files++;
+            }
+        }
+    } else if (g_export.source == EXPORT_SRC_ITEMS) {
+        bool any_item_sel = false;
+        for (int i = 0; i < p->num_items; i++) {
+            if (p->items[i].is_selected) { any_item_sel = true; break; }
+        }
+        for (int i = 0; i < p->num_items; i++) {
+            if (any_item_sel && !p->items[i].is_selected) continue;
+            AudioItem *it = &p->items[i];
+            double it_s = it->start_time;
+            double it_e = it->start_time + it->duration;
+            if (is_range_active()) {
+                if (it_s < exp_start) it_s = exp_start;
+                if (it_e > exp_end)   it_e = exp_end;
+            }
+            if (it_e <= it_s + 0.001) continue;
+
+            char final_path[1024];
+            snprintf(final_path, sizeof(final_path), "%s/%s_Item_%d.%s", dir, base, i + 1, ext);
+            const char *wav_target = (g_export.format == EXPORT_FMT_WAV) ? final_path : ".cache/export_tmp_item.wav";
+            if (render_range_to_wav_file(p, wav_target, it_s, it_e, -1, i,
+                                         g_export.sample_rate, g_export.channels, g_export.wav_bit_depth,
+                                         g_export.two_pass_render)) {
+                finalize_format_from_wav(p, wav_target, final_path, it_s, it_e);
+                exported_files++;
+            }
+        }
+    }
+
+    if (exported_files > 0) {
+        snprintf(g_export.status_msg, sizeof(g_export.status_msg),
+                 "Exported %d file(s) to %s/%s*.%s", exported_files, dir, base, ext);
+    } else {
+        snprintf(g_export.status_msg, sizeof(g_export.status_msg),
+                 "No matching audio/media items found to export.");
+    }
+}
+
+// Opens Windows save/browse dialog to pick output directory & filename for g_export
+static void browse_export_directory_and_filename(void) {
+    char chosen[MAX_PATH] = {0};
+    if (open_generic_dialog(chosen, sizeof(chosen), "Select Output Folder & Name\0*.*\0", true)) {
+        char *last_sep = strrchr(chosen, '\\');
+        if (!last_sep) last_sep = strrchr(chosen, '/');
+        if (last_sep) {
+            *last_sep = '\0';
+            strncpy(g_export.directory, chosen, sizeof(g_export.directory) - 1);
+            g_export.directory[sizeof(g_export.directory) - 1] = '\0';
+            const char *fname = last_sep + 1;
+            if (fname[0] != '\0') {
+                strncpy(g_export.filename, fname, sizeof(g_export.filename) - 1);
+                g_export.filename[sizeof(g_export.filename) - 1] = '\0';
+                // Strip extension if user typed one
+                char *dot = strrchr(g_export.filename, '.');
+                if (dot) *dot = '\0';
+            }
+        } else {
+            strncpy(g_export.filename, chosen, sizeof(g_export.filename) - 1);
+            g_export.filename[sizeof(g_export.filename) - 1] = '\0';
+        }
+    }
+}
+
 // Checks whether interval [start_t, start_t + dur] overlaps any clip on track_idx (excluding ignore_idx)
 static bool interval_overlaps_on_track(ProjectTab *p, int ignore_idx, int track_idx, double start_t, double dur) {
     double end_t = start_t + dur;
@@ -352,6 +932,15 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
 
     if (!p->is_playing) return;
 
+    // Logic Pro style Cycle Range loop during playback
+    if (is_range_active()) {
+        double rs = get_range_start();
+        double re = get_range_end();
+        if (p->playhead_seconds >= re || p->playhead_seconds < rs) {
+            p->playhead_seconds = rs;
+        }
+    }
+
     bool any_solo = false;
     for (int t = 0; t < p->num_tracks; t++) {
         if (p->tracks[t].solo) { any_solo = true; break; }
@@ -406,6 +995,9 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
         }
     }
     p->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
+    if (is_range_active() && p->playhead_seconds >= get_range_end()) {
+        p->playhead_seconds = get_range_start();
+    }
 }
 
 static inline int get_marker_height(ProjectTab *p) {
@@ -525,6 +1117,14 @@ int main(int argc, char *argv[]) {
     double orig_scroll_x = 0; int orig_scroll_y = 0;
     bool scrubbing_ruler = false;
 
+    // Logic Pro style Cycle Range strip dragging state
+    bool dragging_range_left = false;
+    bool dragging_range_right = false;
+    bool dragging_range_body = false;
+    double range_drag_start_mouse_sec = 0.0;
+    double range_orig_start_sec = 0.0;
+    double range_orig_end_sec = 0.0;
+
     bool marquee_selecting = false;
     int marquee_start_x = 0, marquee_start_y = 0;
     int marquee_cur_x = 0, marquee_cur_y = 0;
@@ -583,7 +1183,7 @@ int main(int argc, char *argv[]) {
                     running = false;
                 }
             } else if (e.type == SDL_MOUSEWHEEL) {
-                if (g_daw.save_prompt_open) continue;
+                if (g_daw.save_prompt_open || g_export.is_open) continue;
                 SDL_Keymod mod = SDL_GetModState();
                 int mx, my; SDL_GetMouseState(&mx, &my);
                 if (mod & KMOD_CTRL) {
@@ -605,6 +1205,14 @@ int main(int argc, char *argv[]) {
                 }
             } else if (e.type == SDL_TEXTINPUT) {
                 if (g_daw.save_prompt_open) continue;
+                if (g_export.is_open && g_export.active_field != EXP_FIELD_NONE) {
+                    size_t max_len = 0;
+                    char *buf = get_active_export_field_buf(&max_len);
+                    if (buf && strlen(buf) + strlen(e.text.text) < max_len) {
+                        strcat(buf, e.text.text);
+                    }
+                    continue;
+                }
                 if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME) {
                     if (strlen(g_daw.editing_name_buf) + strlen(e.text.text) < 63) {
                         strcat(g_daw.editing_name_buf, e.text.text);
@@ -625,7 +1233,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
             } else if (e.type == SDL_DROPFILE) {
-                if (g_daw.save_prompt_open) { SDL_free(e.drop.file); continue; }
+                if (g_daw.save_prompt_open || g_export.is_open) { SDL_free(e.drop.file); continue; }
                 char *file = e.drop.file;
                 int my = 0; SDL_GetMouseState(NULL, &my);
                 int trk = 0;
@@ -657,6 +1265,22 @@ int main(int argc, char *argv[]) {
                 if (g_daw.save_prompt_open) {
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
                         handle_save_modal_choice(3, &running);
+                    }
+                    continue;
+                }
+                if (g_export.is_open) {
+                    if (g_export.active_field != EXP_FIELD_NONE) {
+                        size_t max_len = 0;
+                        char *buf = get_active_export_field_buf(&max_len);
+                        if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_ESCAPE) {
+                            g_export.active_field = EXP_FIELD_NONE;
+                            SDL_StopTextInput();
+                        } else if (e.key.keysym.sym == SDLK_BACKSPACE && buf) {
+                            size_t l = strlen(buf);
+                            if (l > 0) buf[l - 1] = '\0';
+                        }
+                    } else if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        g_export.is_open = false;
                     }
                     continue;
                 }
@@ -722,6 +1346,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // Note: Pressing 'M' does NOT add a marker (markers only added via right-click)
                 if ((mod & KMOD_CTRL) && e.key.keysym.sym == SDLK_z) perform_undo();
                 else if ((mod & KMOD_CTRL) && (e.key.keysym.sym == SDLK_y || ((mod & KMOD_SHIFT) && e.key.keysym.sym == SDLK_z))) perform_redo();
                 else if ((mod & KMOD_CTRL) && e.key.keysym.sym == SDLK_s) {
@@ -734,23 +1359,9 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 else if (e.key.keysym.sym == SDLK_EQUALS || e.key.keysym.sym == SDLK_PLUS || e.key.keysym.sym == SDLK_KP_PLUS)
-                    p->pixels_per_second = fminf(400.0f, p->pixels_per_second * 1.25f);
+                    p->pixels_per_second = fminf(400.0f, p->pixels_per_second * 0.8f > 0 ? p->pixels_per_second * 1.25f : 100.0f);
                 else if (e.key.keysym.sym == SDLK_MINUS || e.key.keysym.sym == SDLK_KP_MINUS)
                     p->pixels_per_second = fmaxf(15.0f, p->pixels_per_second * 0.8f);
-                else if (e.key.keysym.sym == SDLK_m) {
-                    p->show_marker_lane = true;
-                    if (p->num_markers < MAX_MARKERS) {
-                        push_undo_state();
-                        int new_m = p->num_markers++;
-                        DawMarker *mk = &p->markers[new_m];
-                        mk->time_sec = p->playhead_seconds;
-                        char def_txt[64];
-                        snprintf(def_txt, sizeof(def_txt), "Marker %d", p->num_markers);
-                        set_marker_full_str(p, new_m, def_txt);
-                        g_selected_marker_idx = new_m;
-                        p->is_dirty = true;
-                    }
-                }
                 else if (e.key.keysym.sym == SDLK_SPACE) p->is_playing = !p->is_playing;
                 else if (e.key.keysym.sym == SDLK_v) p->video.is_open = !p->video.is_open;
                 else if (e.key.keysym.sym == SDLK_HOME) { p->playhead_seconds = 0.0; }
@@ -803,6 +1414,143 @@ int main(int argc, char *argv[]) {
                     // [Cancel]
                     if (mx >= dia_x + 262 && mx <= dia_x + 362 && my >= btn_y && my <= btn_y + 30) {
                         handle_save_modal_choice(3, &running);
+                        continue;
+                    }
+                    continue;
+                }
+
+                // ================= UNIFIED EXPORT MEDIA POPUP INTERACTIONS =================
+                if (g_export.is_open) {
+                    SDL_Rect *er = &g_export.win_rect;
+                    int ex = er->x, ey = er->y, ew = er->w, eh = er->h;
+
+                    // Stop any previous text input unless a field is clicked below
+                    g_export.active_field = EXP_FIELD_NONE;
+                    SDL_StopTextInput();
+
+                    // Title bar drag or [X] close
+                    if (mx >= ex && mx <= ex + ew && my >= ey && my <= ey + 30) {
+                        if (mx >= ex + ew - 30) {
+                            g_export.is_open = false;
+                        } else {
+                            g_export.is_dragging = true;
+                            g_export.drag_off_x = mx - ex;
+                            g_export.drag_off_y = my - ey;
+                        }
+                        continue;
+                    }
+
+                    if (mx >= ex && mx <= ex + ew && my >= ey + 30 && my <= ey + eh) {
+                        // 1. Source row (ey + 48 .. ey + 76)
+                        int sy_src = ey + 48;
+                        if (my >= sy_src && my <= sy_src + 26) {
+                            if (mx >= ex + 110 && mx <= ex + 245) g_export.source = EXPORT_SRC_MASTER;
+                            else if (mx >= ex + 255 && mx <= ex + 465) g_export.source = EXPORT_SRC_STEMS;
+                            else if (mx >= ex + 475 && mx <= ex + 662) g_export.source = EXPORT_SRC_ITEMS;
+                        }
+
+                        // 2. Output Directory row (ey + 98 .. ey + 124) & [Browse...] button
+                        int sy_dir = ey + 98;
+                        if (my >= sy_dir && my <= sy_dir + 26) {
+                            if (mx >= ex + 130 && mx <= ex + 545) {
+                                g_export.active_field = EXP_FIELD_DIR;
+                                SDL_StartTextInput();
+                            } else if (mx >= ex + 555 && mx <= ex + 662) {
+                                browse_export_directory_and_filename();
+                            }
+                        }
+
+                        // 3. Output File Name row (ey + 132 .. ey + 158)
+                        int sy_fn = ey + 132;
+                        if (my >= sy_fn && my <= sy_fn + 26) {
+                            if (mx >= ex + 130 && mx <= ex + 545) {
+                                g_export.active_field = EXP_FIELD_FILENAME;
+                                SDL_StartTextInput();
+                            }
+                        }
+
+                        // 4. Sample Rate (48,000 / 44,100) & Channels (Mono / Stereo) row (ey + 182 .. ey + 208)
+                        int sy_sr = ey + 182;
+                        if (my >= sy_sr && my <= sy_sr + 26) {
+                            if (mx >= ex + 130 && mx <= ex + 235) g_export.sample_rate = 48000;
+                            else if (mx >= ex + 243 && mx <= ex + 348) g_export.sample_rate = 44100;
+                            else if (mx >= ex + 455 && mx <= ex + 545) g_export.channels = 1;
+                            else if (mx >= ex + 553 && mx <= ex + 655) g_export.channels = 2;
+                        }
+
+                        // 5. Format Tabs: WAV / MP3 / MP4 (ey + 232 .. ey + 260)
+                        int sy_fmt = ey + 232;
+                        if (my >= sy_fmt && my <= sy_fmt + 28) {
+                            if (mx >= ex + 130 && mx <= ex + 260) g_export.format = EXPORT_FMT_WAV;
+                            else if (mx >= ex + 270 && mx <= ex + 400) g_export.format = EXPORT_FMT_MP3;
+                            else if (mx >= ex + 410 && mx <= ex + 655) g_export.format = EXPORT_FMT_MP4;
+                        }
+
+                        // 6. Format-specific sub-options (ey + 276 .. ey + 420)
+                        int sy_sub = ey + 278;
+                        if (g_export.format == EXPORT_FMT_WAV) {
+                            if (my >= sy_sub + 12 && my <= sy_sub + 40) {
+                                if (mx >= ex + 140 && mx <= ex + 280) g_export.wav_bit_depth = 16;
+                                else if (mx >= ex + 292 && mx <= ex + 432) g_export.wav_bit_depth = 24;
+                                else if (mx >= ex + 444 && mx <= ex + 584) g_export.wav_bit_depth = 32;
+                            }
+                        } else if (g_export.format == EXPORT_FMT_MP3) {
+                            if (my >= sy_sub + 12 && my <= sy_sub + 40) {
+                                if (mx >= ex + 140 && mx <= ex + 280) g_export.mp3_bitrate = 128;
+                                else if (mx >= ex + 292 && mx <= ex + 432) g_export.mp3_bitrate = 192;
+                                else if (mx >= ex + 444 && mx <= ex + 584) g_export.mp3_bitrate = 320;
+                            }
+                        } else if (g_export.format == EXPORT_FMT_MP4) {
+                            // Row 1: File: [MPEG-4]  Size: [1920] x [1080]  Framerate: [25.00]
+                            int r1_y = sy_sub + 8;
+                            if (my >= r1_y && my <= r1_y + 26) {
+                                if (mx >= ex + 295 && mx <= ex + 365) {
+                                    g_export.active_field = EXP_FIELD_MP4_WIDTH;
+                                    SDL_StartTextInput();
+                                } else if (mx >= ex + 390 && mx <= ex + 460) {
+                                    g_export.active_field = EXP_FIELD_MP4_HEIGHT;
+                                    SDL_StartTextInput();
+                                } else if (mx >= ex + 568 && mx <= ex + 648) {
+                                    g_export.active_field = EXP_FIELD_MP4_FPS;
+                                    SDL_StartTextInput();
+                                }
+                            }
+                            // Row 2: Video: [H.264]  [2048] kbps
+                            int r2_y = sy_sub + 46;
+                            if (my >= r2_y && my <= r2_y + 26) {
+                                if (mx >= ex + 295 && mx <= ex + 395) {
+                                    g_export.active_field = EXP_FIELD_MP4_V_KBPS;
+                                    SDL_StartTextInput();
+                                }
+                            }
+                            // Row 3: Audio: [AAC | WAV | MP3]  [128] kbps
+                            int r3_y = sy_sub + 84;
+                            if (my >= r3_y && my <= r3_y + 26) {
+                                if (mx >= ex + 92 && mx <= ex + 148) g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
+                                else if (mx >= ex + 152 && mx <= ex + 208) g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_WAV;
+                                else if (mx >= ex + 212 && mx <= ex + 268) g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_MP3;
+                                else if (mx >= ex + 295 && mx <= ex + 395) {
+                                    g_export.active_field = EXP_FIELD_MP4_A_KBPS;
+                                    SDL_StartTextInput();
+                                }
+                            }
+                        }
+
+                        // 7. Option: Two-pass render checkbox (ey + 440 .. ey + 466)
+                        int sy_opt = ey + 440;
+                        if (my >= sy_opt && my <= sy_opt + 24 && mx >= ex + 22 && mx <= ex + 240) {
+                            g_export.two_pass_render = !g_export.two_pass_render;
+                        }
+
+                        // 8. Bottom buttons: [Render / Export] and [Close]
+                        int btn_y = ey + eh - 44;
+                        if (my >= btn_y && my <= btn_y + 32) {
+                            if (mx >= ex + ew - 270 && mx <= ex + ew - 125) {
+                                execute_unified_export(p);
+                            } else if (mx >= ex + ew - 115 && mx <= ex + ew - 20) {
+                                g_export.is_open = false;
+                            }
+                        }
                         continue;
                     }
                     continue;
@@ -893,6 +1641,9 @@ int main(int argc, char *argv[]) {
                         char name[64]; snprintf(name, sizeof(name), "Project %d", g_daw.num_tabs + 1);
                         init_tab_defaults(g_daw.num_tabs, name);
                         g_tab_crossfade[g_daw.num_tabs] = true;
+                        g_tab_range_active[g_daw.num_tabs] = false;
+                        g_tab_range_start[g_daw.num_tabs] = 0.0;
+                        g_tab_range_end[g_daw.num_tabs] = 0.0;
                         memset(g_marker_full_text[g_daw.num_tabs], 0, sizeof(g_marker_full_text[0]));
                         g_daw.active_tab = g_daw.num_tabs++;
                         g_selected_marker_idx = -1;
@@ -987,23 +1738,17 @@ int main(int argc, char *argv[]) {
                             g_daw.menu_file_open = false;
                             continue;
                         }
-                        else if (my >= m_start + 72 && my < m_start + 96) { g_daw.submenu_export_audio_open = !g_daw.submenu_export_audio_open; g_daw.submenu_export_video_open = false; continue; }
-                        else if (my >= m_start + 96 && my < m_start + 120) { g_daw.submenu_export_video_open = !g_daw.submenu_export_video_open; g_daw.submenu_export_audio_open = false; continue; }
-                        else if (my >= m_start + 120 && my < m_start + 144) { export_batch_tracks(); g_daw.menu_file_open = false; continue; }
-                    }
-                    if (g_daw.submenu_export_audio_open && mx >= 200 && mx <= 310) {
-                        int s_start = TABBAR_HEIGHT + TOPBAR_HEIGHT + 72;
-                        if (my >= s_start && my < s_start + 22) { export_rendered_audio("wav"); g_daw.menu_file_open = false; continue; }
-                        if (my >= s_start + 22 && my < s_start + 44) { export_rendered_audio("mp3"); g_daw.menu_file_open = false; continue; }
-                        if (my >= s_start + 44 && my < s_start + 66) { export_rendered_audio("flac"); g_daw.menu_file_open = false; continue; }
-                        if (my >= s_start + 66 && my < s_start + 88) { export_rendered_audio("ogg"); g_daw.menu_file_open = false; continue; }
-                    }
-                    if (g_daw.submenu_export_video_open && mx >= 200 && mx <= 310) {
-                        int s_start = TABBAR_HEIGHT + TOPBAR_HEIGHT + 100;
-                        if (my >= s_start && my < s_start + 22) { export_rendered_audio("mp4"); g_daw.menu_file_open = false; continue; }
-                        if (my >= s_start + 22 && my < s_start + 44) { export_rendered_audio("mkv"); g_daw.menu_file_open = false; continue; }
-                        if (my >= s_start + 44 && my < s_start + 66) { export_rendered_audio("mov"); g_daw.menu_file_open = false; continue; }
-                        if (my >= s_start + 66 && my < s_start + 88) { export_rendered_audio("avi"); g_daw.menu_file_open = false; continue; }
+                        else if (my >= m_start + 72 && my < m_start + 100) {
+                            // Opens the unified Export Media Popup Window
+                            g_export.is_open = true;
+                            g_export.win_rect.x = (win_w - g_export.win_rect.w) / 2;
+                            g_export.win_rect.y = (win_h - g_export.win_rect.h) / 2;
+                            g_export.status_msg[0] = '\0';
+                            g_daw.menu_file_open = false;
+                            g_daw.submenu_export_audio_open = false;
+                            g_daw.submenu_export_video_open = false;
+                            continue;
+                        }
                     }
                 }
 
@@ -1025,15 +1770,19 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (my >= TABBAR_HEIGHT && my <= TABBAR_HEIGHT + TOPBAR_HEIGHT) {
-                    if (mx >= 8 && mx <= 50) { g_daw.menu_file_open = !g_daw.menu_file_open; g_daw.menu_action_open = false; }
+                    if (mx >= 8 && mx <= 54) { g_daw.menu_file_open = !g_daw.menu_file_open; g_daw.menu_action_open = false; }
                     else if (mx >= 56 && mx <= 116) { g_daw.menu_action_open = !g_daw.menu_action_open; g_daw.menu_file_open = false; }
-                    else if (mx >= 122 && mx <= 186) {
+                    else if (mx >= 122 && mx <= 188) {
                         p->show_marker_lane = !p->show_marker_lane;
                     }
-                    else if (mx >= 192 && mx <= 284) p->video.is_open = !p->video.is_open;
+                    else if (mx >= 194 && mx <= 282) p->video.is_open = !p->video.is_open;
                     else if (mx >= 288 && mx <= 412) {
                         // Toggle Crossfade mode without moving any existing overlapped clips
                         set_crossfade_active(!is_crossfade_active());
+                    }
+                    else if (mx >= 418 && mx <= 486) {
+                        // Top menu "Range" button: sets/toggles Logic Pro style yellow Cycle Range around selected clip(s)
+                        handle_top_menu_range_button(p);
                     }
                     else if (mx >= win_w - 228 && mx < win_w - 176) perform_undo();
                     else if (mx >= win_w - 172 && mx < win_w - 120) perform_redo();
@@ -1081,10 +1830,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // ================= MARKER LANE INTERACTIONS (FIXED POSITION, NO DRAG) =================
-                // 1. Right-click empty marker lane -> Add Marker (fixed position)
-                // 2. Double-click marker -> Typing cursor for typing text (expands to show full text while editing)
-                // 3. Delete marker (via right-click "Delete Marker" menu or Delete/Backspace key)
+                // ================= MARKER LANE INTERACTIONS (FIXED POSITION, ONLY RIGHT-CLICK ADDS) =================
                 int marker_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT;
                 if (p->show_marker_lane && mx >= g_daw.tcp_width && my > marker_y && my <= marker_y + MARKER_BAR_HEIGHT) {
                     double m_time = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
@@ -1135,7 +1881,6 @@ int main(int argc, char *argv[]) {
                                 g_marker_cursor_pos = (int)strlen(g_editing_marker_full_buf);
                                 SDL_StartTextInput();
                             }
-                            // Note: Markers are sticky (do not move/drag)
                         } else {
                             g_selected_marker_idx = -1;
                         }
@@ -1143,10 +1888,42 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // ================= TIME RULER & LOGIC PRO YELLOW CYCLE RANGE STRIP =================
                 int ruler_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+                int header_top_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + m_lane_h;
+
+                // Check if user clicked on the yellow Cycle Range strip or its draggable left/right edges
+                if (is_range_active() && e.button.button == SDL_BUTTON_LEFT && mx >= g_daw.tcp_width) {
+                    int rx1 = g_daw.tcp_width + (int)((get_range_start() - p->scroll_x_sec) * p->pixels_per_second);
+                    int rx2 = g_daw.tcp_width + (int)((get_range_end()   - p->scroll_x_sec) * p->pixels_per_second);
+                    bool in_ruler_strip = (my >= ruler_y && my <= ruler_y + RULER_HEIGHT);
+                    bool in_top_strip   = (my >= header_top_y && my <= header_top_y + 10);
+
+                    if (in_ruler_strip || in_top_strip) {
+                        if (abs(mx - rx1) <= 8) {
+                            dragging_range_left = true;
+                            range_orig_start_sec = get_range_start();
+                            range_orig_end_sec   = get_range_end();
+                            continue;
+                        } else if (abs(mx - rx2) <= 8) {
+                            dragging_range_right = true;
+                            range_orig_start_sec = get_range_start();
+                            range_orig_end_sec   = get_range_end();
+                            continue;
+                        } else if (mx > rx1 + 8 && mx < rx2 - 8 &&
+                                   ((my >= ruler_y + RULER_HEIGHT - 10 && my <= ruler_y + RULER_HEIGHT) || in_top_strip)) {
+                            dragging_range_body = true;
+                            range_drag_start_mouse_sec = p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second;
+                            range_orig_start_sec = get_range_start();
+                            range_orig_end_sec   = get_range_end();
+                            continue;
+                        }
+                    }
+                }
+
                 if (mx >= g_daw.tcp_width && my > ruler_y && my <= ruler_y + RULER_HEIGHT) {
                     if (e.button.button == SDL_BUTTON_RIGHT) {
-                        // Also allow right-clicking the ruler to auto-show the marker lane and add a marker
+                        // Right-clicking the ruler auto-shows the marker lane and adds a marker
                         p->show_marker_lane = true;
                         if (p->num_markers < MAX_MARKERS) {
                             push_undo_state();
@@ -1168,7 +1945,6 @@ int main(int argc, char *argv[]) {
                 }
 
                 // ================= TRACK CONTROLS, SELECTION & UP/DOWN DRAG REORDER =================
-                int header_top_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + m_lane_h;
                 if (mx < g_daw.tcp_width && my > header_top_y) {
                     int cur_y = header_top_y - p->scroll_y_px;
                     for (int t = 0; t < p->num_tracks; t++) {
@@ -1270,8 +2046,12 @@ int main(int argc, char *argv[]) {
                 }
             } else if (e.type == SDL_MOUSEBUTTONUP) {
                 p->video.is_dragging = false; p->video.is_resizing = false;
+                g_export.is_dragging = false;
                 dragging_scrollbar_h = false; dragging_scrollbar_v = false;
                 scrubbing_ruler = false;
+                dragging_range_left = false;
+                dragging_range_right = false;
+                dragging_range_body = false;
                 resizing_tcp_width = false;
                 resizing_track_idx = -1;
                 dragging_track_order_idx = -1;
@@ -1301,19 +2081,37 @@ int main(int argc, char *argv[]) {
             } else if (e.type == SDL_MOUSEMOTION) {
                 int mx = e.motion.x, my = e.motion.y;
 
+                if (g_export.is_open && g_export.is_dragging) {
+                    g_export.win_rect.x = mx - g_export.drag_off_x;
+                    g_export.win_rect.y = my - g_export.drag_off_y;
+                    continue;
+                }
+
                 if (g_daw.script_win_dragging) {
                     g_daw.script_win_rect.x = mx - g_daw.script_drag_offset_x;
                     g_daw.script_win_rect.y = my - g_daw.script_drag_offset_y;
                 }
 
+                int ruler_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
                 int header_top_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + m_lane_h;
                 bool hovered_edge = false;
                 bool hovered_ibeam = false;
 
-                if (abs(mx - g_daw.tcp_width) <= 5 && my > TABBAR_HEIGHT + TOPBAR_HEIGHT) {
+                // Cursor feedback for yellow Cycle Range strip left/right edges
+                if (is_range_active() && mx >= g_daw.tcp_width &&
+                    ((my >= ruler_y && my <= ruler_y + RULER_HEIGHT) || (my >= header_top_y && my <= header_top_y + 10))) {
+                    int rx1 = g_daw.tcp_width + (int)((get_range_start() - p->scroll_x_sec) * p->pixels_per_second);
+                    int rx2 = g_daw.tcp_width + (int)((get_range_end()   - p->scroll_x_sec) * p->pixels_per_second);
+                    if (abs(mx - rx1) <= 8 || abs(mx - rx2) <= 8) {
+                        SDL_SetCursor(g_cursor_size_we);
+                        hovered_edge = true;
+                    }
+                }
+
+                if (!hovered_edge && abs(mx - g_daw.tcp_width) <= 5 && my > TABBAR_HEIGHT + TOPBAR_HEIGHT) {
                     SDL_SetCursor(g_cursor_size_we);
                     hovered_edge = true;
-                } else if (mx < g_daw.tcp_width && my > header_top_y) {
+                } else if (!hovered_edge && mx < g_daw.tcp_width && my > header_top_y) {
                     int cur_y = header_top_y - p->scroll_y_px;
                     for (int t = 0; t < p->num_tracks; t++) {
                         int th = p->track_heights[t];
@@ -1334,7 +2132,7 @@ int main(int argc, char *argv[]) {
                         }
                         cur_y += th;
                     }
-                } else if (mx >= g_daw.tcp_width && my > header_top_y) {
+                } else if (!hovered_edge && mx >= g_daw.tcp_width && my > header_top_y) {
                     for (int i = 0; i < p->num_items; i++) {
                         AudioItem *it = &p->items[i];
                         int ix = g_daw.tcp_width + (int)((it->start_time - p->scroll_x_sec) * p->pixels_per_second);
@@ -1349,8 +2147,32 @@ int main(int argc, char *argv[]) {
                         }
                     }
                 }
-                if (!hovered_edge && !hovered_ibeam && !resizing_tcp_width && resizing_track_idx < 0 && dragging_track_order_idx < 0) {
+                if (!hovered_edge && !hovered_ibeam && !resizing_tcp_width && resizing_track_idx < 0 &&
+                    dragging_track_order_idx < 0 && !dragging_range_left && !dragging_range_right) {
                     SDL_SetCursor(g_cursor_arrow);
+                }
+
+                // Handle dragging the yellow Cycle Range strip edges or body
+                if (dragging_range_left || dragging_range_right || dragging_range_body) {
+                    double cur_mouse_sec = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
+                    if (dragging_range_left) {
+                        SDL_SetCursor(g_cursor_size_we);
+                        double new_s = cur_mouse_sec;
+                        if (new_s > range_orig_end_sec - 0.05) new_s = range_orig_end_sec - 0.05;
+                        if (new_s < 0.0) new_s = 0.0;
+                        set_tab_range(new_s, range_orig_end_sec, true);
+                    } else if (dragging_range_right) {
+                        SDL_SetCursor(g_cursor_size_we);
+                        double new_e = cur_mouse_sec;
+                        if (new_e < range_orig_start_sec + 0.05) new_e = range_orig_start_sec + 0.05;
+                        set_tab_range(range_orig_start_sec, new_e, true);
+                    } else if (dragging_range_body) {
+                        double delta_s = cur_mouse_sec - range_drag_start_mouse_sec;
+                        double span = range_orig_end_sec - range_orig_start_sec;
+                        double new_s = range_orig_start_sec + delta_s;
+                        if (new_s < 0.0) new_s = 0.0;
+                        set_tab_range(new_s, new_s + span, true);
+                    }
                 }
 
                 if (marquee_selecting) {
@@ -1522,14 +2344,12 @@ int main(int argc, char *argv[]) {
 
         SDL_Color c_white = { 224, 224, 224, 255 };
         SDL_Color c_muted = { 130, 130, 130, 255 };
-        SDL_Color c_blue  = { 26, 86, 219, 255 };
-        (void)c_blue;
 
-        // 1. Google Chrome Style Tab Bar (with Purple Borders)
+        // 1. Google Chrome Style Tab Bar (with Brown Borders)
         SDL_Rect tab_bar = { 0, 0, win_w, TABBAR_HEIGHT };
         SDL_SetRenderDrawColor(ren, 18, 18, 18, 255);
         SDL_RenderFillRect(ren, &tab_bar);
-        draw_purple_border_rect(ren, &tab_bar, false, true);
+        draw_brown_border_rect(ren, &tab_bar, false, true);
 
         int max_tab_w = 160;
         int add_btn_w = 34;
@@ -1544,9 +2364,9 @@ int main(int argc, char *argv[]) {
         for (int t = 0; t < g_daw.num_tabs; t++) {
             bool is_active = (t == g_daw.active_tab);
             SDL_Rect tr = { cur_tab_x, 2, cur_tab_w - 2, TABBAR_HEIGHT - 2 };
-            SDL_SetRenderDrawColor(ren, is_active ? 36 : 22, is_active ? 36 : 22, is_active ? 36 : 22, 255);
+            SDL_SetRenderDrawColor(ren, is_active ? 40 : 22, is_active ? 34 : 22, is_active ? 28 : 22, 255);
             SDL_RenderFillRect(ren, &tr);
-            draw_purple_border_rect(ren, &tr, is_active, !is_active);
+            draw_brown_border_rect(ren, &tr, is_active, !is_active);
 
             char label_buf[70];
             if (g_daw.tabs[t].is_dirty) {
@@ -1564,77 +2384,85 @@ int main(int argc, char *argv[]) {
         SDL_Rect btn_add_tab = { cur_tab_x, 2, add_btn_w, TABBAR_HEIGHT - 2 };
         SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
         SDL_RenderFillRect(ren, &btn_add_tab);
-        draw_purple_border_rect(ren, &btn_add_tab, false, false);
+        draw_brown_border_rect(ren, &btn_add_tab, false, false);
         draw_text(ren, "+", cur_tab_x + 12, 9, c_white);
 
-        // 2. Top Bar (All Buttons & Bar Edges in Purple)
+        // 2. Top Bar (All Buttons & Bar Edges in Brown + "Range" Selection Button)
         SDL_Rect topbar = { 0, TABBAR_HEIGHT, win_w, TOPBAR_HEIGHT };
         SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
         SDL_RenderFillRect(ren, &topbar);
-        draw_purple_border_rect(ren, &topbar, false, true);
+        draw_brown_border_rect(ren, &topbar, false, true);
 
         SDL_Rect btn_file = { 8, TABBAR_HEIGHT + 5, 46, 26 };
         SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
         SDL_RenderFillRect(ren, &btn_file);
-        draw_purple_border_rect(ren, &btn_file, g_daw.menu_file_open, false);
+        draw_brown_border_rect(ren, &btn_file, g_daw.menu_file_open, false);
         draw_text(ren, "File", 18, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_act = { 56, TABBAR_HEIGHT + 5, 60, 26 };
         SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
         SDL_RenderFillRect(ren, &btn_act);
-        draw_purple_border_rect(ren, &btn_act, g_daw.menu_action_open, false);
+        draw_brown_border_rect(ren, &btn_act, g_daw.menu_action_open, false);
         draw_text(ren, "Action", 64, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_mk_toggle = { 122, TABBAR_HEIGHT + 5, 66, 26 };
-        SDL_SetRenderDrawColor(ren, p->show_marker_lane ? 55 : 40, p->show_marker_lane ? 48 : 40, p->show_marker_lane ? 68 : 40, 255);
+        SDL_SetRenderDrawColor(ren, p->show_marker_lane ? 62 : 40, p->show_marker_lane ? 46 : 40, p->show_marker_lane ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &btn_mk_toggle);
-        draw_purple_border_rect(ren, &btn_mk_toggle, p->show_marker_lane, false);
+        draw_brown_border_rect(ren, &btn_mk_toggle, p->show_marker_lane, false);
         draw_text(ren, "Marker", 130, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect v_menu = { 194, TABBAR_HEIGHT + 5, 88, 26 };
-        SDL_SetRenderDrawColor(ren, p->video.is_open ? 55 : 40, p->video.is_open ? 48 : 40, p->video.is_open ? 68 : 40, 255);
+        SDL_SetRenderDrawColor(ren, p->video.is_open ? 62 : 40, p->video.is_open ? 46 : 40, p->video.is_open ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &v_menu);
-        draw_purple_border_rect(ren, &v_menu, p->video.is_open, false);
+        draw_brown_border_rect(ren, &v_menu, p->video.is_open, false);
         draw_text(ren, "View:Video", 200, TABBAR_HEIGHT + 13, c_white);
 
         bool xfade_active = is_crossfade_active();
         SDL_Rect xfade_btn = { 288, TABBAR_HEIGHT + 5, 124, 26 };
-        SDL_SetRenderDrawColor(ren, xfade_active ? 52 : 40, xfade_active ? 38 : 40, xfade_active ? 72 : 40, 255);
+        SDL_SetRenderDrawColor(ren, xfade_active ? 62 : 40, xfade_active ? 46 : 40, xfade_active ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &xfade_btn);
-        draw_purple_border_rect(ren, &xfade_btn, xfade_active, false);
+        draw_brown_border_rect(ren, &xfade_btn, xfade_active, false);
         draw_text(ren, xfade_active ? "Crossfade: ON" : "Crossfade: OFF", 294, TABBAR_HEIGHT + 13, c_white);
+
+        bool range_on = is_range_active();
+        SDL_Rect range_btn = { 418, TABBAR_HEIGHT + 5, 68, 26 };
+        SDL_SetRenderDrawColor(ren, range_on ? 95 : 40, range_on ? 78 : 40, range_on ? 22 : 40, 255);
+        SDL_RenderFillRect(ren, &range_btn);
+        draw_brown_border_rect(ren, &range_btn, range_on, false);
+        draw_text(ren, "Range", 432, TABBAR_HEIGHT + 13, c_white);
 
         char clock_buf[32];
         format_timecode(p->playhead_seconds, clock_buf, sizeof(clock_buf));
         int clock_x = (win_w / 2) - 52;
+        if (clock_x < 502) clock_x = 502;
         SDL_Rect clock_bg = { clock_x - 10, TABBAR_HEIGHT + 4, 128, 28 };
         SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
         SDL_RenderFillRect(ren, &clock_bg);
-        draw_purple_border_rect(ren, &clock_bg, false, false);
+        draw_brown_border_rect(ren, &clock_bg, false, false);
         draw_text(ren, clock_buf, clock_x - 4, TABBAR_HEIGHT + 12, c_white);
 
         SDL_Rect btn_undo = { win_w - 228, TABBAR_HEIGHT + 5, 52, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_undo);
-        draw_purple_border_rect(ren, &btn_undo, false, false);
+        draw_brown_border_rect(ren, &btn_undo, false, false);
         draw_text(ren, "Undo", win_w - 218, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_redo = { win_w - 172, TABBAR_HEIGHT + 5, 52, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_redo);
-        draw_purple_border_rect(ren, &btn_redo, false, false);
+        draw_brown_border_rect(ren, &btn_redo, false, false);
         draw_text(ren, "Redo", win_w - 162, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_zm_out = { win_w - 116, TABBAR_HEIGHT + 5, 56, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_zm_out);
-        draw_purple_border_rect(ren, &btn_zm_out, false, false);
+        draw_brown_border_rect(ren, &btn_zm_out, false, false);
         draw_text(ren, "Zoom-", win_w - 110, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_zm_in = { win_w - 56, TABBAR_HEIGHT + 5, 50, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_zm_in);
-        draw_purple_border_rect(ren, &btn_zm_in, false, false);
+        draw_brown_border_rect(ren, &btn_zm_in, false, false);
         draw_text(ren, "Zoom+", win_w - 50, TABBAR_HEIGHT + 13, c_white);
 
         // 3. Corner Header
@@ -1642,25 +2470,25 @@ int main(int argc, char *argv[]) {
         SDL_Rect corner_area = { 0, corner_y, g_daw.tcp_width, RULER_HEIGHT + m_lane_h };
         SDL_SetRenderDrawColor(ren, 32, 32, 32, 255);
         SDL_RenderFillRect(ren, &corner_area);
-        draw_purple_border_rect(ren, &corner_area, false, true);
+        draw_brown_border_rect(ren, &corner_area, false, true);
 
         SDL_Rect btn_corner_add = { 8, corner_y + 10, 72, 26 };
         SDL_SetRenderDrawColor(ren, 48, 48, 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_add);
-        draw_purple_border_rect(ren, &btn_corner_add, false, false);
+        draw_brown_border_rect(ren, &btn_corner_add, false, false);
         draw_text(ren, "+ Track", 16, corner_y + 18, c_white);
 
         SDL_Rect btn_corner_play = { 86, corner_y + 10, 72, 26 };
-        SDL_SetRenderDrawColor(ren, p->is_playing ? 65 : 48, 48, p->is_playing ? 78 : 48, 255);
+        SDL_SetRenderDrawColor(ren, p->is_playing ? 68 : 48, p->is_playing ? 50 : 48, p->is_playing ? 34 : 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_play);
-        draw_purple_border_rect(ren, &btn_corner_play, p->is_playing, false);
+        draw_brown_border_rect(ren, &btn_corner_play, p->is_playing, false);
         draw_text(ren, p->is_playing ? "Pause" : "Play", 102, corner_y + 18, c_white);
 
-        // 4. Time Ruler & Marker Bar
+        // 4. Time Ruler & Logic Pro Yellow Cycle Range Strip
         SDL_Rect ruler = { g_daw.tcp_width, corner_y, view_w, RULER_HEIGHT };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &ruler);
-        draw_purple_border_rect(ren, &ruler, false, true);
+        draw_brown_border_rect(ren, &ruler, false, true);
 
         double min_px_gap = 90.0;
         double sec_per_tick = min_px_gap / p->pixels_per_second;
@@ -1688,9 +2516,30 @@ int main(int argc, char *argv[]) {
                 int h = (int)(t / 3600); int m = (int)((t - h * 3600) / 60);
                 snprintf(t_str, sizeof(t_str), "%02d:%02d:00", h, m);
             }
-            draw_text(ren, t_str, rx + 4, corner_y + 8, c_muted);
-            SDL_SetRenderDrawColor(ren, 108, 66, 156, 255);
-            SDL_RenderDrawLine(ren, rx, corner_y + 16, rx, corner_y + RULER_HEIGHT);
+            draw_text(ren, t_str, rx + 4, corner_y + 4, c_muted);
+            SDL_SetRenderDrawColor(ren, 118, 78, 46, 255);
+            SDL_RenderDrawLine(ren, rx, corner_y + 15, rx, corner_y + RULER_HEIGHT);
+        }
+
+        // Render Logic Pro Yellow Cycle Strip in the Time Ruler when Range is active
+        if (range_on) {
+            SDL_RenderSetClipRect(ren, &ruler);
+            int rx1 = g_daw.tcp_width + (int)((get_range_start() - p->scroll_x_sec) * p->pixels_per_second);
+            int rx2 = g_daw.tcp_width + (int)((get_range_end()   - p->scroll_x_sec) * p->pixels_per_second);
+            int rw = rx2 - rx1;
+            if (rw < 4) rw = 4;
+
+            SDL_Rect cycle_ruler_strip = { rx1, corner_y + RULER_HEIGHT - 9, rw, 8 };
+            SDL_SetRenderDrawColor(ren, 238, 196, 24, 255);
+            SDL_RenderFillRect(ren, &cycle_ruler_strip);
+
+            // Draggable Left & Right Edge Caps on the Yellow Strip
+            SDL_Rect cap_l = { rx1, corner_y + RULER_HEIGHT - 10, 4, 9 };
+            SDL_Rect cap_r = { rx1 + rw - 4, corner_y + RULER_HEIGHT - 10, 4, 9 };
+            SDL_SetRenderDrawColor(ren, 255, 235, 95, 255);
+            SDL_RenderFillRect(ren, &cap_l);
+            SDL_RenderFillRect(ren, &cap_r);
+            SDL_RenderSetClipRect(ren, NULL);
         }
 
         int marker_y = corner_y + RULER_HEIGHT;
@@ -1701,7 +2550,7 @@ int main(int argc, char *argv[]) {
             SDL_Rect marker_bg = { g_daw.tcp_width, marker_y, view_w, MARKER_BAR_HEIGHT };
             SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
             SDL_RenderFillRect(ren, &marker_bg);
-            draw_purple_border_rect(ren, &marker_bg, false, true);
+            draw_brown_border_rect(ren, &marker_bg, false, true);
 
             // Pass 1: Draw all non-editing markers (clamped so they never cross the next marker)
             for (int m = 0; m < p->num_markers; m++) {
@@ -1716,14 +2565,14 @@ int main(int argc, char *argv[]) {
                 if (mk_x + vis_w >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
                     SDL_Rect m_tag = { mk_x, marker_y + 2, vis_w, MARKER_BAR_HEIGHT - 4 };
                     SDL_SetRenderDrawColor(ren,
-                        is_selected_this ? 45 : 34,
-                        is_selected_this ? 38 : 32,
-                        is_selected_this ? 68 : 46,
+                        is_selected_this ? 48 : 36,
+                        is_selected_this ? 36 : 30,
+                        is_selected_this ? 26 : 24,
                         255);
                     SDL_RenderFillRect(ren, &m_tag);
 
-                    // Top/bottom border in purple
-                    draw_purple_border_rect(ren, &m_tag, is_selected_this, false);
+                    // Top/bottom border in brown
+                    draw_brown_border_rect(ren, &m_tag, is_selected_this, false);
 
                     // Left and right edges of marker text box in bright Orange
                     SDL_SetRenderDrawColor(ren, 255, 140, 0, 255);
@@ -1752,11 +2601,11 @@ int main(int argc, char *argv[]) {
 
                 if (mk_x + full_w >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
                     SDL_Rect m_tag = { mk_x, marker_y + 2, full_w, MARKER_BAR_HEIGHT - 4 };
-                    SDL_SetRenderDrawColor(ren, 38, 32, 62, 255);
+                    SDL_SetRenderDrawColor(ren, 56, 40, 26, 255);
                     SDL_RenderFillRect(ren, &m_tag);
 
-                    // Top/bottom border in thick purple
-                    draw_purple_border_rect(ren, &m_tag, true, false);
+                    // Top/bottom border in thick brown
+                    draw_brown_border_rect(ren, &m_tag, true, false);
 
                     // Left and right edges of marker text box in bright Orange
                     SDL_SetRenderDrawColor(ren, 255, 140, 0, 255);
@@ -1789,31 +2638,31 @@ int main(int argc, char *argv[]) {
         SDL_Rect timeline_clip = { g_daw.tcp_width, header_top_y, view_w, view_h };
         SDL_RenderSetClipRect(ren, &timeline_clip);
 
-        // Subtle vertical timeline grid lines in faded purple
+        // Subtle vertical timeline grid lines in faded brown
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
         for (double t = start_tick; t <= end_tick; t += chosen_step) {
             int gx = g_daw.tcp_width + (int)((t - p->scroll_x_sec) * p->pixels_per_second);
             if (gx < g_daw.tcp_width || gx > g_daw.tcp_width + view_w) continue;
-            SDL_SetRenderDrawColor(ren, 92, 58, 132, 65);
+            SDL_SetRenderDrawColor(ren, 118, 78, 46, 65);
             SDL_RenderDrawLine(ren, gx, header_top_y, gx, header_top_y + view_h);
         }
 
-        // Timeline tracks: Each track has an identical simple faded purple edge; selected track edge is slightly thicker
+        // Timeline tracks: Each track has an identical simple faded brown edge; selected track edge is slightly thicker
         int track_cur_y = header_top_y - p->scroll_y_px;
         for (int i = 0; i < p->num_tracks; i++) {
             int th = p->track_heights[i];
             SDL_Rect lane_border = { g_daw.tcp_width, track_cur_y, view_w, th };
             if (p->track_selected[i]) {
-                // Selected track edge: slightly thicker (2px) purple edge
-                SDL_SetRenderDrawColor(ren, 172, 106, 242, 235);
+                // Selected track edge: slightly thicker (2px) brown edge
+                SDL_SetRenderDrawColor(ren, 205, 138, 72, 235);
                 SDL_RenderDrawRect(ren, &lane_border);
                 if (th > 4 && view_w > 4) {
                     SDL_Rect lane_inner = { g_daw.tcp_width + 1, track_cur_y + 1, view_w - 2, th - 2 };
                     SDL_RenderDrawRect(ren, &lane_inner);
                 }
             } else {
-                // Unselected track edge: simple identical faded purple edge (not a deep dark trench)
-                SDL_SetRenderDrawColor(ren, 110, 68, 158, 130);
+                // Unselected track edge: simple identical faded brown edge
+                SDL_SetRenderDrawColor(ren, 118, 78, 46, 135);
                 SDL_RenderDrawRect(ren, &lane_border);
             }
             track_cur_y += th;
@@ -1831,17 +2680,17 @@ int main(int argc, char *argv[]) {
             if (ix + iw < g_daw.tcp_width || ix > g_daw.tcp_width + view_w || iw <= 0) continue;
 
             SDL_Rect clip_r = { ix, iy, iw, ih };
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 46 : 34, it->is_selected ? 44 : 34, it->is_selected ? 60 : 42, 255);
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 48 : 36, it->is_selected ? 38 : 32, it->is_selected ? 30 : 28, 255);
             SDL_RenderFillRect(ren, &clip_r);
 
             // Subtle header strip at the top of each clip
             int hdr_h = (ih > 18) ? 18 : ih;
             SDL_Rect hdr_r = { ix, iy, iw, hdr_h };
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 62 : 44, it->is_selected ? 54 : 40, it->is_selected ? 82 : 56, 255);
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 68 : 48, it->is_selected ? 50 : 38, it->is_selected ? 34 : 30, 255);
             SDL_RenderFillRect(ren, &hdr_r);
         }
 
-        // Pass 1B: Render Waveforms (attenuated by equal-power crossfade envelope inside overlap zones), Purple Borders & Clipped Labels
+        // Pass 1B: Render Waveforms (attenuated by equal-power crossfade envelope inside overlap zones), Brown Borders & Clipped Labels
         for (int i = 0; i < p->num_items; i++) {
             AudioItem *it = &p->items[i];
             int iy = get_track_y_pos(it->track_idx) + 2;
@@ -1854,8 +2703,8 @@ int main(int argc, char *argv[]) {
             float gain_multiplier = db_to_linear(p->track_db[it->track_idx]);
             int mid_y = iy + ih / 2;
 
-            // Zero-line center axis in faded purple
-            SDL_SetRenderDrawColor(ren, 82, 56, 112, 255);
+            // Zero-line center axis in faded brown
+            SDL_SetRenderDrawColor(ren, 96, 66, 42, 255);
             SDL_RenderDrawLine(ren, ix, mid_y, ix + iw, mid_y);
 
             if (it->peaks && it->peak_count > 0) {
@@ -1890,11 +2739,11 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            // Purple clip border (thicker when clip is selected)
+            // Brown clip border (thicker when clip is selected)
             SDL_Rect clip_r = { ix, iy, iw, ih };
-            draw_purple_border_rect(ren, &clip_r, it->is_selected, false);
+            draw_brown_border_rect(ren, &clip_r, it->is_selected, false);
 
-            // Requirement 2: Clip name strictly clipped to clip length (text only shows until clip's right edge)
+            // Clip name strictly clipped to clip length (text only shows until clip's right edge)
             if (iw > 8) {
                 SDL_Rect clip_text_bounds = { ix + 2, iy + 1, iw - 4, ih - 2 };
                 draw_text_clipped(ren, it->label, ix + 6, iy + 4, c_white, &clip_text_bounds, &timeline_clip);
@@ -1935,7 +2784,7 @@ int main(int argc, char *argv[]) {
 
                 // 1. Translucent crossfade zone highlight box
                 SDL_Rect xf_box = { ox, iy, ow, ih };
-                SDL_SetRenderDrawColor(ren, 155, 90, 225, 32);
+                SDL_SetRenderDrawColor(ren, 185, 120, 55, 32);
                 SDL_RenderFillRect(ren, &xf_box);
 
                 int top_pad = iy + 3;
@@ -1983,15 +2832,15 @@ int main(int argc, char *argv[]) {
                     prev_y_in  = y_in;
                 }
 
-                // 3. Crisp Purple Crossfade Boundary Frame & Corner Handles
-                SDL_SetRenderDrawColor(ren, 175, 108, 245, 235);
+                // 3. Crisp Brown Crossfade Boundary Frame & Corner Handles
+                SDL_SetRenderDrawColor(ren, 205, 138, 72, 235);
                 SDL_RenderDrawRect(ren, &xf_box);
 
                 // 4. Center Equal-Power Crossing Handle (-3dB intersection point at u = 0.5)
                 int cross_x = ox + ow / 2;
                 int cross_y = bot_pad - (int)(0.70710678f * curve_h);
                 SDL_Rect cross_handle = { cross_x - 3, cross_y - 3, 6, 6 };
-                SDL_SetRenderDrawColor(ren, 225, 190, 255, 255);
+                SDL_SetRenderDrawColor(ren, 245, 210, 165, 255);
                 SDL_RenderFillRect(ren, &cross_handle);
 
                 // Top/bottom corner fade handles
@@ -1999,12 +2848,41 @@ int main(int argc, char *argv[]) {
                 SDL_Rect h_tr = { ox + ow - 5, iy, 5, 5 };
                 SDL_Rect h_bl = { ox, iy + ih - 5, 5, 5 };
                 SDL_Rect h_br = { ox + ow - 5, iy + ih - 5, 5, 5 };
-                SDL_SetRenderDrawColor(ren, 175, 108, 245, 255);
+                SDL_SetRenderDrawColor(ren, 205, 138, 72, 255);
                 SDL_RenderFillRect(ren, &h_tl);
                 SDL_RenderFillRect(ren, &h_tr);
                 SDL_RenderFillRect(ren, &h_bl);
                 SDL_RenderFillRect(ren, &h_br);
             }
+        }
+
+        // Logic Pro Style Yellow Cycle Range Strip & Range Highlight in Timeline
+        if (range_on) {
+            int rx1 = g_daw.tcp_width + (int)((get_range_start() - p->scroll_x_sec) * p->pixels_per_second);
+            int rx2 = g_daw.tcp_width + (int)((get_range_end()   - p->scroll_x_sec) * p->pixels_per_second);
+            int rw = rx2 - rx1;
+            if (rw < 4) rw = 4;
+
+            // Subtle translucent yellow wash over the cycle range across tracks
+            SDL_Rect range_wash = { rx1, header_top_y, rw, view_h };
+            SDL_SetRenderDrawColor(ren, 240, 200, 30, 20);
+            SDL_RenderFillRect(ren, &range_wash);
+
+            // Solid Logic Pro Yellow Strip along the top of the timeline
+            SDL_Rect yellow_strip = { rx1, header_top_y, rw, 8 };
+            SDL_SetRenderDrawColor(ren, 242, 202, 28, 245);
+            SDL_RenderFillRect(ren, &yellow_strip);
+
+            // Bright draggable left & right edge handles on the yellow strip + vertical locator lines
+            SDL_Rect handle_l = { rx1, header_top_y, 5, 10 };
+            SDL_Rect handle_r = { rx1 + rw - 5, header_top_y, 5, 10 };
+            SDL_SetRenderDrawColor(ren, 255, 235, 95, 255);
+            SDL_RenderFillRect(ren, &handle_l);
+            SDL_RenderFillRect(ren, &handle_r);
+
+            SDL_SetRenderDrawColor(ren, 242, 202, 28, 175);
+            SDL_RenderDrawLine(ren, rx1, header_top_y, rx1, header_top_y + view_h);
+            SDL_RenderDrawLine(ren, rx1 + rw - 1, header_top_y, rx1 + rw - 1, header_top_y + view_h);
         }
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
@@ -2014,7 +2892,7 @@ int main(int argc, char *argv[]) {
             int mw = abs(marquee_cur_x - marquee_start_x);
             int mh = abs(marquee_cur_y - marquee_start_y);
             SDL_Rect mr = { mx1, my1, mw, mh };
-            draw_purple_border_rect(ren, &mr, false, false);
+            draw_brown_border_rect(ren, &mr, false, false);
         }
 
         int cur_px = g_daw.tcp_width + (int)((p->playhead_seconds - p->scroll_x_sec) * p->pixels_per_second);
@@ -2024,7 +2902,7 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 6. Track Header (TCP) with Identical Simple Faded Purple Edge & Thicker Selected Purple Edge
+        // 6. Track Header (TCP) with Identical Simple Faded Brown Edge & Thicker Selected Brown Edge
         SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
         for (int i = 0; i < p->num_tracks; i++) {
@@ -2035,29 +2913,29 @@ int main(int argc, char *argv[]) {
 
             SDL_Rect tp = { 1, ty + 1, g_daw.tcp_width - 2, th - 2 };
             SDL_SetRenderDrawColor(ren,
-                is_dragging_this_trk ? 42 : (is_sel ? 34 : 26),
+                is_dragging_this_trk ? 48 : (is_sel ? 38 : 26),
                 is_dragging_this_trk ? 36 : (is_sel ? 30 : 26),
-                is_dragging_this_trk ? 58 : (is_sel ? 44 : 26),
+                is_dragging_this_trk ? 26 : (is_sel ? 24 : 26),
                 255);
             SDL_RenderFillRect(ren, &tp);
 
-            // Requirement 3 & 4: Every track has a simple identical faded purple edge; selected/dragged track edge is slightly thicker
+            // Every track has a simple identical faded brown edge; selected/dragged track edge is slightly thicker
             if (is_dragging_this_trk || is_sel) {
-                draw_purple_border_rect(ren, &tp, true, false);
+                draw_brown_border_rect(ren, &tp, true, false);
             } else {
                 SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-                SDL_SetRenderDrawColor(ren, 110, 68, 158, 145);
+                SDL_SetRenderDrawColor(ren, 118, 78, 46, 145);
                 SDL_RenderDrawRect(ren, &tp);
                 SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
             }
 
-            // Top Part: Track Name Box with clean purple border
+            // Top Part: Track Name Box with clean brown border
             SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 38, 22 };
             bool is_editing = (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME && g_daw.editing_track_name_idx == i);
 
             SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
             SDL_RenderFillRect(ren, &name_box);
-            draw_purple_border_rect(ren, &name_box, is_editing, false);
+            draw_brown_border_rect(ren, &name_box, is_editing, false);
 
             SDL_Rect name_txt_bounds = { name_box.x + 2, name_box.y + 1, name_box.w - 4, name_box.h - 2 };
             if (is_editing) {
@@ -2074,11 +2952,11 @@ int main(int argc, char *argv[]) {
             // Right-side Up/Down Drag Grip Handle
             int grip_x = g_daw.tcp_width - 24;
             SDL_Rect grip_box = { grip_x, ty + 6, 18, 48 };
-            SDL_SetRenderDrawColor(ren, is_dragging_this_trk ? 52 : 36, is_dragging_this_trk ? 42 : 36, is_dragging_this_trk ? 72 : 36, 255);
+            SDL_SetRenderDrawColor(ren, is_dragging_this_trk ? 56 : 36, is_dragging_this_trk ? 42 : 32, is_dragging_this_trk ? 28 : 28, 255);
             SDL_RenderFillRect(ren, &grip_box);
-            draw_purple_border_rect(ren, &grip_box, is_dragging_this_trk, false);
+            draw_brown_border_rect(ren, &grip_box, is_dragging_this_trk, false);
             // Draw grip bars (=)
-            SDL_SetRenderDrawColor(ren, 175, 130, 225, 255);
+            SDL_SetRenderDrawColor(ren, 195, 140, 88, 255);
             for (int gy = ty + 22; gy <= ty + 36; gy += 4) {
                 SDL_RenderDrawLine(ren, grip_x + 4, gy, grip_x + 13, gy);
             }
@@ -2090,7 +2968,7 @@ int main(int argc, char *argv[]) {
             SDL_Rect btn_minus = { 8, bot_y, 18, 20 };
             SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
             SDL_RenderFillRect(ren, &btn_minus);
-            draw_purple_border_rect(ren, &btn_minus, false, false);
+            draw_brown_border_rect(ren, &btn_minus, false, false);
             draw_text(ren, "-", 14, bot_y + 4, c_white);
 
             char db_txt[16];
@@ -2100,85 +2978,85 @@ int main(int argc, char *argv[]) {
             SDL_Rect btn_plus = { 76, bot_y, 18, 20 };
             SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
             SDL_RenderFillRect(ren, &btn_plus);
-            draw_purple_border_rect(ren, &btn_plus, false, false);
+            draw_brown_border_rect(ren, &btn_plus, false, false);
             draw_text(ren, "+", 81, bot_y + 4, c_white);
 
             // M & S Buttons
             SDL_Rect m_btn = { 110, bot_y, 22, 20 };
             SDL_SetRenderDrawColor(ren, p->tracks[i].mute ? 180 : 40, p->tracks[i].mute ? 40 : 40, 40, 255);
             SDL_RenderFillRect(ren, &m_btn);
-            draw_purple_border_rect(ren, &m_btn, p->tracks[i].mute, false);
+            draw_brown_border_rect(ren, &m_btn, p->tracks[i].mute, false);
             draw_text(ren, "M", 117, bot_y + 4, c_white);
 
             SDL_Rect s_btn = { 138, bot_y, 22, 20 };
             SDL_SetRenderDrawColor(ren, p->tracks[i].solo ? 180 : 40, p->tracks[i].solo ? 140 : 40, 40, 255);
             SDL_RenderFillRect(ren, &s_btn);
-            draw_purple_border_rect(ren, &s_btn, p->tracks[i].solo, false);
+            draw_brown_border_rect(ren, &s_btn, p->tracks[i].solo, false);
             draw_text(ren, "S", 145, bot_y + 4, c_white);
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // Purple vertical border line between TCP and Timeline
-        SDL_SetRenderDrawColor(ren, 140, 84, 208, 255);
+        // Brown vertical border line between TCP and Timeline
+        SDL_SetRenderDrawColor(ren, 152, 98, 54, 255);
         SDL_RenderDrawLine(ren, g_daw.tcp_width - 1, TABBAR_HEIGHT + TOPBAR_HEIGHT, g_daw.tcp_width - 1, win_h);
 
-        // Scrollbars (with Purple Borders)
+        // Scrollbars (with Brown Borders)
         SDL_Rect bar_h = { g_daw.tcp_width, win_h - SCROLLBAR_SIZE, view_w, SCROLLBAR_SIZE };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &bar_h);
-        draw_purple_border_rect(ren, &bar_h, false, true);
+        draw_brown_border_rect(ren, &bar_h, false, true);
 
         float thumb_w_sz = (total_w_timeline > 0) ? fmaxf(30.0f, (float)view_w * ((float)view_w / total_w_timeline)) : view_w;
         double max_scroll_sec = (total_w_timeline > view_w) ? (double)(total_w_timeline - view_w) / p->pixels_per_second : 0.0001;
         float thumb_x = g_daw.tcp_width + (max_scroll_sec > 0 ? (float)(p->scroll_x_sec / max_scroll_sec) * (view_w - thumb_w_sz) : 0);
         SDL_Rect thumb_h = { (int)thumb_x, win_h - SCROLLBAR_SIZE + 2, (int)thumb_w_sz, SCROLLBAR_SIZE - 4 };
-        SDL_SetRenderDrawColor(ren, 55, 50, 68, 255);
+        SDL_SetRenderDrawColor(ren, 62, 48, 36, 255);
         SDL_RenderFillRect(ren, &thumb_h);
-        draw_purple_border_rect(ren, &thumb_h, false, false);
+        draw_brown_border_rect(ren, &thumb_h, false, false);
 
         SDL_Rect bar_v = { win_w - SCROLLBAR_SIZE, header_top_y, SCROLLBAR_SIZE, view_h };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &bar_v);
-        draw_purple_border_rect(ren, &bar_v, false, true);
+        draw_brown_border_rect(ren, &bar_v, false, true);
 
         float thumb_h_sz = (max_h_tracks > 0) ? fmaxf(30.0f, (float)view_h * ((float)view_h / max_h_tracks)) : view_h;
         float thumb_y = header_top_y + (max_h_tracks > view_h ? ((float)p->scroll_y_px / (max_h_tracks - view_h)) * (view_h - thumb_h_sz) : 0);
         SDL_Rect thumb_v = { win_w - SCROLLBAR_SIZE + 2, (int)thumb_y, SCROLLBAR_SIZE - 4, (int)thumb_h_sz };
-        SDL_SetRenderDrawColor(ren, 55, 50, 68, 255);
+        SDL_SetRenderDrawColor(ren, 62, 48, 36, 255);
         SDL_RenderFillRect(ren, &thumb_v);
-        draw_purple_border_rect(ren, &thumb_v, false, false);
+        draw_brown_border_rect(ren, &thumb_v, false, false);
 
-        // Marker Right-Click Context Menu ("Delete Marker") with Purple Border
+        // Marker Right-Click Context Menu ("Delete Marker") with Brown Border
         if (g_marker_context_menu_open && g_marker_context_target_idx >= 0 && g_marker_context_target_idx < p->num_markers) {
             SDL_Rect cm_box = { g_marker_context_x, g_marker_context_y, 128, 28 };
-            SDL_SetRenderDrawColor(ren, 28, 26, 36, 255);
+            SDL_SetRenderDrawColor(ren, 34, 28, 24, 255);
             SDL_RenderFillRect(ren, &cm_box);
-            draw_purple_border_rect(ren, &cm_box, true, false);
+            draw_brown_border_rect(ren, &cm_box, true, false);
             draw_text(ren, "Delete Marker", g_marker_context_x + 12, g_marker_context_y + 8, c_white);
         }
 
-        // 7. Action Menu (with Purple Border)
+        // 7. Action Menu (with Brown Border)
         if (g_daw.menu_action_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
             SDL_Rect a_box = { 56, m_start, 134, 56 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &a_box);
-            draw_purple_border_rect(ren, &a_box, false, false);
+            draw_brown_border_rect(ren, &a_box, false, false);
             draw_text(ren, "Lua Scripts...", 64, m_start + 8, c_white);
             draw_text(ren, "Python Scripts...", 64, m_start + 32, c_white);
         }
 
-        // Script Manager (with Purple Borders)
+        // Script Manager (with Brown Borders)
         if (g_daw.script_manager_open) {
             SDL_Rect *sr = &g_daw.script_win_rect;
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, sr);
-            draw_purple_border_rect(ren, sr, false, false);
+            draw_brown_border_rect(ren, sr, false, false);
 
             SDL_Rect s_hdr = { sr->x, sr->y, sr->w, 26 };
             SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
             SDL_RenderFillRect(ren, &s_hdr);
-            draw_purple_border_rect(ren, &s_hdr, false, false);
+            draw_brown_border_rect(ren, &s_hdr, false, false);
 
             char win_title[64];
             snprintf(win_title, sizeof(win_title), "%s Script Manager", g_daw.script_manager_is_python ? "Python" : "Lua");
@@ -2188,15 +3066,15 @@ int main(int argc, char *argv[]) {
             SDL_Rect list_box = { sr->x + 12, sr->y + 34, sr->w - 24, 180 };
             SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
             SDL_RenderFillRect(ren, &list_box);
-            draw_purple_border_rect(ren, &list_box, false, false);
+            draw_brown_border_rect(ren, &list_box, false, false);
 
             for (int s = 0; s < g_daw.num_scripts; s++) {
                 int sy = sr->y + 38 + (s * 22);
                 if (s == g_daw.script_selected_idx) {
                     SDL_Rect s_row = { sr->x + 14, sy - 2, sr->w - 28, 20 };
-                    SDL_SetRenderDrawColor(ren, 48, 42, 62, 255);
+                    SDL_SetRenderDrawColor(ren, 56, 42, 30, 255);
                     SDL_RenderFillRect(ren, &s_row);
-                    draw_purple_border_rect(ren, &s_row, false, false);
+                    draw_brown_border_rect(ren, &s_row, false, false);
                 }
                 draw_text(ren, g_daw.scripts[s].name, sr->x + 18, sy + 2, c_white);
                 draw_text(ren, g_daw.scripts[s].shortcut, sr->x + sr->w - 70, sy + 2, c_white);
@@ -2206,61 +3084,37 @@ int main(int argc, char *argv[]) {
             SDL_Rect btn_add_sc = { sr->x + 12, by, 92, 28 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &btn_add_sc);
-            draw_purple_border_rect(ren, &btn_add_sc, false, false);
+            draw_brown_border_rect(ren, &btn_add_sc, false, false);
             draw_text(ren, "Add Script", sr->x + 18, by + 8, c_white);
 
             SDL_Rect btn_run_sc = { sr->x + 114, by, 92, 28 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &btn_run_sc);
-            draw_purple_border_rect(ren, &btn_run_sc, false, false);
+            draw_brown_border_rect(ren, &btn_run_sc, false, false);
             draw_text(ren, "Run Script", sr->x + 120, by + 8, c_white);
 
             SDL_Rect btn_del_sc = { sr->x + 216, by, 92, 28 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &btn_del_sc);
-            draw_purple_border_rect(ren, &btn_del_sc, false, false);
+            draw_brown_border_rect(ren, &btn_del_sc, false, false);
             draw_text(ren, "Delete", sr->x + 236, by + 8, c_white);
         }
 
-        // File Menu (with Purple Borders)
+        // File Menu (Unified single "Export Media..." option)
         if (g_daw.menu_file_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect m_box = { 8, m_start, 192, 146 };
+            SDL_Rect m_box = { 8, m_start, 192, 102 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &m_box);
-            draw_purple_border_rect(ren, &m_box, false, false);
+            draw_brown_border_rect(ren, &m_box, false, false);
 
             draw_text(ren, "Import Project (.ehs)", 16, m_start + 6, c_white);
             draw_text(ren, "Export Project (.ehs)", 16, m_start + 30, c_white);
             draw_text(ren, "Import Media", 16, m_start + 54, c_white);
-            draw_text(ren, "Export Media -> Audio >", 16, m_start + 78, c_white);
-            draw_text(ren, "Export Media -> Video >", 16, m_start + 102, c_white);
-            draw_text(ren, "Batch Export (Stems)", 16, m_start + 126, c_white);
-
-            if (g_daw.submenu_export_audio_open) {
-                SDL_Rect sub_a = { 200, m_start + 76, 110, 94 };
-                SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
-                SDL_RenderFillRect(ren, &sub_a);
-                draw_purple_border_rect(ren, &sub_a, false, false);
-                draw_text(ren, ".WAV Audio", 208, m_start + 82, c_white);
-                draw_text(ren, ".MP3 Audio", 208, m_start + 104, c_white);
-                draw_text(ren, ".FLAC Audio", 208, m_start + 126, c_white);
-                draw_text(ren, ".OGG Audio", 208, m_start + 148, c_white);
-            }
-
-            if (g_daw.submenu_export_video_open) {
-                SDL_Rect sub_v = { 200, m_start + 100, 110, 94 };
-                SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
-                SDL_RenderFillRect(ren, &sub_v);
-                draw_purple_border_rect(ren, &sub_v, false, false);
-                draw_text(ren, ".MP4 Video", 208, m_start + 106, c_white);
-                draw_text(ren, ".MKV Video", 208, m_start + 128, c_white);
-                draw_text(ren, ".MOV Video", 208, m_start + 150, c_white);
-                draw_text(ren, ".AVI Video", 208, m_start + 172, c_white);
-            }
+            draw_text(ren, "Export Media...", 16, m_start + 78, c_white);
         }
 
-        // Floating Video Monitor (With Black Gap Handling & Purple Borders)
+        // Floating Video Monitor (With Black Gap Handling & Brown Borders)
         if (p->video.is_open) {
             SDL_Rect s_rect = { p->video.rect.x + 4, p->video.rect.y + 4, p->video.rect.w, p->video.rect.h };
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
@@ -2269,7 +3123,7 @@ int main(int argc, char *argv[]) {
             SDL_Rect v_bar = { p->video.rect.x, p->video.rect.y, p->video.rect.w, 24 };
             SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
             SDL_RenderFillRect(ren, &v_bar);
-            draw_purple_border_rect(ren, &v_bar, false, false);
+            draw_brown_border_rect(ren, &v_bar, false, false);
 
             draw_text(ren, "Video Monitor", p->video.rect.x + 8, p->video.rect.y + 7, c_white);
             draw_text(ren, "X", p->video.rect.x + p->video.rect.w - 18, p->video.rect.y + 7, c_white);
@@ -2285,14 +3139,404 @@ int main(int argc, char *argv[]) {
             } else if (!p->video.texture) {
                 draw_text(ren, "No Video Stream Loaded", p->video.rect.x + 120, p->video.rect.y + 140, c_muted);
             }
-            draw_purple_border_rect(ren, &v_canvas, false, false);
+            draw_brown_border_rect(ren, &v_canvas, false, false);
 
             SDL_Rect resize_handle = { p->video.rect.x + p->video.rect.w - 12, p->video.rect.y + p->video.rect.h - 12, 10, 10 };
-            SDL_SetRenderDrawColor(ren, 140, 84, 208, 255);
+            SDL_SetRenderDrawColor(ren, 152, 98, 54, 255);
             SDL_RenderFillRect(ren, &resize_handle);
         }
 
-        // 8. Save Confirmation Dialog Modal (with Purple Borders)
+        // ================= UNIFIED EXPORT MEDIA POPUP WINDOW =================
+        if (g_export.is_open) {
+            SDL_Rect *er = &g_export.win_rect;
+            int ex = er->x, ey = er->y, ew = er->w, eh = er->h;
+
+            // Subtle drop shadow
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+            SDL_Rect shadow = { ex + 6, ey + 6, ew, eh };
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
+            SDL_RenderFillRect(ren, &shadow);
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+            // Window Body
+            SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+            SDL_RenderFillRect(ren, er);
+            draw_brown_border_rect(ren, er, true, false);
+
+            // Title Bar
+            SDL_Rect hdr = { ex, ey, ew, 30 };
+            SDL_SetRenderDrawColor(ren, 42, 34, 28, 255);
+            SDL_RenderFillRect(ren, &hdr);
+            draw_brown_border_rect(ren, &hdr, false, false);
+            draw_text(ren, "Export Media", ex + 14, ey + 9, c_white);
+            draw_text(ren, "X", ex + ew - 20, ey + 9, c_white);
+
+            // Time Bounds Indicator in Header
+            char bounds_txt[96];
+            if (is_range_active()) {
+                snprintf(bounds_txt, sizeof(bounds_txt), "Bounds: Cycle Range (%.2fs - %.2fs)",
+                         get_range_start(), get_range_end());
+            } else {
+                snprintf(bounds_txt, sizeof(bounds_txt), "Bounds: Entire Project");
+            }
+            draw_text(ren, bounds_txt, ex + 180, ey + 9, c_muted);
+
+            // ---- 1. SOURCE SECTION ----
+            int sy_src = ey + 48;
+            draw_text(ren, "Source:", ex + 18, sy_src + 7, c_white);
+
+            SDL_Rect b_src_master = { ex + 110, sy_src, 135, 26 };
+            SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_MASTER ? 68 : 38,
+                                        g_export.source == EXPORT_SRC_MASTER ? 48 : 36,
+                                        g_export.source == EXPORT_SRC_MASTER ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_src_master);
+            draw_brown_border_rect(ren, &b_src_master, g_export.source == EXPORT_SRC_MASTER, false);
+            draw_text(ren, "Master mix", ex + 132, sy_src + 7, c_white);
+
+            SDL_Rect b_src_stems = { ex + 255, sy_src, 210, 26 };
+            SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_STEMS ? 68 : 38,
+                                        g_export.source == EXPORT_SRC_STEMS ? 48 : 36,
+                                        g_export.source == EXPORT_SRC_STEMS ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_src_stems);
+            draw_brown_border_rect(ren, &b_src_stems, g_export.source == EXPORT_SRC_STEMS, false);
+            draw_text(ren, "Selected tracks (stems)", ex + 266, sy_src + 7, c_white);
+
+            SDL_Rect b_src_items = { ex + 475, sy_src, 187, 26 };
+            SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_ITEMS ? 68 : 38,
+                                        g_export.source == EXPORT_SRC_ITEMS ? 48 : 36,
+                                        g_export.source == EXPORT_SRC_ITEMS ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_src_items);
+            draw_brown_border_rect(ren, &b_src_items, g_export.source == EXPORT_SRC_ITEMS, false);
+            draw_text(ren, "Selected media items", ex + 486, sy_src + 7, c_white);
+
+            // ---- 2. OUTPUT SECTION (Directory + Browse, File Name) ----
+            int sy_dir = ey + 98;
+            draw_text(ren, "Directory:", ex + 18, sy_dir + 7, c_white);
+
+            SDL_Rect box_dir = { ex + 130, sy_dir, 415, 26 };
+            bool ed_dir = (g_export.active_field == EXP_FIELD_DIR);
+            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+            SDL_RenderFillRect(ren, &box_dir);
+            draw_brown_border_rect(ren, &box_dir, ed_dir, false);
+            SDL_Rect box_dir_clip = { box_dir.x + 4, box_dir.y + 2, box_dir.w - 8, box_dir.h - 4 };
+            draw_text_clipped(ren, g_export.directory, box_dir.x + 6, sy_dir + 7, c_white, &box_dir_clip, NULL);
+            if (ed_dir && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                int cx = box_dir.x + 6 + (int)strlen(g_export.directory) * 8;
+                if (cx < box_dir.x + box_dir.w - 4) {
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, sy_dir + 5, cx, sy_dir + 21);
+                }
+            }
+
+            SDL_Rect btn_browse = { ex + 555, sy_dir, 107, 26 };
+            SDL_SetRenderDrawColor(ren, 52, 40, 30, 255);
+            SDL_RenderFillRect(ren, &btn_browse);
+            draw_brown_border_rect(ren, &btn_browse, false, false);
+            draw_text(ren, "Browse...", ex + 572, sy_dir + 7, c_white);
+
+            int sy_fn = ey + 132;
+            draw_text(ren, "File Name:", ex + 18, sy_fn + 7, c_white);
+
+            SDL_Rect box_fn = { ex + 130, sy_fn, 415, 26 };
+            bool ed_fn = (g_export.active_field == EXP_FIELD_FILENAME);
+            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+            SDL_RenderFillRect(ren, &box_fn);
+            draw_brown_border_rect(ren, &box_fn, ed_fn, false);
+            SDL_Rect box_fn_clip = { box_fn.x + 4, box_fn.y + 2, box_fn.w - 8, box_fn.h - 4 };
+            draw_text_clipped(ren, g_export.filename, box_fn.x + 6, sy_fn + 7, c_white, &box_fn_clip, NULL);
+            if (ed_fn && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                int cx = box_fn.x + 6 + (int)strlen(g_export.filename) * 8;
+                if (cx < box_fn.x + box_fn.w - 4) {
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, sy_fn + 5, cx, sy_fn + 21);
+                }
+            }
+            char ext_preview[16];
+            snprintf(ext_preview, sizeof(ext_preview), ".%s", get_export_ext());
+            draw_text(ren, ext_preview, ex + 555, sy_fn + 7, c_muted);
+
+            // ---- 3. SAMPLE RATE & CHANNELS SECTION ----
+            int sy_sr = ey + 182;
+            draw_text(ren, "Sample Rate:", ex + 18, sy_sr + 7, c_white);
+
+            SDL_Rect b_sr_48 = { ex + 130, sy_sr, 105, 26 };
+            SDL_SetRenderDrawColor(ren, g_export.sample_rate == 48000 ? 68 : 38,
+                                        g_export.sample_rate == 48000 ? 48 : 36,
+                                        g_export.sample_rate == 48000 ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_sr_48);
+            draw_brown_border_rect(ren, &b_sr_48, g_export.sample_rate == 48000, false);
+            draw_text(ren, "48,000 Hz", ex + 146, sy_sr + 7, c_white);
+
+            SDL_Rect b_sr_44 = { ex + 243, sy_sr, 105, 26 };
+            SDL_SetRenderDrawColor(ren, g_export.sample_rate == 44100 ? 68 : 38,
+                                        g_export.sample_rate == 44100 ? 48 : 36,
+                                        g_export.sample_rate == 44100 ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_sr_44);
+            draw_brown_border_rect(ren, &b_sr_44, g_export.sample_rate == 44100, false);
+            draw_text(ren, "44,100 Hz", ex + 259, sy_sr + 7, c_white);
+
+            draw_text(ren, "Channels:", ex + 372, sy_sr + 7, c_white);
+
+            SDL_Rect b_ch_mono = { ex + 455, sy_sr, 90, 26 };
+            SDL_SetRenderDrawColor(ren, g_export.channels == 1 ? 68 : 38,
+                                        g_export.channels == 1 ? 48 : 36,
+                                        g_export.channels == 1 ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_ch_mono);
+            draw_brown_border_rect(ren, &b_ch_mono, g_export.channels == 1, false);
+            draw_text(ren, "Mono", ex + 482, sy_sr + 7, c_white);
+
+            SDL_Rect b_ch_stereo = { ex + 553, sy_sr, 102, 26 };
+            SDL_SetRenderDrawColor(ren, g_export.channels == 2 ? 68 : 38,
+                                        g_export.channels == 2 ? 48 : 36,
+                                        g_export.channels == 2 ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_ch_stereo);
+            draw_brown_border_rect(ren, &b_ch_stereo, g_export.channels == 2, false);
+            draw_text(ren, "Stereo", ex + 578, sy_sr + 7, c_white);
+
+            // ---- 4. FORMAT SECTION ----
+            int sy_fmt = ey + 232;
+            draw_text(ren, "Format:", ex + 18, sy_fmt + 7, c_white);
+
+            SDL_Rect b_fmt_wav = { ex + 130, sy_fmt, 130, 28 };
+            SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_WAV ? 68 : 38,
+                                        g_export.format == EXPORT_FMT_WAV ? 48 : 36,
+                                        g_export.format == EXPORT_FMT_WAV ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_fmt_wav);
+            draw_brown_border_rect(ren, &b_fmt_wav, g_export.format == EXPORT_FMT_WAV, false);
+            draw_text(ren, "WAV (PCM)", ex + 158, sy_fmt + 8, c_white);
+
+            SDL_Rect b_fmt_mp3 = { ex + 270, sy_fmt, 130, 28 };
+            SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_MP3 ? 68 : 38,
+                                        g_export.format == EXPORT_FMT_MP3 ? 48 : 36,
+                                        g_export.format == EXPORT_FMT_MP3 ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_fmt_mp3);
+            draw_brown_border_rect(ren, &b_fmt_mp3, g_export.format == EXPORT_FMT_MP3, false);
+            draw_text(ren, "MP3 Audio", ex + 298, sy_fmt + 8, c_white);
+
+            SDL_Rect b_fmt_mp4 = { ex + 410, sy_fmt, 245, 28 };
+            SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_MP4 ? 68 : 38,
+                                        g_export.format == EXPORT_FMT_MP4 ? 48 : 36,
+                                        g_export.format == EXPORT_FMT_MP4 ? 32 : 34, 255);
+            SDL_RenderFillRect(ren, &b_fmt_mp4);
+            draw_brown_border_rect(ren, &b_fmt_mp4, g_export.format == EXPORT_FMT_MP4, false);
+            draw_text(ren, "MP4 (MPEG-4 Video)", ex + 455, sy_fmt + 8, c_white);
+
+            // Format Details Sub-Panel (ey + 272 .. ey + 422)
+            SDL_Rect sub_panel = { ex + 18, ey + 272, ew - 36, 152 };
+            SDL_SetRenderDrawColor(ren, 20, 19, 18, 255);
+            SDL_RenderFillRect(ren, &sub_panel);
+            draw_brown_border_rect(ren, &sub_panel, false, true);
+
+            int sy_sub = ey + 278;
+            if (g_export.format == EXPORT_FMT_WAV) {
+                draw_text(ren, "WAV Bit Depth:", ex + 34, sy_sub + 19, c_white);
+
+                SDL_Rect b_w16 = { ex + 150, sy_sub + 12, 130, 28 };
+                SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 16 ? 68 : 38,
+                                            g_export.wav_bit_depth == 16 ? 48 : 36,
+                                            g_export.wav_bit_depth == 16 ? 32 : 34, 255);
+                SDL_RenderFillRect(ren, &b_w16);
+                draw_brown_border_rect(ren, &b_w16, g_export.wav_bit_depth == 16, false);
+                draw_text(ren, "16 bit PCM", ex + 174, sy_sub + 20, c_white);
+
+                SDL_Rect b_w24 = { ex + 292, sy_sub + 12, 130, 28 };
+                SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 24 ? 68 : 38,
+                                            g_export.wav_bit_depth == 24 ? 48 : 36,
+                                            g_export.wav_bit_depth == 24 ? 32 : 34, 255);
+                SDL_RenderFillRect(ren, &b_w24);
+                draw_brown_border_rect(ren, &b_w24, g_export.wav_bit_depth == 24, false);
+                draw_text(ren, "24 bit PCM", ex + 316, sy_sub + 20, c_white);
+
+                SDL_Rect b_w32 = { ex + 434, sy_sub + 12, 130, 28 };
+                SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 32 ? 68 : 38,
+                                            g_export.wav_bit_depth == 32 ? 48 : 36,
+                                            g_export.wav_bit_depth == 32 ? 32 : 34, 255);
+                SDL_RenderFillRect(ren, &b_w32);
+                draw_brown_border_rect(ren, &b_w32, g_export.wav_bit_depth == 32, false);
+                draw_text(ren, "32 bit PCM", ex + 458, sy_sub + 20, c_white);
+
+                draw_text(ren, "Uncompressed studio-quality linear PCM WAVE format.", ex + 34, sy_sub + 62, c_muted);
+            } else if (g_export.format == EXPORT_FMT_MP3) {
+                draw_text(ren, "MP3 Bitrate:", ex + 34, sy_sub + 19, c_white);
+
+                SDL_Rect b_m128 = { ex + 150, sy_sub + 12, 130, 28 };
+                SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 128 ? 68 : 38,
+                                            g_export.mp3_bitrate == 128 ? 48 : 36,
+                                            g_export.mp3_bitrate == 128 ? 32 : 34, 255);
+                SDL_RenderFillRect(ren, &b_m128);
+                draw_brown_border_rect(ren, &b_m128, g_export.mp3_bitrate == 128, false);
+                draw_text(ren, "128 kbps", ex + 182, sy_sub + 20, c_white);
+
+                SDL_Rect b_m192 = { ex + 292, sy_sub + 12, 130, 28 };
+                SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 192 ? 68 : 38,
+                                            g_export.mp3_bitrate == 192 ? 48 : 36,
+                                            g_export.mp3_bitrate == 192 ? 32 : 34, 255);
+                SDL_RenderFillRect(ren, &b_m192);
+                draw_brown_border_rect(ren, &b_m192, g_export.mp3_bitrate == 192, false);
+                draw_text(ren, "192 kbps", ex + 324, sy_sub + 20, c_white);
+
+                SDL_Rect b_m320 = { ex + 434, sy_sub + 12, 130, 28 };
+                SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 320 ? 68 : 38,
+                                            g_export.mp3_bitrate == 320 ? 48 : 36,
+                                            g_export.mp3_bitrate == 320 ? 32 : 34, 255);
+                SDL_RenderFillRect(ren, &b_m320);
+                draw_brown_border_rect(ren, &b_m320, g_export.mp3_bitrate == 320, false);
+                draw_text(ren, "320 kbps", ex + 466, sy_sub + 20, c_white);
+
+                draw_text(ren, "MPEG-1/2 Audio Layer III constant bitrate encoding.", ex + 34, sy_sub + 62, c_muted);
+            } else if (g_export.format == EXPORT_FMT_MP4) {
+                // Row 1 (matching image_736e17.png):
+                // File: [ MPEG-4 ]   Size: [ 1920 ] x [ 1080 ]   Framerate: [ 25.00 ]
+                int r1_y = sy_sub + 8;
+                draw_text(ren, "File:", ex + 34, r1_y + 7, c_white);
+                SDL_Rect box_mpeg4 = { ex + 92, r1_y, 136, 26 };
+                SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+                SDL_RenderFillRect(ren, &box_mpeg4);
+                draw_brown_border_rect(ren, &box_mpeg4, false, false);
+                draw_text(ren, "MPEG-4", ex + 104, r1_y + 7, c_white);
+                draw_text(ren, "v", ex + 210, r1_y + 7, c_muted);
+
+                draw_text(ren, "Size:", ex + 244, r1_y + 7, c_white);
+                SDL_Rect box_w = { ex + 295, r1_y, 70, 26 };
+                bool ed_w = (g_export.active_field == EXP_FIELD_MP4_WIDTH);
+                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+                SDL_RenderFillRect(ren, &box_w);
+                draw_brown_border_rect(ren, &box_w, ed_w, false);
+                draw_text(ren, g_export.mp4_width_str, box_w.x + 8, r1_y + 7, c_white);
+                if (ed_w && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                    int cx = box_w.x + 8 + (int)strlen(g_export.mp4_width_str) * 8;
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, r1_y + 5, cx, r1_y + 21);
+                }
+
+                draw_text(ren, "x", ex + 373, r1_y + 7, c_white);
+
+                SDL_Rect box_h = { ex + 390, r1_y, 70, 26 };
+                bool ed_h = (g_export.active_field == EXP_FIELD_MP4_HEIGHT);
+                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+                SDL_RenderFillRect(ren, &box_h);
+                draw_brown_border_rect(ren, &box_h, ed_h, false);
+                draw_text(ren, g_export.mp4_height_str, box_h.x + 8, r1_y + 7, c_white);
+                if (ed_h && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                    int cx = box_h.x + 8 + (int)strlen(g_export.mp4_height_str) * 8;
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, r1_y + 5, cx, r1_y + 21);
+                }
+
+                draw_text(ren, "Framerate:", ex + 476, r1_y + 7, c_white);
+                SDL_Rect box_fps = { ex + 568, r1_y, 80, 26 };
+                bool ed_fps = (g_export.active_field == EXP_FIELD_MP4_FPS);
+                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+                SDL_RenderFillRect(ren, &box_fps);
+                draw_brown_border_rect(ren, &box_fps, ed_fps, false);
+                draw_text(ren, g_export.mp4_fps_str, box_fps.x + 8, r1_y + 7, c_white);
+                if (ed_fps && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                    int cx = box_fps.x + 8 + (int)strlen(g_export.mp4_fps_str) * 8;
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, r1_y + 5, cx, r1_y + 21);
+                }
+
+                // Row 2 (matching image_736e58.png):
+                // Video: [ H.264 ]   [ 2048 ] kbps
+                int r2_y = sy_sub + 46;
+                draw_text(ren, "Video:", ex + 34, r2_y + 7, c_white);
+                SDL_Rect box_vcodec = { ex + 92, r2_y, 176, 26 };
+                SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+                SDL_RenderFillRect(ren, &box_vcodec);
+                draw_brown_border_rect(ren, &box_vcodec, false, false);
+                draw_text(ren, "H.264", ex + 104, r2_y + 7, c_white);
+                draw_text(ren, "v", ex + 250, r2_y + 7, c_muted);
+
+                SDL_Rect box_vkbps = { ex + 295, r2_y, 100, 26 };
+                bool ed_vk = (g_export.active_field == EXP_FIELD_MP4_V_KBPS);
+                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+                SDL_RenderFillRect(ren, &box_vkbps);
+                draw_brown_border_rect(ren, &box_vkbps, ed_vk, false);
+                draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r2_y + 7, c_white);
+                if (ed_vk && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                    int cx = box_vkbps.x + 8 + (int)strlen(g_export.mp4_video_kbps_str) * 8;
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, r2_y + 5, cx, r2_y + 21);
+                }
+                draw_text(ren, "kbps", ex + 405, r2_y + 7, c_white);
+
+                // Row 3 (matching image_736e58.png + AAC, WAV, MP3 selector):
+                // Audio: [ AAC | WAV | MP3 ]   [ 128 ] kbps
+                int r3_y = sy_sub + 84;
+                draw_text(ren, "Audio:", ex + 34, r3_y + 7, c_white);
+
+                SDL_Rect b_ac_aac = { ex + 92, r3_y, 56, 26 };
+                SDL_SetRenderDrawColor(ren, g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_AAC ? 68 : 34,
+                                            g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_AAC ? 48 : 30,
+                                            g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_AAC ? 32 : 26, 255);
+                SDL_RenderFillRect(ren, &b_ac_aac);
+                draw_brown_border_rect(ren, &b_ac_aac, g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_AAC, false);
+                draw_text(ren, "AAC", ex + 108, r3_y + 7, c_white);
+
+                SDL_Rect b_ac_wav = { ex + 152, r3_y, 56, 26 };
+                SDL_SetRenderDrawColor(ren, g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_WAV ? 68 : 34,
+                                            g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_WAV ? 48 : 30,
+                                            g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_WAV ? 32 : 26, 255);
+                SDL_RenderFillRect(ren, &b_ac_wav);
+                draw_brown_border_rect(ren, &b_ac_wav, g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_WAV, false);
+                draw_text(ren, "WAV", ex + 168, r3_y + 7, c_white);
+
+                SDL_Rect b_ac_mp3 = { ex + 212, r3_y, 56, 26 };
+                SDL_SetRenderDrawColor(ren, g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_MP3 ? 68 : 34,
+                                            g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_MP3 ? 48 : 30,
+                                            g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_MP3 ? 32 : 26, 255);
+                SDL_RenderFillRect(ren, &b_ac_mp3);
+                draw_brown_border_rect(ren, &b_ac_mp3, g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_MP3, false);
+                draw_text(ren, "MP3", ex + 228, r3_y + 7, c_white);
+
+                SDL_Rect box_akbps = { ex + 295, r3_y, 100, 26 };
+                bool ed_ak = (g_export.active_field == EXP_FIELD_MP4_A_KBPS);
+                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+                SDL_RenderFillRect(ren, &box_akbps);
+                draw_brown_border_rect(ren, &box_akbps, ed_ak, false);
+                draw_text(ren, g_export.mp4_audio_kbps_str, box_akbps.x + 8, r3_y + 7, c_white);
+                if (ed_ak && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                    int cx = box_akbps.x + 8 + (int)strlen(g_export.mp4_audio_kbps_str) * 8;
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, r3_y + 5, cx, r3_y + 21);
+                }
+                draw_text(ren, "kbps", ex + 405, r3_y + 7, c_white);
+            }
+
+            // ---- 5. OPTION: TWO-PASS RENDER CHECKBOX ----
+            int sy_opt = ey + 440;
+            SDL_Rect chk_box = { ex + 22, sy_opt + 2, 20, 20 };
+            SDL_SetRenderDrawColor(ren, g_export.two_pass_render ? 72 : 20,
+                                        g_export.two_pass_render ? 50 : 20,
+                                        g_export.two_pass_render ? 30 : 20, 255);
+            SDL_RenderFillRect(ren, &chk_box);
+            draw_brown_border_rect(ren, &chk_box, g_export.two_pass_render, false);
+            if (g_export.two_pass_render) {
+                draw_text(ren, "x", ex + 28, sy_opt + 5, c_white);
+            }
+            draw_text(ren, "Option: Two-pass render", ex + 50, sy_opt + 6, c_white);
+
+            // Status message
+            if (g_export.status_msg[0] != '\0') {
+                draw_text(ren, g_export.status_msg, ex + 22, ey + 474, c_muted);
+            }
+
+            // ---- 6. BOTTOM ACTION BUTTONS ----
+            int btn_y = ey + eh - 44;
+            SDL_Rect btn_render = { ex + ew - 270, btn_y, 145, 32 };
+            SDL_SetRenderDrawColor(ren, 78, 52, 32, 255);
+            SDL_RenderFillRect(ren, &btn_render);
+            draw_brown_border_rect(ren, &btn_render, true, false);
+            draw_text(ren, "Render / Export", ex + ew - 258, btn_y + 10, c_white);
+
+            SDL_Rect btn_close = { ex + ew - 115, btn_y, 95, 32 };
+            SDL_SetRenderDrawColor(ren, 44, 40, 38, 255);
+            SDL_RenderFillRect(ren, &btn_close);
+            draw_brown_border_rect(ren, &btn_close, false, false);
+            draw_text(ren, "Cancel", ex + ew - 92, btn_y + 10, c_white);
+        }
+
+        // 8. Save Confirmation Dialog Modal (with Brown Borders)
         if (g_daw.save_prompt_open) {
             SDL_Rect dim_overlay = { 0, 0, win_w, win_h };
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -2307,7 +3551,7 @@ int main(int argc, char *argv[]) {
             SDL_Rect dia_rect = { dia_x, dia_y, dia_w, dia_h };
             SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
             SDL_RenderFillRect(ren, &dia_rect);
-            draw_purple_border_rect(ren, &dia_rect, true, false);
+            draw_brown_border_rect(ren, &dia_rect, true, false);
 
             draw_text(ren, "Save changes before closing?", dia_x + 18, dia_y + 18, c_white);
 
@@ -2321,23 +3565,23 @@ int main(int argc, char *argv[]) {
 
             // [ Save ]
             SDL_Rect b_save = { dia_x + 18, btn_y, 100, 30 };
-            SDL_SetRenderDrawColor(ren, 62, 42, 96, 255);
+            SDL_SetRenderDrawColor(ren, 72, 48, 30, 255);
             SDL_RenderFillRect(ren, &b_save);
-            draw_purple_border_rect(ren, &b_save, true, false);
+            draw_brown_border_rect(ren, &b_save, true, false);
             draw_text(ren, "Save", dia_x + 52, btn_y + 8, c_white);
 
             // [ Don't Save ]
             SDL_Rect b_discard = { dia_x + 130, btn_y, 120, 30 };
             SDL_SetRenderDrawColor(ren, 55, 55, 55, 255);
             SDL_RenderFillRect(ren, &b_discard);
-            draw_purple_border_rect(ren, &b_discard, false, false);
+            draw_brown_border_rect(ren, &b_discard, false, false);
             draw_text(ren, "Don't Save", dia_x + 148, btn_y + 8, c_white);
 
             // [ Cancel ]
             SDL_Rect b_cancel = { dia_x + 262, btn_y, 100, 30 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &b_cancel);
-            draw_purple_border_rect(ren, &b_cancel, false, false);
+            draw_brown_border_rect(ren, &b_cancel, false, false);
             draw_text(ren, "Cancel", dia_x + 292, btn_y + 8, c_white);
         }
 
