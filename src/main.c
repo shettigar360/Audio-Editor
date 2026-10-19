@@ -28,6 +28,11 @@ static SDL_Cursor *g_cursor_ibeam = NULL;
 // false = Crossfade OFF (existing overlapped clips stay as-is; newly moved/trimmed clips stop edge-to-edge)
 static bool g_tab_crossfade[MAX_TABS] = { true, true, true, true, true, true, true, true };
 
+// Extended marker text storage (allows typing long marker text beyond 63 chars)
+#define MARKER_TEXT_MAX 256
+static char g_marker_full_text[MAX_TABS][MAX_MARKERS][MARKER_TEXT_MAX];
+static char g_editing_marker_full_buf[MARKER_TEXT_MAX];
+
 // Marker selection, typing cursor, & right-click context menu state
 static int g_selected_marker_idx = -1;
 static int g_marker_cursor_pos = 0;
@@ -48,20 +53,75 @@ static inline void set_crossfade_active(bool active) {
     g_tab_crossfade[idx] = active;
 }
 
+static const char* get_marker_full_str(ProjectTab *p, int m_idx) {
+    int tab_idx = g_daw.active_tab;
+    if (tab_idx < 0 || tab_idx >= MAX_TABS) tab_idx = 0;
+    if (!p || m_idx < 0 || m_idx >= p->num_markers) return "";
+    if (strncmp(g_marker_full_text[tab_idx][m_idx], p->markers[m_idx].text, 63) != 0) {
+        strncpy(g_marker_full_text[tab_idx][m_idx], p->markers[m_idx].text, 63);
+        g_marker_full_text[tab_idx][m_idx][63] = '\0';
+    }
+    return g_marker_full_text[tab_idx][m_idx];
+}
+
+static void set_marker_full_str(ProjectTab *p, int m_idx, const char *str) {
+    int tab_idx = g_daw.active_tab;
+    if (tab_idx < 0 || tab_idx >= MAX_TABS) tab_idx = 0;
+    if (!p || m_idx < 0 || m_idx >= MAX_MARKERS || !str) return;
+    strncpy(g_marker_full_text[tab_idx][m_idx], str, MARKER_TEXT_MAX - 1);
+    g_marker_full_text[tab_idx][m_idx][MARKER_TEXT_MAX - 1] = '\0';
+    strncpy(p->markers[m_idx].text, str, 63);
+    p->markers[m_idx].text[63] = '\0';
+}
+
+// Marker tag width expands strictly according to text length
 static inline int get_marker_tag_width(const char *text) {
     int len = text ? (int)strlen(text) : 0;
-    int w = len * 8 + 28;
-    if (w < 84) w = 84;
-    if (w > 540) w = 540;
+    int w = len * 8 + 14;
+    if (w < 24) w = 24;
     return w;
+}
+
+// Finds the screen X of the next marker on the timeline after m_idx (so marker m_idx never crosses it)
+static int get_next_marker_screen_x(ProjectTab *p, int m_idx) {
+    if (!p || m_idx < 0 || m_idx >= p->num_markers) return 999999;
+    double my_t = p->markers[m_idx].time_sec;
+    double best_next_t = 1e18;
+    bool found = false;
+    for (int k = 0; k < p->num_markers; k++) {
+        if (k == m_idx) continue;
+        double kt = p->markers[k].time_sec;
+        if (kt > my_t + 1e-6 || (fabs(kt - my_t) <= 1e-6 && k > m_idx)) {
+            if (kt < best_next_t) {
+                best_next_t = kt;
+                found = true;
+            }
+        }
+    }
+    if (!found) return 999999;
+    return g_daw.tcp_width + (int)((best_next_t - p->scroll_x_sec) * p->pixels_per_second);
+}
+
+// Computes the visible (clamped) width of marker m_idx when not being edited
+static int get_marker_clamped_width(ProjectTab *p, int m_idx, int mk_x) {
+    const char *txt = get_marker_full_str(p, m_idx);
+    int full_w = get_marker_tag_width(txt);
+    int next_x = get_next_marker_screen_x(p, m_idx);
+    int max_w = next_x - mk_x;
+    if (max_w < 6) max_w = 6;
+    return (full_w > max_w) ? max_w : full_w;
 }
 
 // Deletes marker at idx in the current tab
 static void delete_marker_at(ProjectTab *p, int idx) {
     if (!p || idx < 0 || idx >= p->num_markers) return;
+    int tab_idx = g_daw.active_tab;
+    if (tab_idx < 0 || tab_idx >= MAX_TABS) tab_idx = 0;
+
     push_undo_state();
     for (int m = idx; m < p->num_markers - 1; m++) {
         p->markers[m] = p->markers[m + 1];
+        memcpy(g_marker_full_text[tab_idx][m], g_marker_full_text[tab_idx][m + 1], MARKER_TEXT_MAX);
     }
     p->num_markers--;
     if (g_selected_marker_idx == idx) g_selected_marker_idx = -1;
@@ -117,6 +177,49 @@ static void swap_tracks(ProjectTab *p, int t1, int t2) {
     else if (g_daw.editing_track_name_idx == t2) g_daw.editing_track_name_idx = t1;
 
     p->is_dirty = true;
+}
+
+// Helper to draw a 1px or 2px purple border rectangle
+static inline void draw_purple_border_rect(SDL_Renderer *ren, const SDL_Rect *r, bool thick, bool faded) {
+    if (!r || r->w <= 0 || r->h <= 0) return;
+    if (thick) {
+        SDL_SetRenderDrawColor(ren, 175, 108, 245, 255);
+        SDL_RenderDrawRect(ren, r);
+        if (r->w > 2 && r->h > 2) {
+            SDL_Rect inner = { r->x + 1, r->y + 1, r->w - 2, r->h - 2 };
+            SDL_RenderDrawRect(ren, &inner);
+        }
+    } else if (faded) {
+        SDL_SetRenderDrawColor(ren, 108, 66, 156, 255);
+        SDL_RenderDrawRect(ren, r);
+    } else {
+        SDL_SetRenderDrawColor(ren, 140, 84, 208, 255);
+        SDL_RenderDrawRect(ren, r);
+    }
+}
+
+// Helper to draw text clipped strictly inside max_bounds intersected with active_clip
+static void draw_text_clipped(SDL_Renderer *ren, const char *text, int x, int y, SDL_Color col,
+                              const SDL_Rect *box_bounds, const SDL_Rect *parent_clip) {
+    if (!text || !box_bounds) return;
+    int x1 = box_bounds->x;
+    int y1 = box_bounds->y;
+    int x2 = box_bounds->x + box_bounds->w;
+    int y2 = box_bounds->y + box_bounds->h;
+
+    if (parent_clip) {
+        if (x1 < parent_clip->x) x1 = parent_clip->x;
+        if (y1 < parent_clip->y) y1 = parent_clip->y;
+        if (x2 > parent_clip->x + parent_clip->w) x2 = parent_clip->x + parent_clip->w;
+        if (y2 > parent_clip->y + parent_clip->h) y2 = parent_clip->y + parent_clip->h;
+    }
+
+    if (x2 > x1 && y2 > y1) {
+        SDL_Rect c_rect = { x1, y1, x2 - x1, y2 - y1 };
+        SDL_RenderSetClipRect(ren, &c_rect);
+        draw_text(ren, text, x, y, col);
+    }
+    SDL_RenderSetClipRect(ren, parent_clip);
 }
 
 // Computes equal-power crossfade gain (sin/cos S-law) for any overlapping clips and micro de-click ramps at sample time t_sec
@@ -386,6 +489,9 @@ int main(int argc, char *argv[]) {
     g_cursor_ibeam   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_IBEAM);
 
     memset(&g_daw, 0, sizeof(DawEngine));
+    memset(g_marker_full_text, 0, sizeof(g_marker_full_text));
+    memset(g_editing_marker_full_buf, 0, sizeof(g_editing_marker_full_buf));
+
     g_daw.num_tabs = 1;
     g_daw.active_tab = 0;
     g_daw.tcp_width = 200;
@@ -435,9 +541,6 @@ int main(int argc, char *argv[]) {
     // Track Header Up/Down Reorder Drag State
     int dragging_track_order_idx = -1;
     bool dragging_track_order_pushed_undo = false;
-
-    // Marker Dragging State
-    int dragging_marker_idx = -1;
 
     SDL_Event e;
     while (running) {
@@ -507,16 +610,18 @@ int main(int argc, char *argv[]) {
                         strcat(g_daw.editing_name_buf, e.text.text);
                     }
                 } else if (g_daw.input_focus == INPUT_FOCUS_MARKER) {
-                    size_t cur_len = strlen(g_daw.editing_marker_buf);
+                    size_t cur_len = strlen(g_editing_marker_full_buf);
                     size_t add_len = strlen(e.text.text);
                     if (g_marker_cursor_pos < 0) g_marker_cursor_pos = 0;
                     if ((size_t)g_marker_cursor_pos > cur_len) g_marker_cursor_pos = (int)cur_len;
-                    if (cur_len + add_len < 63) {
-                        memmove(g_daw.editing_marker_buf + g_marker_cursor_pos + add_len,
-                                g_daw.editing_marker_buf + g_marker_cursor_pos,
+                    if (cur_len + add_len < MARKER_TEXT_MAX - 1) {
+                        memmove(g_editing_marker_full_buf + g_marker_cursor_pos + add_len,
+                                g_editing_marker_full_buf + g_marker_cursor_pos,
                                 cur_len - (size_t)g_marker_cursor_pos + 1);
-                        memcpy(g_daw.editing_marker_buf + g_marker_cursor_pos, e.text.text, add_len);
+                        memcpy(g_editing_marker_full_buf + g_marker_cursor_pos, e.text.text, add_len);
                         g_marker_cursor_pos += (int)add_len;
+                        strncpy(g_daw.editing_marker_buf, g_editing_marker_full_buf, 63);
+                        g_daw.editing_marker_buf[63] = '\0';
                     }
                 }
             } else if (e.type == SDL_DROPFILE) {
@@ -574,12 +679,12 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 if (g_daw.input_focus == INPUT_FOCUS_MARKER) {
-                    size_t l = strlen(g_daw.editing_marker_buf);
+                    size_t l = strlen(g_editing_marker_full_buf);
                     if (g_marker_cursor_pos < 0) g_marker_cursor_pos = 0;
                     if ((size_t)g_marker_cursor_pos > l) g_marker_cursor_pos = (int)l;
 
                     if (e.key.keysym.sym == SDLK_RETURN) {
-                        strncpy(p->markers[g_daw.editing_marker_idx].text, g_daw.editing_marker_buf, 63);
+                        set_marker_full_str(p, g_daw.editing_marker_idx, g_editing_marker_full_buf);
                         g_daw.input_focus = INPUT_FOCUS_NONE;
                         g_daw.editing_marker_idx = -1;
                         SDL_StopTextInput();
@@ -590,16 +695,20 @@ int main(int argc, char *argv[]) {
                         SDL_StopTextInput();
                     } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
                         if (g_marker_cursor_pos > 0 && l > 0) {
-                            memmove(g_daw.editing_marker_buf + g_marker_cursor_pos - 1,
-                                    g_daw.editing_marker_buf + g_marker_cursor_pos,
+                            memmove(g_editing_marker_full_buf + g_marker_cursor_pos - 1,
+                                    g_editing_marker_full_buf + g_marker_cursor_pos,
                                     l - (size_t)g_marker_cursor_pos + 1);
                             g_marker_cursor_pos--;
+                            strncpy(g_daw.editing_marker_buf, g_editing_marker_full_buf, 63);
+                            g_daw.editing_marker_buf[63] = '\0';
                         }
                     } else if (e.key.keysym.sym == SDLK_DELETE) {
                         if ((size_t)g_marker_cursor_pos < l) {
-                            memmove(g_daw.editing_marker_buf + g_marker_cursor_pos,
-                                    g_daw.editing_marker_buf + g_marker_cursor_pos + 1,
+                            memmove(g_editing_marker_full_buf + g_marker_cursor_pos,
+                                    g_editing_marker_full_buf + g_marker_cursor_pos + 1,
                                     l - (size_t)g_marker_cursor_pos);
+                            strncpy(g_daw.editing_marker_buf, g_editing_marker_full_buf, 63);
+                            g_daw.editing_marker_buf[63] = '\0';
                         }
                     } else if (e.key.keysym.sym == SDLK_LEFT) {
                         if (g_marker_cursor_pos > 0) g_marker_cursor_pos--;
@@ -635,7 +744,9 @@ int main(int argc, char *argv[]) {
                         int new_m = p->num_markers++;
                         DawMarker *mk = &p->markers[new_m];
                         mk->time_sec = p->playhead_seconds;
-                        snprintf(mk->text, sizeof(mk->text), "Marker %d", p->num_markers);
+                        char def_txt[64];
+                        snprintf(def_txt, sizeof(def_txt), "Marker %d", p->num_markers);
+                        set_marker_full_str(p, new_m, def_txt);
                         g_selected_marker_idx = new_m;
                         p->is_dirty = true;
                     }
@@ -725,13 +836,14 @@ int main(int argc, char *argv[]) {
                         int marker_y_chk = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT;
                         bool clicked_inside_editing_marker = false;
                         if (em >= 0 && em < p->num_markers && p->show_marker_lane &&
-                            my >= marker_y_chk && my <= marker_y_chk + MARKER_BAR_HEIGHT) {
+                            my >= marker_y_chk && my <= marker_y_chk + MARKER_BAR_HEIGHT &&
+                            e.button.button == SDL_BUTTON_LEFT) {
                             int mk_x = g_daw.tcp_width + (int)((p->markers[em].time_sec - p->scroll_x_sec) * p->pixels_per_second);
-                            int tag_w = get_marker_tag_width(g_daw.editing_marker_buf);
+                            int tag_w = get_marker_tag_width(g_editing_marker_full_buf);
                             if (mx >= mk_x && mx <= mk_x + tag_w) {
                                 clicked_inside_editing_marker = true;
                                 int char_pos = (mx - (mk_x + 6) + 4) / 8;
-                                int max_l = (int)strlen(g_daw.editing_marker_buf);
+                                int max_l = (int)strlen(g_editing_marker_full_buf);
                                 if (char_pos < 0) char_pos = 0;
                                 if (char_pos > max_l) char_pos = max_l;
                                 g_marker_cursor_pos = char_pos;
@@ -741,7 +853,7 @@ int main(int argc, char *argv[]) {
                             continue;
                         }
                         if (em >= 0 && em < p->num_markers) {
-                            strncpy(p->markers[em].text, g_daw.editing_marker_buf, 63);
+                            set_marker_full_str(p, em, g_editing_marker_full_buf);
                             p->is_dirty = true;
                         }
                         g_daw.input_focus = INPUT_FOCUS_NONE;
@@ -781,6 +893,7 @@ int main(int argc, char *argv[]) {
                         char name[64]; snprintf(name, sizeof(name), "Project %d", g_daw.num_tabs + 1);
                         init_tab_defaults(g_daw.num_tabs, name);
                         g_tab_crossfade[g_daw.num_tabs] = true;
+                        memset(g_marker_full_text[g_daw.num_tabs], 0, sizeof(g_marker_full_text[0]));
                         g_daw.active_tab = g_daw.num_tabs++;
                         g_selected_marker_idx = -1;
                     }
@@ -968,25 +1081,21 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // ================= MARKER LANE INTERACTIONS =================
-                // 1. Right-click empty marker lane -> Add Marker
-                // 2. Double-click marker -> Typing cursor for typing text
-                // 3. Delete marker (via right-click "Delete Marker" menu, marker [x] button, or Delete key)
+                // ================= MARKER LANE INTERACTIONS (FIXED POSITION, NO DRAG) =================
+                // 1. Right-click empty marker lane -> Add Marker (fixed position)
+                // 2. Double-click marker -> Typing cursor for typing text (expands to show full text while editing)
+                // 3. Delete marker (via right-click "Delete Marker" menu or Delete/Backspace key)
                 int marker_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT;
                 if (p->show_marker_lane && mx >= g_daw.tcp_width && my > marker_y && my <= marker_y + MARKER_BAR_HEIGHT) {
                     double m_time = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
 
-                    // Check if user clicked on an existing marker tag (top-most / last drawn first)
+                    // Hit-test existing markers using their non-overlapping clamped width
                     int hit_m = -1;
-                    bool hit_delete_x = false;
                     for (int m = p->num_markers - 1; m >= 0; m--) {
                         int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
-                        int tag_w = get_marker_tag_width(p->markers[m].text);
-                        if (mx >= mk_x && mx <= mk_x + tag_w) {
+                        int vis_w = get_marker_clamped_width(p, m, mk_x);
+                        if (mx >= mk_x && mx < mk_x + vis_w) {
                             hit_m = m;
-                            if (mx >= mk_x + tag_w - 16) {
-                                hit_delete_x = true;
-                            }
                             break;
                         }
                     }
@@ -1000,33 +1109,33 @@ int main(int argc, char *argv[]) {
                             g_marker_context_x = mx;
                             g_marker_context_y = marker_y + MARKER_BAR_HEIGHT + 2;
                         } else if (p->num_markers < MAX_MARKERS) {
-                            // 1. Right-click on empty marker lane -> Add Marker
+                            // Right-click on empty marker lane -> Add fixed Marker
                             push_undo_state();
                             int new_idx = p->num_markers++;
                             DawMarker *mk = &p->markers[new_idx];
                             mk->time_sec = m_time;
-                            snprintf(mk->text, sizeof(mk->text), "Marker %d", p->num_markers);
+                            char def_txt[64];
+                            snprintf(def_txt, sizeof(def_txt), "Marker %d", p->num_markers);
+                            set_marker_full_str(p, new_idx, def_txt);
                             g_selected_marker_idx = new_idx;
                             p->is_dirty = true;
                         }
                     } else if (e.button.button == SDL_BUTTON_LEFT) {
                         if (hit_m >= 0) {
                             g_selected_marker_idx = hit_m;
-                            if (hit_delete_x) {
-                                // 3. Clicked [x] button on marker tag -> Delete Marker
-                                delete_marker_at(p, hit_m);
-                            } else if (e.button.clicks >= 2) {
-                                // 2. Double-click on marker -> Open typing cursor for typing text
+                            if (e.button.clicks >= 2) {
+                                // Double-click on marker -> Open typing cursor and reveal full text
                                 g_daw.input_focus = INPUT_FOCUS_MARKER;
                                 g_daw.editing_marker_idx = hit_m;
-                                strncpy(g_daw.editing_marker_buf, p->markers[hit_m].text, 63);
+                                const char *full_str = get_marker_full_str(p, hit_m);
+                                strncpy(g_editing_marker_full_buf, full_str, MARKER_TEXT_MAX - 1);
+                                g_editing_marker_full_buf[MARKER_TEXT_MAX - 1] = '\0';
+                                strncpy(g_daw.editing_marker_buf, full_str, 63);
                                 g_daw.editing_marker_buf[63] = '\0';
-                                g_marker_cursor_pos = (int)strlen(g_daw.editing_marker_buf);
+                                g_marker_cursor_pos = (int)strlen(g_editing_marker_full_buf);
                                 SDL_StartTextInput();
-                            } else {
-                                // Single click selects marker and allows dragging it along the lane
-                                dragging_marker_idx = hit_m;
                             }
+                            // Note: Markers are sticky (do not move/drag)
                         } else {
                             g_selected_marker_idx = -1;
                         }
@@ -1045,7 +1154,9 @@ int main(int argc, char *argv[]) {
                             int new_idx = p->num_markers++;
                             DawMarker *mk = &p->markers[new_idx];
                             mk->time_sec = m_time;
-                            snprintf(mk->text, sizeof(mk->text), "Marker %d", p->num_markers);
+                            char def_txt[64];
+                            snprintf(def_txt, sizeof(def_txt), "Marker %d", p->num_markers);
+                            set_marker_full_str(p, new_idx, def_txt);
                             g_selected_marker_idx = new_idx;
                             p->is_dirty = true;
                         }
@@ -1165,7 +1276,6 @@ int main(int argc, char *argv[]) {
                 resizing_track_idx = -1;
                 dragging_track_order_idx = -1;
                 dragging_track_order_pushed_undo = false;
-                dragging_marker_idx = -1;
                 g_daw.script_win_dragging = false;
                 if (dragging_item_idx != -1) p->is_dirty = true;
                 dragging_item_idx = -1; dragging_trim_left = false; dragging_trim_right = false;
@@ -1286,13 +1396,6 @@ int main(int argc, char *argv[]) {
                             dragging_track_order_idx++;
                         }
                     }
-                }
-
-                // Handle Marker Dragging along Marker Lane
-                if (dragging_marker_idx >= 0 && dragging_marker_idx < p->num_markers) {
-                    double m_time = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
-                    p->markers[dragging_marker_idx].time_sec = m_time;
-                    p->is_dirty = true;
                 }
 
                 if (p->video.is_resizing) {
@@ -1422,10 +1525,11 @@ int main(int argc, char *argv[]) {
         SDL_Color c_blue  = { 26, 86, 219, 255 };
         (void)c_blue;
 
-        // 1. Google Chrome Style Tab Bar
+        // 1. Google Chrome Style Tab Bar (with Purple Borders)
         SDL_Rect tab_bar = { 0, 0, win_w, TABBAR_HEIGHT };
         SDL_SetRenderDrawColor(ren, 18, 18, 18, 255);
         SDL_RenderFillRect(ren, &tab_bar);
+        draw_purple_border_rect(ren, &tab_bar, false, true);
 
         int max_tab_w = 160;
         int add_btn_w = 34;
@@ -1442,6 +1546,7 @@ int main(int argc, char *argv[]) {
             SDL_Rect tr = { cur_tab_x, 2, cur_tab_w - 2, TABBAR_HEIGHT - 2 };
             SDL_SetRenderDrawColor(ren, is_active ? 36 : 22, is_active ? 36 : 22, is_active ? 36 : 22, 255);
             SDL_RenderFillRect(ren, &tr);
+            draw_purple_border_rect(ren, &tr, is_active, !is_active);
 
             char label_buf[70];
             if (g_daw.tabs[t].is_dirty) {
@@ -1449,7 +1554,8 @@ int main(int argc, char *argv[]) {
             } else {
                 snprintf(label_buf, sizeof(label_buf), "%s", g_daw.tabs[t].project_name);
             }
-            draw_text(ren, label_buf, cur_tab_x + 10, 9, is_active ? c_white : c_muted);
+            SDL_Rect tab_lbl_bounds = { cur_tab_x + 4, 2, cur_tab_w - 26, TABBAR_HEIGHT - 4 };
+            draw_text_clipped(ren, label_buf, cur_tab_x + 10, 9, is_active ? c_white : c_muted, &tab_lbl_bounds, NULL);
 
             draw_text(ren, "x", cur_tab_x + cur_tab_w - 18, 9, is_active ? c_white : c_muted);
             cur_tab_x += cur_tab_w;
@@ -1458,39 +1564,44 @@ int main(int argc, char *argv[]) {
         SDL_Rect btn_add_tab = { cur_tab_x, 2, add_btn_w, TABBAR_HEIGHT - 2 };
         SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
         SDL_RenderFillRect(ren, &btn_add_tab);
+        draw_purple_border_rect(ren, &btn_add_tab, false, false);
         draw_text(ren, "+", cur_tab_x + 12, 9, c_white);
 
-        // 2. Top Bar
+        // 2. Top Bar (All Buttons & Bar Edges in Purple)
         SDL_Rect topbar = { 0, TABBAR_HEIGHT, win_w, TOPBAR_HEIGHT };
         SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
         SDL_RenderFillRect(ren, &topbar);
+        draw_purple_border_rect(ren, &topbar, false, true);
 
         SDL_Rect btn_file = { 8, TABBAR_HEIGHT + 5, 46, 26 };
         SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
         SDL_RenderFillRect(ren, &btn_file);
+        draw_purple_border_rect(ren, &btn_file, g_daw.menu_file_open, false);
         draw_text(ren, "File", 18, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_act = { 56, TABBAR_HEIGHT + 5, 60, 26 };
         SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
         SDL_RenderFillRect(ren, &btn_act);
+        draw_purple_border_rect(ren, &btn_act, g_daw.menu_action_open, false);
         draw_text(ren, "Action", 64, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_mk_toggle = { 122, TABBAR_HEIGHT + 5, 66, 26 };
-        SDL_SetRenderDrawColor(ren, p->show_marker_lane ? 55 : 40, p->show_marker_lane ? 55 : 40, p->show_marker_lane ? 55 : 40, 255);
+        SDL_SetRenderDrawColor(ren, p->show_marker_lane ? 55 : 40, p->show_marker_lane ? 48 : 40, p->show_marker_lane ? 68 : 40, 255);
         SDL_RenderFillRect(ren, &btn_mk_toggle);
+        draw_purple_border_rect(ren, &btn_mk_toggle, p->show_marker_lane, false);
         draw_text(ren, "Marker", 130, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect v_menu = { 194, TABBAR_HEIGHT + 5, 88, 26 };
-        SDL_SetRenderDrawColor(ren, p->video.is_open ? 55 : 40, p->video.is_open ? 55 : 40, p->video.is_open ? 55 : 40, 255);
+        SDL_SetRenderDrawColor(ren, p->video.is_open ? 55 : 40, p->video.is_open ? 48 : 40, p->video.is_open ? 68 : 40, 255);
         SDL_RenderFillRect(ren, &v_menu);
+        draw_purple_border_rect(ren, &v_menu, p->video.is_open, false);
         draw_text(ren, "View:Video", 200, TABBAR_HEIGHT + 13, c_white);
 
         bool xfade_active = is_crossfade_active();
         SDL_Rect xfade_btn = { 288, TABBAR_HEIGHT + 5, 124, 26 };
-        SDL_SetRenderDrawColor(ren, xfade_active ? 28 : 40, xfade_active ? 82 : 40, xfade_active ? 62 : 40, 255);
+        SDL_SetRenderDrawColor(ren, xfade_active ? 52 : 40, xfade_active ? 38 : 40, xfade_active ? 72 : 40, 255);
         SDL_RenderFillRect(ren, &xfade_btn);
-        SDL_SetRenderDrawColor(ren, xfade_active ? 64 : 60, xfade_active ? 160 : 60, xfade_active ? 115 : 60, 255);
-        SDL_RenderDrawRect(ren, &xfade_btn);
+        draw_purple_border_rect(ren, &xfade_btn, xfade_active, false);
         draw_text(ren, xfade_active ? "Crossfade: ON" : "Crossfade: OFF", 294, TABBAR_HEIGHT + 13, c_white);
 
         char clock_buf[32];
@@ -1499,26 +1610,31 @@ int main(int argc, char *argv[]) {
         SDL_Rect clock_bg = { clock_x - 10, TABBAR_HEIGHT + 4, 128, 28 };
         SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
         SDL_RenderFillRect(ren, &clock_bg);
+        draw_purple_border_rect(ren, &clock_bg, false, false);
         draw_text(ren, clock_buf, clock_x - 4, TABBAR_HEIGHT + 12, c_white);
 
         SDL_Rect btn_undo = { win_w - 228, TABBAR_HEIGHT + 5, 52, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_undo);
+        draw_purple_border_rect(ren, &btn_undo, false, false);
         draw_text(ren, "Undo", win_w - 218, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_redo = { win_w - 172, TABBAR_HEIGHT + 5, 52, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_redo);
+        draw_purple_border_rect(ren, &btn_redo, false, false);
         draw_text(ren, "Redo", win_w - 162, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_zm_out = { win_w - 116, TABBAR_HEIGHT + 5, 56, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_zm_out);
+        draw_purple_border_rect(ren, &btn_zm_out, false, false);
         draw_text(ren, "Zoom-", win_w - 110, TABBAR_HEIGHT + 13, c_white);
 
         SDL_Rect btn_zm_in = { win_w - 56, TABBAR_HEIGHT + 5, 50, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_zm_in);
+        draw_purple_border_rect(ren, &btn_zm_in, false, false);
         draw_text(ren, "Zoom+", win_w - 50, TABBAR_HEIGHT + 13, c_white);
 
         // 3. Corner Header
@@ -1526,21 +1642,25 @@ int main(int argc, char *argv[]) {
         SDL_Rect corner_area = { 0, corner_y, g_daw.tcp_width, RULER_HEIGHT + m_lane_h };
         SDL_SetRenderDrawColor(ren, 32, 32, 32, 255);
         SDL_RenderFillRect(ren, &corner_area);
+        draw_purple_border_rect(ren, &corner_area, false, true);
 
         SDL_Rect btn_corner_add = { 8, corner_y + 10, 72, 26 };
         SDL_SetRenderDrawColor(ren, 48, 48, 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_add);
+        draw_purple_border_rect(ren, &btn_corner_add, false, false);
         draw_text(ren, "+ Track", 16, corner_y + 18, c_white);
 
         SDL_Rect btn_corner_play = { 86, corner_y + 10, 72, 26 };
-        SDL_SetRenderDrawColor(ren, p->is_playing ? 65 : 48, 48, 48, 255);
+        SDL_SetRenderDrawColor(ren, p->is_playing ? 65 : 48, 48, p->is_playing ? 78 : 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_play);
+        draw_purple_border_rect(ren, &btn_corner_play, p->is_playing, false);
         draw_text(ren, p->is_playing ? "Pause" : "Play", 102, corner_y + 18, c_white);
 
         // 4. Time Ruler & Marker Bar
         SDL_Rect ruler = { g_daw.tcp_width, corner_y, view_w, RULER_HEIGHT };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &ruler);
+        draw_purple_border_rect(ren, &ruler, false, true);
 
         double min_px_gap = 90.0;
         double sec_per_tick = min_px_gap / p->pixels_per_second;
@@ -1569,7 +1689,7 @@ int main(int argc, char *argv[]) {
                 snprintf(t_str, sizeof(t_str), "%02d:%02d:00", h, m);
             }
             draw_text(ren, t_str, rx + 4, corner_y + 8, c_muted);
-            SDL_SetRenderDrawColor(ren, 55, 55, 55, 255);
+            SDL_SetRenderDrawColor(ren, 108, 66, 156, 255);
             SDL_RenderDrawLine(ren, rx, corner_y + 16, rx, corner_y + RULER_HEIGHT);
         }
 
@@ -1581,56 +1701,87 @@ int main(int argc, char *argv[]) {
             SDL_Rect marker_bg = { g_daw.tcp_width, marker_y, view_w, MARKER_BAR_HEIGHT };
             SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
             SDL_RenderFillRect(ren, &marker_bg);
-            SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
-            SDL_RenderDrawLine(ren, g_daw.tcp_width, marker_y + MARKER_BAR_HEIGHT - 1, g_daw.tcp_width + view_w, marker_y + MARKER_BAR_HEIGHT - 1);
+            draw_purple_border_rect(ren, &marker_bg, false, true);
 
+            // Pass 1: Draw all non-editing markers (clamped so they never cross the next marker)
             for (int m = 0; m < p->num_markers; m++) {
-                int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
                 bool is_editing_this = (g_daw.input_focus == INPUT_FOCUS_MARKER && g_daw.editing_marker_idx == m);
-                bool is_selected_this = (g_selected_marker_idx == m);
-                const char *disp_txt = is_editing_this ? g_daw.editing_marker_buf : p->markers[m].text;
-                int tag_w = get_marker_tag_width(disp_txt);
+                if (is_editing_this) continue;
 
-                if (mk_x + tag_w >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
-                    SDL_Rect m_tag = { mk_x, marker_y + 2, tag_w, MARKER_BAR_HEIGHT - 4 };
+                int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
+                bool is_selected_this = (g_selected_marker_idx == m);
+                const char *disp_txt = get_marker_full_str(p, m);
+                int vis_w = get_marker_clamped_width(p, m, mk_x);
+
+                if (mk_x + vis_w >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
+                    SDL_Rect m_tag = { mk_x, marker_y + 2, vis_w, MARKER_BAR_HEIGHT - 4 };
                     SDL_SetRenderDrawColor(ren,
-                        is_editing_this ? 24 : (is_selected_this ? 45 : 38),
-                        is_editing_this ? 72 : (is_selected_this ? 68 : 48),
-                        is_editing_this ? 165 : (is_selected_this ? 115 : 58),
+                        is_selected_this ? 45 : 34,
+                        is_selected_this ? 38 : 32,
+                        is_selected_this ? 68 : 46,
                         255);
                     SDL_RenderFillRect(ren, &m_tag);
 
-                    SDL_SetRenderDrawColor(ren,
-                        is_editing_this ? 120 : (is_selected_this ? 150 : 85),
-                        is_editing_this ? 185 : (is_selected_this ? 185 : 95),
-                        is_editing_this ? 255 : (is_selected_this ? 235 : 110),
-                        255);
-                    SDL_RenderDrawRect(ren, &m_tag);
+                    // Top/bottom border in purple
+                    draw_purple_border_rect(ren, &m_tag, is_selected_this, false);
 
-                    // Marker position indicator line on left edge
-                    SDL_SetRenderDrawColor(ren, 245, 190, 65, 255);
-                    SDL_RenderDrawLine(ren, mk_x, marker_y, mk_x, marker_y + MARKER_BAR_HEIGHT - 1);
+                    // Left and right edges of marker text box in bright Orange
+                    SDL_SetRenderDrawColor(ren, 255, 140, 0, 255);
+                    SDL_RenderDrawLine(ren, m_tag.x, m_tag.y, m_tag.x, m_tag.y + m_tag.h - 1);
+                    if (m_tag.w > 1) {
+                        SDL_RenderDrawLine(ren, m_tag.x + 1, m_tag.y, m_tag.x + 1, m_tag.y + m_tag.h - 1);
+                        SDL_RenderDrawLine(ren, m_tag.x + m_tag.w - 1, m_tag.y, m_tag.x + m_tag.w - 1, m_tag.y + m_tag.h - 1);
+                    }
+                    if (m_tag.w > 3) {
+                        SDL_RenderDrawLine(ren, m_tag.x + m_tag.w - 2, m_tag.y, m_tag.x + m_tag.w - 2, m_tag.y + m_tag.h - 1);
+                    }
 
-                    draw_text(ren, disp_txt, mk_x + 6, marker_y + 6, c_white);
+                    // Clip marker text so it only shows until the next marker (inside the orange edges)
+                    SDL_Rect txt_bounds = { m_tag.x + 3, m_tag.y + 1, m_tag.w - 6, m_tag.h - 2 };
+                    draw_text_clipped(ren, disp_txt, mk_x + 6, marker_y + 6, c_white, &txt_bounds, &marker_clip);
+                }
+            }
 
-                    // Blinking Typing Cursor when double-clicked for editing text
-                    if (is_editing_this) {
-                        int cur_pos = g_marker_cursor_pos;
-                        int max_l = (int)strlen(g_daw.editing_marker_buf);
-                        if (cur_pos < 0) cur_pos = 0;
-                        if (cur_pos > max_l) cur_pos = max_l;
-                        int cx = mk_x + 6 + cur_pos * 8;
-                        if ((SDL_GetTicks() / 450) % 2 == 0) {
-                            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                            SDL_RenderDrawLine(ren, cx, marker_y + 4, cx, marker_y + MARKER_BAR_HEIGHT - 4);
-                            SDL_RenderDrawLine(ren, cx + 1, marker_y + 4, cx + 1, marker_y + MARKER_BAR_HEIGHT - 4);
-                        }
-                    } else {
-                        // Small [x] delete button on right end of marker tag
-                        draw_text(ren, "x", mk_x + tag_w - 12, marker_y + 6, c_muted);
+            // Pass 2: Draw the currently-editing (double-clicked) marker on top with its complete text visible
+            if (g_daw.input_focus == INPUT_FOCUS_MARKER &&
+                g_daw.editing_marker_idx >= 0 && g_daw.editing_marker_idx < p->num_markers) {
+                int m = g_daw.editing_marker_idx;
+                int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
+                const char *disp_txt = g_editing_marker_full_buf;
+                int full_w = get_marker_tag_width(disp_txt);
+
+                if (mk_x + full_w >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
+                    SDL_Rect m_tag = { mk_x, marker_y + 2, full_w, MARKER_BAR_HEIGHT - 4 };
+                    SDL_SetRenderDrawColor(ren, 38, 32, 62, 255);
+                    SDL_RenderFillRect(ren, &m_tag);
+
+                    // Top/bottom border in thick purple
+                    draw_purple_border_rect(ren, &m_tag, true, false);
+
+                    // Left and right edges of marker text box in bright Orange
+                    SDL_SetRenderDrawColor(ren, 255, 140, 0, 255);
+                    SDL_RenderDrawLine(ren, m_tag.x, m_tag.y, m_tag.x, m_tag.y + m_tag.h - 1);
+                    SDL_RenderDrawLine(ren, m_tag.x + 1, m_tag.y, m_tag.x + 1, m_tag.y + m_tag.h - 1);
+                    SDL_RenderDrawLine(ren, m_tag.x + m_tag.w - 1, m_tag.y, m_tag.x + m_tag.w - 1, m_tag.y + m_tag.h - 1);
+                    SDL_RenderDrawLine(ren, m_tag.x + m_tag.w - 2, m_tag.y, m_tag.x + m_tag.w - 2, m_tag.y + m_tag.h - 1);
+
+                    SDL_Rect txt_bounds = { m_tag.x + 3, m_tag.y + 1, m_tag.w - 6, m_tag.h - 2 };
+                    draw_text_clipped(ren, disp_txt, mk_x + 6, marker_y + 6, c_white, &txt_bounds, &marker_clip);
+
+                    // Blinking Typing Cursor
+                    int cur_pos = g_marker_cursor_pos;
+                    int max_l = (int)strlen(g_editing_marker_full_buf);
+                    if (cur_pos < 0) cur_pos = 0;
+                    if (cur_pos > max_l) cur_pos = max_l;
+                    int cx = mk_x + 6 + cur_pos * 8;
+                    if ((SDL_GetTicks() / 450) % 2 == 0) {
+                        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                        SDL_RenderDrawLine(ren, cx, marker_y + 4, cx, marker_y + MARKER_BAR_HEIGHT - 4);
+                        SDL_RenderDrawLine(ren, cx + 1, marker_y + 4, cx + 1, marker_y + MARKER_BAR_HEIGHT - 4);
                     }
                 }
             }
+
             SDL_RenderSetClipRect(ren, NULL);
         }
 
@@ -1638,39 +1789,38 @@ int main(int argc, char *argv[]) {
         SDL_Rect timeline_clip = { g_daw.tcp_width, header_top_y, view_w, view_h };
         SDL_RenderSetClipRect(ren, &timeline_clip);
 
+        // Subtle vertical timeline grid lines in faded purple
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
         for (double t = start_tick; t <= end_tick; t += chosen_step) {
             int gx = g_daw.tcp_width + (int)((t - p->scroll_x_sec) * p->pixels_per_second);
             if (gx < g_daw.tcp_width || gx > g_daw.tcp_width + view_w) continue;
-            SDL_SetRenderDrawColor(ren, 38, 38, 38, 255);
+            SDL_SetRenderDrawColor(ren, 92, 58, 132, 65);
             SDL_RenderDrawLine(ren, gx, header_top_y, gx, header_top_y + view_h);
         }
 
-        // Draw vertical marker guide lines across timeline tracks
-        if (p->show_marker_lane) {
-            for (int m = 0; m < p->num_markers; m++) {
-                int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
-                if (mk_x >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
-                    SDL_SetRenderDrawColor(ren, 95, 80, 40, 255);
-                    SDL_RenderDrawLine(ren, mk_x, header_top_y, mk_x, header_top_y + view_h);
-                }
-            }
-        }
-
-        // Timeline tracks background and light selection borders
+        // Timeline tracks: Each track has an identical simple faded purple edge; selected track edge is slightly thicker
         int track_cur_y = header_top_y - p->scroll_y_px;
         for (int i = 0; i < p->num_tracks; i++) {
             int th = p->track_heights[i];
+            SDL_Rect lane_border = { g_daw.tcp_width, track_cur_y, view_w, th };
             if (p->track_selected[i]) {
-                SDL_Rect sel_lane_border = { g_daw.tcp_width, track_cur_y, view_w, th };
-                SDL_SetRenderDrawColor(ren, 40, 75, 50, 255);
-                SDL_RenderDrawRect(ren, &sel_lane_border);
+                // Selected track edge: slightly thicker (2px) purple edge
+                SDL_SetRenderDrawColor(ren, 172, 106, 242, 235);
+                SDL_RenderDrawRect(ren, &lane_border);
+                if (th > 4 && view_w > 4) {
+                    SDL_Rect lane_inner = { g_daw.tcp_width + 1, track_cur_y + 1, view_w - 2, th - 2 };
+                    SDL_RenderDrawRect(ren, &lane_inner);
+                }
+            } else {
+                // Unselected track edge: simple identical faded purple edge (not a deep dark trench)
+                SDL_SetRenderDrawColor(ren, 110, 68, 158, 130);
+                SDL_RenderDrawRect(ren, &lane_border);
             }
             track_cur_y += th;
-            SDL_SetRenderDrawColor(ren, 26, 26, 26, 255);
-            SDL_RenderDrawLine(ren, g_daw.tcp_width, track_cur_y, g_daw.tcp_width + view_w, track_cur_y);
         }
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
-        // 5. Render Clips (Pass 1A: Clip Backgrounds, Pass 1B: Faded Waveforms & Labels, Pass 2: Standard Studio Crossfade Overlays)
+        // 5. Render Clips (Pass 1A: Clip Backgrounds, Pass 1B: Faded Waveforms & Clipped Labels, Pass 2: Standard Studio Crossfade Overlays)
         for (int i = 0; i < p->num_items; i++) {
             AudioItem *it = &p->items[i];
             int iy = get_track_y_pos(it->track_idx) + 2;
@@ -1678,19 +1828,20 @@ int main(int argc, char *argv[]) {
             int ix = g_daw.tcp_width + (int)((it->start_time - p->scroll_x_sec) * p->pixels_per_second);
             int iw = (int)(it->duration * p->pixels_per_second);
 
-            if (ix + iw < g_daw.tcp_width || ix > g_daw.tcp_width + view_w) continue;
+            if (ix + iw < g_daw.tcp_width || ix > g_daw.tcp_width + view_w || iw <= 0) continue;
 
             SDL_Rect clip_r = { ix, iy, iw, ih };
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 46 : 34, it->is_selected ? 50 : 36, it->is_selected ? 56 : 40, 255);
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 46 : 34, it->is_selected ? 44 : 34, it->is_selected ? 60 : 42, 255);
             SDL_RenderFillRect(ren, &clip_r);
 
             // Subtle header strip at the top of each clip
-            SDL_Rect hdr_r = { ix, iy, iw, 18 };
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 60 : 42, it->is_selected ? 68 : 45, it->is_selected ? 78 : 52, 255);
+            int hdr_h = (ih > 18) ? 18 : ih;
+            SDL_Rect hdr_r = { ix, iy, iw, hdr_h };
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 62 : 44, it->is_selected ? 54 : 40, it->is_selected ? 82 : 56, 255);
             SDL_RenderFillRect(ren, &hdr_r);
         }
 
-        // Pass 1B: Render Waveforms (attenuated by equal-power crossfade envelope inside overlap zones), Borders & Labels
+        // Pass 1B: Render Waveforms (attenuated by equal-power crossfade envelope inside overlap zones), Purple Borders & Clipped Labels
         for (int i = 0; i < p->num_items; i++) {
             AudioItem *it = &p->items[i];
             int iy = get_track_y_pos(it->track_idx) + 2;
@@ -1698,13 +1849,13 @@ int main(int argc, char *argv[]) {
             int ix = g_daw.tcp_width + (int)((it->start_time - p->scroll_x_sec) * p->pixels_per_second);
             int iw = (int)(it->duration * p->pixels_per_second);
 
-            if (ix + iw < g_daw.tcp_width || ix > g_daw.tcp_width + view_w) continue;
+            if (ix + iw < g_daw.tcp_width || ix > g_daw.tcp_width + view_w || iw <= 0) continue;
 
             float gain_multiplier = db_to_linear(p->track_db[it->track_idx]);
             int mid_y = iy + ih / 2;
 
-            // Zero-line center axis
-            SDL_SetRenderDrawColor(ren, 52, 55, 60, 255);
+            // Zero-line center axis in faded purple
+            SDL_SetRenderDrawColor(ren, 82, 56, 112, 255);
             SDL_RenderDrawLine(ren, ix, mid_y, ix + iw, mid_y);
 
             if (it->peaks && it->peak_count > 0) {
@@ -1739,11 +1890,15 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            // Purple clip border (thicker when clip is selected)
             SDL_Rect clip_r = { ix, iy, iw, ih };
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 190 : 82, it->is_selected ? 200 : 86, it->is_selected ? 215 : 94, 255);
-            SDL_RenderDrawRect(ren, &clip_r);
+            draw_purple_border_rect(ren, &clip_r, it->is_selected, false);
 
-            draw_text(ren, it->label, ix + 6, iy + 4, c_white);
+            // Requirement 2: Clip name strictly clipped to clip length (text only shows until clip's right edge)
+            if (iw > 8) {
+                SDL_Rect clip_text_bounds = { ix + 2, iy + 1, iw - 4, ih - 2 };
+                draw_text_clipped(ren, it->label, ix + 6, iy + 4, c_white, &clip_text_bounds, &timeline_clip);
+            }
         }
 
         // Pass 2: Standard Audio Editing Crossfade Box & Equal-Power X-Curves on any Overlapping Clips
@@ -1780,7 +1935,7 @@ int main(int argc, char *argv[]) {
 
                 // 1. Translucent crossfade zone highlight box
                 SDL_Rect xf_box = { ox, iy, ow, ih };
-                SDL_SetRenderDrawColor(ren, 245, 175, 55, 28);
+                SDL_SetRenderDrawColor(ren, 155, 90, 225, 32);
                 SDL_RenderFillRect(ren, &xf_box);
 
                 int top_pad = iy + 3;
@@ -1828,15 +1983,15 @@ int main(int argc, char *argv[]) {
                     prev_y_in  = y_in;
                 }
 
-                // 3. Crisp Crossfade Boundary Frame & Corner Handles
-                SDL_SetRenderDrawColor(ren, 235, 175, 65, 215);
+                // 3. Crisp Purple Crossfade Boundary Frame & Corner Handles
+                SDL_SetRenderDrawColor(ren, 175, 108, 245, 235);
                 SDL_RenderDrawRect(ren, &xf_box);
 
                 // 4. Center Equal-Power Crossing Handle (-3dB intersection point at u = 0.5)
                 int cross_x = ox + ow / 2;
                 int cross_y = bot_pad - (int)(0.70710678f * curve_h);
                 SDL_Rect cross_handle = { cross_x - 3, cross_y - 3, 6, 6 };
-                SDL_SetRenderDrawColor(ren, 255, 235, 180, 255);
+                SDL_SetRenderDrawColor(ren, 225, 190, 255, 255);
                 SDL_RenderFillRect(ren, &cross_handle);
 
                 // Top/bottom corner fade handles
@@ -1844,7 +1999,7 @@ int main(int argc, char *argv[]) {
                 SDL_Rect h_tr = { ox + ow - 5, iy, 5, 5 };
                 SDL_Rect h_bl = { ox, iy + ih - 5, 5, 5 };
                 SDL_Rect h_br = { ox + ow - 5, iy + ih - 5, 5, 5 };
-                SDL_SetRenderDrawColor(ren, 235, 175, 65, 255);
+                SDL_SetRenderDrawColor(ren, 175, 108, 245, 255);
                 SDL_RenderFillRect(ren, &h_tl);
                 SDL_RenderFillRect(ren, &h_tr);
                 SDL_RenderFillRect(ren, &h_bl);
@@ -1859,8 +2014,7 @@ int main(int argc, char *argv[]) {
             int mw = abs(marquee_cur_x - marquee_start_x);
             int mh = abs(marquee_cur_y - marquee_start_y);
             SDL_Rect mr = { mx1, my1, mw, mh };
-            SDL_SetRenderDrawColor(ren, 100, 100, 100, 255);
-            SDL_RenderDrawRect(ren, &mr);
+            draw_purple_border_rect(ren, &mr, false, false);
         }
 
         int cur_px = g_daw.tcp_width + (int)((p->playhead_seconds - p->scroll_x_sec) * p->pixels_per_second);
@@ -1870,7 +2024,7 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 6. Track Header (TCP) with Up/Down Drag Handle
+        // 6. Track Header (TCP) with Identical Simple Faded Purple Edge & Thicker Selected Purple Edge
         SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
         for (int i = 0; i < p->num_tracks; i++) {
@@ -1879,55 +2033,52 @@ int main(int argc, char *argv[]) {
             bool is_sel = p->track_selected[i];
             bool is_dragging_this_trk = (dragging_track_order_idx == i);
 
-            SDL_Rect tp = { 2, ty + 2, g_daw.tcp_width - 4, th - 4 };
+            SDL_Rect tp = { 1, ty + 1, g_daw.tcp_width - 2, th - 2 };
             SDL_SetRenderDrawColor(ren,
-                is_dragging_this_trk ? 42 : (is_sel ? 32 : 26),
-                is_dragging_this_trk ? 56 : (is_sel ? 40 : 26),
-                is_dragging_this_trk ? 72 : (is_sel ? 32 : 26),
+                is_dragging_this_trk ? 42 : (is_sel ? 34 : 26),
+                is_dragging_this_trk ? 36 : (is_sel ? 30 : 26),
+                is_dragging_this_trk ? 58 : (is_sel ? 44 : 26),
                 255);
             SDL_RenderFillRect(ren, &tp);
 
-            if (is_dragging_this_trk) {
-                SDL_SetRenderDrawColor(ren, 85, 190, 245, 255);
+            // Requirement 3 & 4: Every track has a simple identical faded purple edge; selected/dragged track edge is slightly thicker
+            if (is_dragging_this_trk || is_sel) {
+                draw_purple_border_rect(ren, &tp, true, false);
+            } else {
+                SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+                SDL_SetRenderDrawColor(ren, 110, 68, 158, 145);
                 SDL_RenderDrawRect(ren, &tp);
-                SDL_Rect inner_drag = { tp.x + 1, tp.y + 1, tp.w - 2, tp.h - 2 };
-                SDL_RenderDrawRect(ren, &inner_drag);
-            } else if (is_sel) {
-                SDL_SetRenderDrawColor(ren, 22, 101, 52, 255);
-                SDL_RenderDrawRect(ren, &tp);
-                SDL_Rect inner_green = { tp.x + 1, tp.y + 1, tp.w - 2, tp.h - 2 };
-                SDL_RenderDrawRect(ren, &inner_green);
+                SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
             }
 
-            // Top Part: Track Name Box with clean border
+            // Top Part: Track Name Box with clean purple border
             SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 38, 22 };
             bool is_editing = (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME && g_daw.editing_track_name_idx == i);
 
             SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
             SDL_RenderFillRect(ren, &name_box);
-            SDL_SetRenderDrawColor(ren, is_editing ? 220 : 65, is_editing ? 220 : 65, is_editing ? 220 : 65, 255);
-            SDL_RenderDrawRect(ren, &name_box);
+            draw_purple_border_rect(ren, &name_box, is_editing, false);
 
+            SDL_Rect name_txt_bounds = { name_box.x + 2, name_box.y + 1, name_box.w - 4, name_box.h - 2 };
             if (is_editing) {
-                draw_text(ren, g_daw.editing_name_buf, 12, ty + 10, c_white);
+                draw_text_clipped(ren, g_daw.editing_name_buf, 12, ty + 10, c_white, &name_txt_bounds, &tcp_clip);
                 int text_w = (int)strlen(g_daw.editing_name_buf) * 8;
                 if ((SDL_GetTicks() / 500) % 2 == 0) {
                     SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
                     SDL_RenderDrawLine(ren, 12 + text_w, ty + 8, 12 + text_w, ty + 24);
                 }
             } else {
-                draw_text(ren, p->track_names[i], 12, ty + 10, c_white);
+                draw_text_clipped(ren, p->track_names[i], 12, ty + 10, c_white, &name_txt_bounds, &tcp_clip);
             }
 
             // Right-side Up/Down Drag Grip Handle
             int grip_x = g_daw.tcp_width - 24;
             SDL_Rect grip_box = { grip_x, ty + 6, 18, 48 };
-            SDL_SetRenderDrawColor(ren, is_dragging_this_trk ? 55 : 36, is_dragging_this_trk ? 75 : 36, is_dragging_this_trk ? 95 : 36, 255);
+            SDL_SetRenderDrawColor(ren, is_dragging_this_trk ? 52 : 36, is_dragging_this_trk ? 42 : 36, is_dragging_this_trk ? 72 : 36, 255);
             SDL_RenderFillRect(ren, &grip_box);
-            SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
-            SDL_RenderDrawRect(ren, &grip_box);
-            // Draw grip bars (=) and up/down chevron hints
-            SDL_SetRenderDrawColor(ren, 165, 165, 165, 255);
+            draw_purple_border_rect(ren, &grip_box, is_dragging_this_trk, false);
+            // Draw grip bars (=)
+            SDL_SetRenderDrawColor(ren, 175, 130, 225, 255);
             for (int gy = ty + 22; gy <= ty + 36; gy += 4) {
                 SDL_RenderDrawLine(ren, grip_x + 4, gy, grip_x + 13, gy);
             }
@@ -1937,8 +2088,9 @@ int main(int argc, char *argv[]) {
 
             // DB Controls
             SDL_Rect btn_minus = { 8, bot_y, 18, 20 };
-            SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
+            SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
             SDL_RenderFillRect(ren, &btn_minus);
+            draw_purple_border_rect(ren, &btn_minus, false, false);
             draw_text(ren, "-", 14, bot_y + 4, c_white);
 
             char db_txt[16];
@@ -1946,84 +2098,87 @@ int main(int argc, char *argv[]) {
             draw_text(ren, db_txt, 30, bot_y + 5, c_white);
 
             SDL_Rect btn_plus = { 76, bot_y, 18, 20 };
-            SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
+            SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
             SDL_RenderFillRect(ren, &btn_plus);
+            draw_purple_border_rect(ren, &btn_plus, false, false);
             draw_text(ren, "+", 81, bot_y + 4, c_white);
 
             // M & S Buttons
             SDL_Rect m_btn = { 110, bot_y, 22, 20 };
-            SDL_SetRenderDrawColor(ren, p->tracks[i].mute ? 180 : 44, p->tracks[i].mute ? 40 : 44, 44, 255);
+            SDL_SetRenderDrawColor(ren, p->tracks[i].mute ? 180 : 40, p->tracks[i].mute ? 40 : 40, 40, 255);
             SDL_RenderFillRect(ren, &m_btn);
+            draw_purple_border_rect(ren, &m_btn, p->tracks[i].mute, false);
             draw_text(ren, "M", 117, bot_y + 4, c_white);
 
             SDL_Rect s_btn = { 138, bot_y, 22, 20 };
-            SDL_SetRenderDrawColor(ren, p->tracks[i].solo ? 180 : 44, p->tracks[i].solo ? 140 : 44, 44, 255);
+            SDL_SetRenderDrawColor(ren, p->tracks[i].solo ? 180 : 40, p->tracks[i].solo ? 140 : 40, 40, 255);
             SDL_RenderFillRect(ren, &s_btn);
+            draw_purple_border_rect(ren, &s_btn, p->tracks[i].solo, false);
             draw_text(ren, "S", 145, bot_y + 4, c_white);
-
-            SDL_SetRenderDrawColor(ren, 18, 18, 18, 255);
-            SDL_RenderDrawLine(ren, 0, ty + th, g_daw.tcp_width, ty + th);
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        SDL_SetRenderDrawColor(ren, 45, 45, 45, 255);
+        // Purple vertical border line between TCP and Timeline
+        SDL_SetRenderDrawColor(ren, 140, 84, 208, 255);
         SDL_RenderDrawLine(ren, g_daw.tcp_width - 1, TABBAR_HEIGHT + TOPBAR_HEIGHT, g_daw.tcp_width - 1, win_h);
 
-        // Scrollbars
+        // Scrollbars (with Purple Borders)
         SDL_Rect bar_h = { g_daw.tcp_width, win_h - SCROLLBAR_SIZE, view_w, SCROLLBAR_SIZE };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &bar_h);
+        draw_purple_border_rect(ren, &bar_h, false, true);
 
         float thumb_w_sz = (total_w_timeline > 0) ? fmaxf(30.0f, (float)view_w * ((float)view_w / total_w_timeline)) : view_w;
         double max_scroll_sec = (total_w_timeline > view_w) ? (double)(total_w_timeline - view_w) / p->pixels_per_second : 0.0001;
         float thumb_x = g_daw.tcp_width + (max_scroll_sec > 0 ? (float)(p->scroll_x_sec / max_scroll_sec) * (view_w - thumb_w_sz) : 0);
         SDL_Rect thumb_h = { (int)thumb_x, win_h - SCROLLBAR_SIZE + 2, (int)thumb_w_sz, SCROLLBAR_SIZE - 4 };
-        SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
+        SDL_SetRenderDrawColor(ren, 55, 50, 68, 255);
         SDL_RenderFillRect(ren, &thumb_h);
+        draw_purple_border_rect(ren, &thumb_h, false, false);
 
         SDL_Rect bar_v = { win_w - SCROLLBAR_SIZE, header_top_y, SCROLLBAR_SIZE, view_h };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &bar_v);
+        draw_purple_border_rect(ren, &bar_v, false, true);
 
         float thumb_h_sz = (max_h_tracks > 0) ? fmaxf(30.0f, (float)view_h * ((float)view_h / max_h_tracks)) : view_h;
         float thumb_y = header_top_y + (max_h_tracks > view_h ? ((float)p->scroll_y_px / (max_h_tracks - view_h)) * (view_h - thumb_h_sz) : 0);
         SDL_Rect thumb_v = { win_w - SCROLLBAR_SIZE + 2, (int)thumb_y, SCROLLBAR_SIZE - 4, (int)thumb_h_sz };
-        SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
+        SDL_SetRenderDrawColor(ren, 55, 50, 68, 255);
         SDL_RenderFillRect(ren, &thumb_v);
+        draw_purple_border_rect(ren, &thumb_v, false, false);
 
-        // Marker Right-Click Context Menu ("Delete Marker")
+        // Marker Right-Click Context Menu ("Delete Marker") with Purple Border
         if (g_marker_context_menu_open && g_marker_context_target_idx >= 0 && g_marker_context_target_idx < p->num_markers) {
             SDL_Rect cm_box = { g_marker_context_x, g_marker_context_y, 128, 28 };
-            SDL_SetRenderDrawColor(ren, 28, 28, 32, 255);
+            SDL_SetRenderDrawColor(ren, 28, 26, 36, 255);
             SDL_RenderFillRect(ren, &cm_box);
-            SDL_SetRenderDrawColor(ren, 185, 65, 65, 255);
-            SDL_RenderDrawRect(ren, &cm_box);
+            draw_purple_border_rect(ren, &cm_box, true, false);
             draw_text(ren, "Delete Marker", g_marker_context_x + 12, g_marker_context_y + 8, c_white);
         }
 
-        // 7. Action Menu
+        // 7. Action Menu (with Purple Border)
         if (g_daw.menu_action_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
             SDL_Rect a_box = { 56, m_start, 134, 56 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &a_box);
-            SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
-            SDL_RenderDrawRect(ren, &a_box);
+            draw_purple_border_rect(ren, &a_box, false, false);
             draw_text(ren, "Lua Scripts...", 64, m_start + 8, c_white);
             draw_text(ren, "Python Scripts...", 64, m_start + 32, c_white);
         }
 
-        // Script Manager
+        // Script Manager (with Purple Borders)
         if (g_daw.script_manager_open) {
             SDL_Rect *sr = &g_daw.script_win_rect;
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, sr);
-            SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
-            SDL_RenderDrawRect(ren, sr);
+            draw_purple_border_rect(ren, sr, false, false);
 
             SDL_Rect s_hdr = { sr->x, sr->y, sr->w, 26 };
             SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
             SDL_RenderFillRect(ren, &s_hdr);
+            draw_purple_border_rect(ren, &s_hdr, false, false);
 
             char win_title[64];
             snprintf(win_title, sizeof(win_title), "%s Script Manager", g_daw.script_manager_is_python ? "Python" : "Lua");
@@ -2033,13 +2188,15 @@ int main(int argc, char *argv[]) {
             SDL_Rect list_box = { sr->x + 12, sr->y + 34, sr->w - 24, 180 };
             SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
             SDL_RenderFillRect(ren, &list_box);
+            draw_purple_border_rect(ren, &list_box, false, false);
 
             for (int s = 0; s < g_daw.num_scripts; s++) {
                 int sy = sr->y + 38 + (s * 22);
                 if (s == g_daw.script_selected_idx) {
                     SDL_Rect s_row = { sr->x + 14, sy - 2, sr->w - 28, 20 };
-                    SDL_SetRenderDrawColor(ren, 48, 48, 48, 255);
+                    SDL_SetRenderDrawColor(ren, 48, 42, 62, 255);
                     SDL_RenderFillRect(ren, &s_row);
+                    draw_purple_border_rect(ren, &s_row, false, false);
                 }
                 draw_text(ren, g_daw.scripts[s].name, sr->x + 18, sy + 2, c_white);
                 draw_text(ren, g_daw.scripts[s].shortcut, sr->x + sr->w - 70, sy + 2, c_white);
@@ -2049,27 +2206,29 @@ int main(int argc, char *argv[]) {
             SDL_Rect btn_add_sc = { sr->x + 12, by, 92, 28 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &btn_add_sc);
+            draw_purple_border_rect(ren, &btn_add_sc, false, false);
             draw_text(ren, "Add Script", sr->x + 18, by + 8, c_white);
 
             SDL_Rect btn_run_sc = { sr->x + 114, by, 92, 28 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &btn_run_sc);
+            draw_purple_border_rect(ren, &btn_run_sc, false, false);
             draw_text(ren, "Run Script", sr->x + 120, by + 8, c_white);
 
             SDL_Rect btn_del_sc = { sr->x + 216, by, 92, 28 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &btn_del_sc);
+            draw_purple_border_rect(ren, &btn_del_sc, false, false);
             draw_text(ren, "Delete", sr->x + 236, by + 8, c_white);
         }
 
-        // File Menu
+        // File Menu (with Purple Borders)
         if (g_daw.menu_file_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
             SDL_Rect m_box = { 8, m_start, 192, 146 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &m_box);
-            SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
-            SDL_RenderDrawRect(ren, &m_box);
+            draw_purple_border_rect(ren, &m_box, false, false);
 
             draw_text(ren, "Import Project (.ehs)", 16, m_start + 6, c_white);
             draw_text(ren, "Export Project (.ehs)", 16, m_start + 30, c_white);
@@ -2082,8 +2241,7 @@ int main(int argc, char *argv[]) {
                 SDL_Rect sub_a = { 200, m_start + 76, 110, 94 };
                 SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
                 SDL_RenderFillRect(ren, &sub_a);
-                SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
-                SDL_RenderDrawRect(ren, &sub_a);
+                draw_purple_border_rect(ren, &sub_a, false, false);
                 draw_text(ren, ".WAV Audio", 208, m_start + 82, c_white);
                 draw_text(ren, ".MP3 Audio", 208, m_start + 104, c_white);
                 draw_text(ren, ".FLAC Audio", 208, m_start + 126, c_white);
@@ -2094,8 +2252,7 @@ int main(int argc, char *argv[]) {
                 SDL_Rect sub_v = { 200, m_start + 100, 110, 94 };
                 SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
                 SDL_RenderFillRect(ren, &sub_v);
-                SDL_SetRenderDrawColor(ren, 60, 60, 60, 255);
-                SDL_RenderDrawRect(ren, &sub_v);
+                draw_purple_border_rect(ren, &sub_v, false, false);
                 draw_text(ren, ".MP4 Video", 208, m_start + 106, c_white);
                 draw_text(ren, ".MKV Video", 208, m_start + 128, c_white);
                 draw_text(ren, ".MOV Video", 208, m_start + 150, c_white);
@@ -2103,7 +2260,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Floating Video Monitor (With Black Gap Handling)
+        // Floating Video Monitor (With Black Gap Handling & Purple Borders)
         if (p->video.is_open) {
             SDL_Rect s_rect = { p->video.rect.x + 4, p->video.rect.y + 4, p->video.rect.w, p->video.rect.h };
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
@@ -2112,6 +2269,7 @@ int main(int argc, char *argv[]) {
             SDL_Rect v_bar = { p->video.rect.x, p->video.rect.y, p->video.rect.w, 24 };
             SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
             SDL_RenderFillRect(ren, &v_bar);
+            draw_purple_border_rect(ren, &v_bar, false, false);
 
             draw_text(ren, "Video Monitor", p->video.rect.x + 8, p->video.rect.y + 7, c_white);
             draw_text(ren, "X", p->video.rect.x + p->video.rect.w - 18, p->video.rect.y + 7, c_white);
@@ -2127,13 +2285,14 @@ int main(int argc, char *argv[]) {
             } else if (!p->video.texture) {
                 draw_text(ren, "No Video Stream Loaded", p->video.rect.x + 120, p->video.rect.y + 140, c_muted);
             }
+            draw_purple_border_rect(ren, &v_canvas, false, false);
 
             SDL_Rect resize_handle = { p->video.rect.x + p->video.rect.w - 12, p->video.rect.y + p->video.rect.h - 12, 10, 10 };
-            SDL_SetRenderDrawColor(ren, 100, 100, 100, 255);
+            SDL_SetRenderDrawColor(ren, 140, 84, 208, 255);
             SDL_RenderFillRect(ren, &resize_handle);
         }
 
-        // 8. Save Confirmation Dialog Modal
+        // 8. Save Confirmation Dialog Modal (with Purple Borders)
         if (g_daw.save_prompt_open) {
             SDL_Rect dim_overlay = { 0, 0, win_w, win_h };
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -2148,8 +2307,7 @@ int main(int argc, char *argv[]) {
             SDL_Rect dia_rect = { dia_x, dia_y, dia_w, dia_h };
             SDL_SetRenderDrawColor(ren, 30, 30, 30, 255);
             SDL_RenderFillRect(ren, &dia_rect);
-            SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
-            SDL_RenderDrawRect(ren, &dia_rect);
+            draw_purple_border_rect(ren, &dia_rect, true, false);
 
             draw_text(ren, "Save changes before closing?", dia_x + 18, dia_y + 18, c_white);
 
@@ -2163,20 +2321,23 @@ int main(int argc, char *argv[]) {
 
             // [ Save ]
             SDL_Rect b_save = { dia_x + 18, btn_y, 100, 30 };
-            SDL_SetRenderDrawColor(ren, 26, 86, 219, 255);
+            SDL_SetRenderDrawColor(ren, 62, 42, 96, 255);
             SDL_RenderFillRect(ren, &b_save);
+            draw_purple_border_rect(ren, &b_save, true, false);
             draw_text(ren, "Save", dia_x + 52, btn_y + 8, c_white);
 
             // [ Don't Save ]
             SDL_Rect b_discard = { dia_x + 130, btn_y, 120, 30 };
             SDL_SetRenderDrawColor(ren, 55, 55, 55, 255);
             SDL_RenderFillRect(ren, &b_discard);
+            draw_purple_border_rect(ren, &b_discard, false, false);
             draw_text(ren, "Don't Save", dia_x + 148, btn_y + 8, c_white);
 
             // [ Cancel ]
             SDL_Rect b_cancel = { dia_x + 262, btn_y, 100, 30 };
             SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
             SDL_RenderFillRect(ren, &b_cancel);
+            draw_purple_border_rect(ren, &b_cancel, false, false);
             draw_text(ren, "Cancel", dia_x + 292, btn_y + 8, c_white);
         }
 
