@@ -23,6 +23,177 @@ static SDL_Cursor *g_cursor_size_we = NULL;
 static SDL_Cursor *g_cursor_size_ns = NULL;
 static SDL_Cursor *g_cursor_ibeam = NULL;
 
+// Per-tab Crossfade mode state (true = Crossfade ON, false = Crossfade OFF / edge-touch only)
+static bool g_tab_crossfade[MAX_TABS] = { true, true, true, true, true, true, true, true };
+
+static inline bool is_crossfade_active(void) {
+    int idx = g_daw.active_tab;
+    if (idx < 0 || idx >= MAX_TABS) idx = 0;
+    return g_tab_crossfade[idx];
+}
+
+static inline void set_crossfade_active(bool active) {
+    int idx = g_daw.active_tab;
+    if (idx < 0 || idx >= MAX_TABS) idx = 0;
+    g_tab_crossfade[idx] = active;
+}
+
+// Computes equal-power crossfade gain (sin/cos S-law) and micro de-click ramps at sample time t_sec
+static float compute_item_crossfade_gain(ProjectTab *p, int item_idx, double t_sec, bool crossfade_on) {
+    AudioItem *it = &p->items[item_idx];
+    double it_s = it->start_time;
+    double it_e = it->start_time + it->duration;
+    if (t_sec < it_s || t_sec > it_e) return 0.0f;
+
+    float env = 1.0f;
+    bool has_left_xfade = false;
+    bool has_right_xfade = false;
+
+    if (crossfade_on) {
+        for (int o = 0; o < p->num_items; o++) {
+            if (o == item_idx) continue;
+            AudioItem *ot = &p->items[o];
+            if (ot->track_idx != it->track_idx) continue;
+
+            double ot_s = ot->start_time;
+            double ot_e = ot->start_time + ot->duration;
+            double ov_s = fmax(it_s, ot_s);
+            double ov_e = fmin(it_e, ot_e);
+
+            if (ov_e > ov_s + 0.0005) {
+                bool ot_is_earlier = (ot_s < it_s - 1e-6) || (fabs(ot_s - it_s) <= 1e-6 && o < item_idx);
+                if (ot_is_earlier) {
+                    has_left_xfade = true;
+                    if (t_sec >= ov_s && t_sec <= ov_e) {
+                        float u = (float)((t_sec - ov_s) / (ov_e - ov_s));
+                        if (u < 0.0f) u = 0.0f;
+                        if (u > 1.0f) u = 1.0f;
+                        // Standard Equal-Power (Constant-Power) Fade-In: sin(u * pi/2)
+                        env *= sinf(u * 1.57079632679f);
+                    }
+                } else {
+                    has_right_xfade = true;
+                    if (t_sec >= ov_s && t_sec <= ov_e) {
+                        float u = (float)((t_sec - ov_s) / (ov_e - ov_s));
+                        if (u < 0.0f) u = 0.0f;
+                        if (u > 1.0f) u = 1.0f;
+                        // Standard Equal-Power (Constant-Power) Fade-Out: cos(u * pi/2)
+                        env *= cosf(u * 1.57079632679f);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2ms anti-click ramp on non-crossfaded hard cuts / touching edges
+    const double edge_ramp = 0.002;
+    if (!has_left_xfade && (t_sec - it_s) < edge_ramp && it->duration > edge_ramp * 2.0) {
+        float u = (float)((t_sec - it_s) / edge_ramp);
+        if (u >= 0.0f && u < 1.0f) env *= u;
+    }
+    if (!has_right_xfade && (it_e - t_sec) < edge_ramp && it->duration > edge_ramp * 2.0) {
+        float u = (float)((it_e - t_sec) / edge_ramp);
+        if (u >= 0.0f && u < 1.0f) env *= u;
+    }
+
+    return env;
+}
+
+// Checks whether interval [start_t, start_t + dur] overlaps any clip on track_idx (excluding ignore_idx)
+static bool interval_overlaps_on_track(ProjectTab *p, int ignore_idx, int track_idx, double start_t, double dur) {
+    double end_t = start_t + dur;
+    const double eps = 1e-6;
+    for (int i = 0; i < p->num_items; i++) {
+        if (i == ignore_idx) continue;
+        AudioItem *ot = &p->items[i];
+        if (ot->track_idx != track_idx) continue;
+        double ot_s = ot->start_time;
+        double ot_e = ot->start_time + ot->duration;
+        if (start_t < ot_e - eps && end_t > ot_s + eps) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// When Crossfade is OFF, clamps a dragged/placed clip's start_time so it touches edges without overlapping
+static double clamp_non_overlapping_start(ProjectTab *p, int item_idx, int track_idx, double desired_start, double dur) {
+    if (desired_start < 0.0) desired_start = 0.0;
+    if (!interval_overlaps_on_track(p, item_idx, track_idx, desired_start, dur)) {
+        return desired_start;
+    }
+
+    double best_start = -1.0;
+    double best_dist = 1e18;
+
+    // Candidate 0: timeline start (0.0)
+    if (!interval_overlaps_on_track(p, item_idx, track_idx, 0.0, dur)) {
+        best_start = 0.0;
+        best_dist = fabs(desired_start - 0.0);
+    }
+
+    // Candidates: touching left edge (ot_s - dur) or right edge (ot_e) of every clip on the same track
+    for (int i = 0; i < p->num_items; i++) {
+        if (i == item_idx) continue;
+        AudioItem *ot = &p->items[i];
+        if (ot->track_idx != track_idx) continue;
+
+        double cand_left = ot->start_time - dur;
+        if (cand_left >= 0.0 && !interval_overlaps_on_track(p, item_idx, track_idx, cand_left, dur)) {
+            double d = fabs(desired_start - cand_left);
+            if (d < best_dist) {
+                best_dist = d;
+                best_start = cand_left;
+            }
+        }
+
+        double cand_right = ot->start_time + ot->duration;
+        if (cand_right >= 0.0 && !interval_overlaps_on_track(p, item_idx, track_idx, cand_right, dur)) {
+            double d = fabs(desired_start - cand_right);
+            if (d < best_dist) {
+                best_dist = d;
+                best_start = cand_right;
+            }
+        }
+    }
+
+    return (best_start >= 0.0) ? best_start : desired_start;
+}
+
+// Resolves any existing overlaps on all tracks by snapping overlapping clips edge-to-edge
+static void resolve_all_track_overlaps_edge_to_edge(ProjectTab *p) {
+    if (!p) return;
+    for (int t = 0; t < p->num_tracks; t++) {
+        int idxs[MAX_ITEMS];
+        int cnt = 0;
+        for (int i = 0; i < p->num_items; i++) {
+            if (p->items[i].track_idx == t) {
+                idxs[cnt++] = i;
+            }
+        }
+        // Sort clips on track t by start_time
+        for (int a = 0; a < cnt - 1; a++) {
+            for (int b = a + 1; b < cnt; b++) {
+                if (p->items[idxs[b]].start_time < p->items[idxs[a]].start_time) {
+                    int tmp = idxs[a];
+                    idxs[a] = idxs[b];
+                    idxs[b] = tmp;
+                }
+            }
+        }
+        // Push any overlapping clip so its left edge touches the preceding clip's right edge
+        for (int k = 1; k < cnt; k++) {
+            AudioItem *prev = &p->items[idxs[k - 1]];
+            AudioItem *curr = &p->items[idxs[k]];
+            double prev_end = prev->start_time + prev->duration;
+            if (curr->start_time < prev_end) {
+                curr->start_time = prev_end;
+                p->is_dirty = true;
+            }
+        }
+    }
+}
+
 void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
     DawEngine *eng = (DawEngine *)userdata;
     if (eng->num_tabs <= 0) return;
@@ -38,6 +209,7 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
         if (p->tracks[t].solo) { any_solo = true; break; }
     }
 
+    bool xfade_on = g_tab_crossfade[eng->active_tab >= 0 && eng->active_tab < MAX_TABS ? eng->active_tab : 0];
     double st = p->playhead_seconds;
     double et = st + ((double)frames_needed / SAMPLE_RATE);
 
@@ -54,15 +226,35 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
         double it_e = it->start_time + it->duration;
 
         if (it_e > st && it_s < et) {
-            int64_t sample_offset = (int64_t)(((st - it_s) + it->offset_in_file) * SAMPLE_RATE);
-            if (sample_offset >= 0) {
-                fseek(it->raw_file_handle, sample_offset * sizeof(float) * 2, SEEK_SET);
-                float chunk[1024 * 2];
-                size_t read_frames = fread(chunk, sizeof(float) * 2, frames_needed, it->raw_file_handle);
-                for (size_t f = 0; f < read_frames; f++) {
-                    out[f * 2]     += chunk[f * 2] * linear_gain;
-                    out[f * 2 + 1] += chunk[f * 2 + 1] * linear_gain;
-                }
+            int f_start = 0;
+            if (it_s > st) {
+                f_start = (int)((it_s - st) * SAMPLE_RATE);
+                if (f_start < 0) f_start = 0;
+                if (f_start >= frames_needed) continue;
+            }
+            int f_end = frames_needed;
+            if (it_e < et) {
+                f_end = (int)((it_e - st) * SAMPLE_RATE);
+                if (f_end > frames_needed) f_end = frames_needed;
+                if (f_end <= f_start) continue;
+            }
+
+            int frames_to_read = f_end - f_start;
+            double clip_start_t = st + ((double)f_start / SAMPLE_RATE);
+            int64_t sample_offset = (int64_t)(((clip_start_t - it_s) + it->offset_in_file) * SAMPLE_RATE);
+            if (sample_offset < 0) sample_offset = 0;
+
+            fseek(it->raw_file_handle, (long)(sample_offset * sizeof(float) * 2), SEEK_SET);
+            float chunk[1024 * 2];
+            if (frames_to_read > 1024) frames_to_read = 1024;
+            size_t read_frames = fread(chunk, sizeof(float) * 2, (size_t)frames_to_read, it->raw_file_handle);
+            for (size_t f = 0; f < read_frames; f++) {
+                int out_idx = f_start + (int)f;
+                double sample_t = st + ((double)out_idx / SAMPLE_RATE);
+                float xfade_gain = compute_item_crossfade_gain(p, i, sample_t, xfade_on);
+                float total_gain = linear_gain * xfade_gain;
+                out[out_idx * 2]     += chunk[f * 2]     * total_gain;
+                out[out_idx * 2 + 1] += chunk[f * 2 + 1] * total_gain;
             }
         }
     }
@@ -277,11 +469,15 @@ int main(int argc, char *argv[]) {
 
                 if (p->num_items < MAX_ITEMS) {
                     push_undo_state();
-                    AudioItem *it = &p->items[p->num_items];
+                    int new_idx = p->num_items;
+                    AudioItem *it = &p->items[new_idx];
                     memset(it, 0, sizeof(AudioItem));
                     it->track_idx = trk;
                     it->start_time = p->playhead_seconds;
                     if (process_media_cache(file, it) == 0) {
+                        if (!is_crossfade_active()) {
+                            it->start_time = clamp_non_overlapping_start(p, new_idx, trk, it->start_time, it->duration);
+                        }
                         p->num_items++;
                         if (it->has_video) {
                             open_video_by_path(&p->video, it->file_path, ren);
@@ -454,6 +650,7 @@ int main(int argc, char *argv[]) {
                     if (!clicked_tab && mx >= cur_tab_x && mx <= cur_tab_x + add_btn_w && g_daw.num_tabs < MAX_TABS) {
                         char name[64]; snprintf(name, sizeof(name), "Project %d", g_daw.num_tabs + 1);
                         init_tab_defaults(g_daw.num_tabs, name);
+                        g_tab_crossfade[g_daw.num_tabs] = true;
                         g_daw.active_tab = g_daw.num_tabs++;
                     }
                     continue;
@@ -527,11 +724,15 @@ int main(int argc, char *argv[]) {
                             if (open_generic_dialog(pth, sizeof(pth), "Media Files\0*.wav;*.mp3;*.flac;*.mp4;*.mkv;*.mov;*.avi;*.webm\0All Files (*.*)\0*.*\0", false)) {
                                 if (p->num_items < MAX_ITEMS) {
                                     push_undo_state();
-                                    AudioItem *it = &p->items[p->num_items];
+                                    int new_idx = p->num_items;
+                                    AudioItem *it = &p->items[new_idx];
                                     memset(it, 0, sizeof(AudioItem));
                                     it->track_idx = 0;
                                     it->start_time = p->playhead_seconds;
                                     if (process_media_cache(pth, it) == 0) {
+                                        if (!is_crossfade_active()) {
+                                            it->start_time = clamp_non_overlapping_start(p, new_idx, 0, it->start_time, it->duration);
+                                        }
                                         p->num_items++;
                                         if (it->has_video) {
                                             open_video_by_path(&p->video, it->file_path, ren);
@@ -586,6 +787,14 @@ int main(int argc, char *argv[]) {
                         p->show_marker_lane = !p->show_marker_lane;
                     }
                     else if (mx >= 192 && mx <= 284) p->video.is_open = !p->video.is_open;
+                    else if (mx >= 288 && mx <= 412) {
+                        bool next_xfade = !is_crossfade_active();
+                        set_crossfade_active(next_xfade);
+                        if (!next_xfade) {
+                            push_undo_state();
+                            resolve_all_track_overlaps_edge_to_edge(p);
+                        }
+                    }
                     else if (mx >= win_w - 228 && mx < win_w - 176) perform_undo();
                     else if (mx >= win_w - 172 && mx < win_w - 120) perform_redo();
                     else if (mx >= win_w - 116 && mx < win_w - 60) p->pixels_per_second = fmaxf(15.0f, p->pixels_per_second * 0.8f);
@@ -726,6 +935,7 @@ int main(int argc, char *argv[]) {
                         AudioItem *it = &p->items[i];
                         if (it->track_idx == click_track && click_time >= it->start_time && click_time <= it->start_time + it->duration) {
                             clicked_clip = true;
+                            push_undo_state();
                             if (ctrl_pressed) it->is_selected = !it->is_selected;
                             else if (!shift_pressed && !it->is_selected) {
                                 for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
@@ -878,21 +1088,63 @@ int main(int argc, char *argv[]) {
                     AudioItem *it = &p->items[dragging_item_idx];
                     double cur_mouse_time = p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second;
                     double delta_t = cur_mouse_time - drag_start_mouse_time;
+                    bool xfade_on = is_crossfade_active();
 
                     if (dragging_trim_left) {
-                        if (item_orig_dur - delta_t > 0.1) {
-                            it->start_time = item_orig_start + delta_t;
-                            it->duration = item_orig_dur - delta_t;
-                            it->offset_in_file = item_orig_offset + delta_t;
+                        double new_start = item_orig_start + delta_t;
+                        if (new_start < 0.0) new_start = 0.0;
+                        if (item_orig_offset + (new_start - item_orig_start) < 0.0) {
+                            new_start = item_orig_start - item_orig_offset;
+                        }
+                        if (!xfade_on) {
+                            // Clamp left trim so it stops at the right edge of any preceding clip on the same track
+                            for (int o = 0; o < p->num_items; o++) {
+                                if (o == dragging_item_idx) continue;
+                                AudioItem *ot = &p->items[o];
+                                if (ot->track_idx != it->track_idx) continue;
+                                double ot_e = ot->start_time + ot->duration;
+                                if (ot_e <= item_orig_start + 1e-5 && new_start < ot_e) {
+                                    new_start = ot_e;
+                                }
+                            }
+                        }
+                        double adj_delta = new_start - item_orig_start;
+                        if (item_orig_dur - adj_delta > 0.1) {
+                            it->start_time = new_start;
+                            it->duration = item_orig_dur - adj_delta;
+                            it->offset_in_file = item_orig_offset + adj_delta;
                         }
                     } else if (dragging_trim_right) {
-                        if (item_orig_dur + delta_t > 0.1) it->duration = item_orig_dur + delta_t;
+                        double new_dur = item_orig_dur + delta_t;
+                        if (it->file_total_duration > 0.0 && it->offset_in_file + new_dur > it->file_total_duration) {
+                            new_dur = it->file_total_duration - it->offset_in_file;
+                        }
+                        if (!xfade_on) {
+                            // Clamp right trim so it stops at the left edge of any following clip on the same track
+                            for (int o = 0; o < p->num_items; o++) {
+                                if (o == dragging_item_idx) continue;
+                                AudioItem *ot = &p->items[o];
+                                if (ot->track_idx != it->track_idx) continue;
+                                if (ot->start_time >= item_orig_start + item_orig_dur - 1e-5) {
+                                    double max_dur = ot->start_time - it->start_time;
+                                    if (new_dur > max_dur) new_dur = max_dur;
+                                }
+                            }
+                        }
+                        if (new_dur > 0.1) it->duration = new_dur;
                     } else {
-                        it->start_time = fmax(0.0, item_orig_start + delta_t);
+                        int target_trk = it->track_idx;
                         int cur_y = header_top_y - p->scroll_y_px;
                         for (int t = 0; t < p->num_tracks; t++) {
-                            if (my >= cur_y && my < cur_y + p->track_heights[t]) { it->track_idx = t; break; }
+                            if (my >= cur_y && my < cur_y + p->track_heights[t]) { target_trk = t; break; }
                             cur_y += p->track_heights[t];
+                        }
+                        double desired_start = fmax(0.0, item_orig_start + delta_t);
+                        it->track_idx = target_trk;
+                        if (!xfade_on) {
+                            it->start_time = clamp_non_overlapping_start(p, dragging_item_idx, target_trk, desired_start, it->duration);
+                        } else {
+                            it->start_time = desired_start;
                         }
                     }
                 }
@@ -993,6 +1245,14 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(ren, p->video.is_open ? 55 : 40, p->video.is_open ? 55 : 40, p->video.is_open ? 55 : 40, 255);
         SDL_RenderFillRect(ren, &v_menu);
         draw_text(ren, "View:Video", 200, TABBAR_HEIGHT + 13, c_white);
+
+        bool xfade_active = is_crossfade_active();
+        SDL_Rect xfade_btn = { 288, TABBAR_HEIGHT + 5, 124, 26 };
+        SDL_SetRenderDrawColor(ren, xfade_active ? 28 : 40, xfade_active ? 82 : 40, xfade_active ? 62 : 40, 255);
+        SDL_RenderFillRect(ren, &xfade_btn);
+        SDL_SetRenderDrawColor(ren, xfade_active ? 64 : 60, xfade_active ? 160 : 60, xfade_active ? 115 : 60, 255);
+        SDL_RenderDrawRect(ren, &xfade_btn);
+        draw_text(ren, xfade_active ? "Crossfade: ON" : "Crossfade: OFF", 294, TABBAR_HEIGHT + 13, c_white);
 
         char clock_buf[32];
         format_timecode(p->playhead_seconds, clock_buf, sizeof(clock_buf));
@@ -1123,7 +1383,27 @@ int main(int argc, char *argv[]) {
             SDL_RenderDrawLine(ren, g_daw.tcp_width, track_cur_y, g_daw.tcp_width + view_w, track_cur_y);
         }
 
-        // 5. Render Clips
+        // 5. Render Clips (Pass 1A: Clip Backgrounds, Pass 1B: Faded Waveforms & Labels, Pass 2: Standard Studio Crossfade Overlays)
+        for (int i = 0; i < p->num_items; i++) {
+            AudioItem *it = &p->items[i];
+            int iy = get_track_y_pos(it->track_idx) + 2;
+            int ih = p->track_heights[it->track_idx] - 4;
+            int ix = g_daw.tcp_width + (int)((it->start_time - p->scroll_x_sec) * p->pixels_per_second);
+            int iw = (int)(it->duration * p->pixels_per_second);
+
+            if (ix + iw < g_daw.tcp_width || ix > g_daw.tcp_width + view_w) continue;
+
+            SDL_Rect clip_r = { ix, iy, iw, ih };
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 46 : 34, it->is_selected ? 50 : 36, it->is_selected ? 56 : 40, 255);
+            SDL_RenderFillRect(ren, &clip_r);
+
+            // Subtle header strip at the top of each clip
+            SDL_Rect hdr_r = { ix, iy, iw, 18 };
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 60 : 42, it->is_selected ? 68 : 45, it->is_selected ? 78 : 52, 255);
+            SDL_RenderFillRect(ren, &hdr_r);
+        }
+
+        // Pass 1B: Render Waveforms (attenuated by equal-power crossfade envelope inside overlap zones), Borders & Labels
         for (int i = 0; i < p->num_items; i++) {
             AudioItem *it = &p->items[i];
             int iy = get_track_y_pos(it->track_idx) + 2;
@@ -1134,59 +1414,158 @@ int main(int argc, char *argv[]) {
             if (ix + iw < g_daw.tcp_width || ix > g_daw.tcp_width + view_w) continue;
 
             float gain_multiplier = db_to_linear(p->track_db[it->track_idx]);
-
-            SDL_Rect clip_r = { ix, iy, iw, ih };
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 48 : 34, it->is_selected ? 48 : 34, it->is_selected ? 48 : 34, 255);
-            SDL_RenderFillRect(ren, &clip_r);
-            SDL_SetRenderDrawColor(ren, it->is_selected ? 180 : 80, it->is_selected ? 180 : 80, it->is_selected ? 180 : 80, 255);
-            SDL_RenderDrawRect(ren, &clip_r);
-
-            for (int o = 0; o < p->num_items; o++) {
-                if (o == i) continue;
-                AudioItem *ot = &p->items[o];
-                if (ot->track_idx == it->track_idx && ot->start_time < it->start_time) {
-                    double overlap_s = it->start_time;
-                    double overlap_e = fmin(it->start_time + it->duration, ot->start_time + ot->duration);
-                    if (overlap_e > overlap_s) {
-                        int ox = g_daw.tcp_width + (int)((overlap_s - p->scroll_x_sec) * p->pixels_per_second);
-                        int ow = (int)((overlap_e - overlap_s) * p->pixels_per_second);
-                        SDL_SetRenderDrawColor(ren, 185, 30, 30, 255);
-                        for (int px = 0; px < ow; px++) {
-                            float factor = (float)px / (float)ow;
-                            int y_fade_in = iy + ih - (int)(sinf(factor * 1.57079f) * ih);
-                            int y_fade_out = iy + (int)(sinf(factor * 1.57079f) * ih);
-                            SDL_RenderDrawPoint(ren, ox + px, y_fade_in);
-                            SDL_RenderDrawPoint(ren, ox + px, y_fade_out);
-                        }
-                    }
-                }
-            }
-
             int mid_y = iy + ih / 2;
-            SDL_SetRenderDrawColor(ren, 200, 200, 200, 255);
+
+            // Zero-line center axis
+            SDL_SetRenderDrawColor(ren, 52, 55, 60, 255);
+            SDL_RenderDrawLine(ren, ix, mid_y, ix + iw, mid_y);
 
             if (it->peaks && it->peak_count > 0) {
                 for (int col = 0; col < iw; col++) {
                     int px = ix + col;
                     if (px < g_daw.tcp_width || px > g_daw.tcp_width + view_w) continue;
 
-                    double cur_item_sec = it->offset_in_file + ((double)col / p->pixels_per_second);
+                    double rel_sec = (double)col / p->pixels_per_second;
+                    double timeline_sec = it->start_time + rel_sec;
+                    double cur_item_sec = it->offset_in_file + rel_sec;
                     int bin_idx = (int)((cur_item_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
 
                     if (bin_idx >= 0 && bin_idx < it->peak_count) {
-                        float mn = it->peaks[bin_idx].min_val * gain_multiplier;
-                        float mx = it->peaks[bin_idx].max_val * gain_multiplier;
+                        float xfade_env = compute_item_crossfade_gain(p, i, timeline_sec, xfade_active);
+                        float env_gain = gain_multiplier * xfade_env;
+                        float mn = it->peaks[bin_idx].min_val * env_gain;
+                        float mx = it->peaks[bin_idx].max_val * env_gain;
 
-                        int y1 = mid_y - (int)(mx * (ih / 2.0f - 2));
-                        int y2 = mid_y - (int)(mn * (ih / 2.0f - 2));
-                        if (y1 < iy) y1 = iy;
-                        if (y2 > iy + ih) y2 = iy + ih;
+                        int y1 = mid_y - (int)(mx * (ih / 2.0f - 4));
+                        int y2 = mid_y - (int)(mn * (ih / 2.0f - 4));
+                        if (y1 < iy + 2) y1 = iy + 2;
+                        if (y2 > iy + ih - 2) y2 = iy + ih - 2;
                         if (y1 == y2) y2 += 1;
+
+                        if (xfade_env < 0.999f) {
+                            SDL_SetRenderDrawColor(ren, 165, 205, 225, 255);
+                        } else {
+                            SDL_SetRenderDrawColor(ren, 196, 202, 210, 255);
+                        }
                         SDL_RenderDrawLine(ren, px, y1, px, y2);
                     }
                 }
             }
-            draw_text(ren, it->label, ix + 6, iy + 6, c_white);
+
+            SDL_Rect clip_r = { ix, iy, iw, ih };
+            SDL_SetRenderDrawColor(ren, it->is_selected ? 190 : 82, it->is_selected ? 200 : 86, it->is_selected ? 215 : 94, 255);
+            SDL_RenderDrawRect(ren, &clip_r);
+
+            draw_text(ren, it->label, ix + 6, iy + 4, c_white);
+        }
+
+        // Pass 2: Standard Audio Editing Crossfade Box & Equal-Power X-Curves on Overlapping Clips
+        if (xfade_active) {
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+            for (int i = 0; i < p->num_items; i++) {
+                AudioItem *it = &p->items[i];
+                double it_s = it->start_time;
+                double it_e = it->start_time + it->duration;
+
+                for (int o = 0; o < p->num_items; o++) {
+                    if (o == i) continue;
+                    AudioItem *ot = &p->items[o];
+                    if (ot->track_idx != it->track_idx) continue;
+
+                    double ot_s = ot->start_time;
+                    double ot_e = ot->start_time + ot->duration;
+
+                    // Process each ordered pair once (ot = outgoing earlier clip, it = incoming later clip)
+                    bool ot_is_earlier = (ot_s < it_s - 1e-6) || (fabs(ot_s - it_s) <= 1e-6 && o < i);
+                    if (!ot_is_earlier) continue;
+
+                    double overlap_s = it_s;
+                    double overlap_e = fmin(it_e, ot_e);
+                    if (overlap_e <= overlap_s + 0.001) continue;
+
+                    int iy = get_track_y_pos(it->track_idx) + 2;
+                    int ih = p->track_heights[it->track_idx] - 4;
+                    int ox = g_daw.tcp_width + (int)((overlap_s - p->scroll_x_sec) * p->pixels_per_second);
+                    int ox_end = g_daw.tcp_width + (int)((overlap_e - p->scroll_x_sec) * p->pixels_per_second);
+                    int ow = ox_end - ox;
+                    if (ow < 2) ow = 2;
+
+                    if (ox + ow < g_daw.tcp_width || ox > g_daw.tcp_width + view_w) continue;
+
+                    // 1. Translucent crossfade zone highlight box
+                    SDL_Rect xf_box = { ox, iy, ow, ih };
+                    SDL_SetRenderDrawColor(ren, 245, 175, 55, 28);
+                    SDL_RenderFillRect(ren, &xf_box);
+
+                    int top_pad = iy + 3;
+                    int bot_pad = iy + ih - 4;
+                    int curve_h = bot_pad - top_pad;
+                    if (curve_h < 8) curve_h = 8;
+
+                    int prev_x = ox;
+                    int prev_y_out = top_pad;
+                    int prev_y_in  = bot_pad;
+
+                    // 2. Shade upper exterior region and draw continuous 2px Equal-Power S/Cosine Crossfade X-Curves
+                    for (int px = 0; px < ow; px++) {
+                        int cur_x = ox + px;
+                        float u = (ow > 1) ? ((float)px / (float)(ow - 1)) : 0.5f;
+
+                        // Equal-power / smooth S-curve envelope values in [0..1]
+                        float gain_out = cosf(u * 1.57079632679f);
+                        float gain_in  = sinf(u * 1.57079632679f);
+
+                        int y_out = bot_pad - (int)(gain_out * curve_h);
+                        int y_in  = bot_pad - (int)(gain_in  * curve_h);
+
+                        // Darken region above the active crossfade envelope (standard DAW crossfade shading)
+                        int y_top_env = (y_out < y_in) ? y_out : y_in;
+                        if (cur_x >= g_daw.tcp_width && cur_x <= g_daw.tcp_width + view_w && y_top_env > iy + 1) {
+                            SDL_SetRenderDrawColor(ren, 12, 14, 18, 115);
+                            SDL_RenderDrawLine(ren, cur_x, iy + 1, cur_x, y_top_env);
+                        }
+
+                        if (px > 0) {
+                            // Outgoing Fade-Out Curve (warm coral-amber)
+                            SDL_SetRenderDrawColor(ren, 245, 115, 75, 245);
+                            SDL_RenderDrawLine(ren, prev_x, prev_y_out, cur_x, y_out);
+                            SDL_RenderDrawLine(ren, prev_x, prev_y_out + 1, cur_x, y_out + 1);
+
+                            // Incoming Fade-In Curve (bright gold-cyan studio accent)
+                            SDL_SetRenderDrawColor(ren, 85, 215, 240, 245);
+                            SDL_RenderDrawLine(ren, prev_x, prev_y_in, cur_x, y_in);
+                            SDL_RenderDrawLine(ren, prev_x, prev_y_in + 1, cur_x, y_in + 1);
+                        }
+
+                        prev_x = cur_x;
+                        prev_y_out = y_out;
+                        prev_y_in  = y_in;
+                    }
+
+                    // 3. Crisp Crossfade Boundary Frame & Corner Handles
+                    SDL_SetRenderDrawColor(ren, 235, 175, 65, 215);
+                    SDL_RenderDrawRect(ren, &xf_box);
+
+                    // 4. Center Equal-Power Crossing Handle (-3dB intersection point at u = 0.5)
+                    int cross_x = ox + ow / 2;
+                    int cross_y = bot_pad - (int)(0.70710678f * curve_h);
+                    SDL_Rect cross_handle = { cross_x - 3, cross_y - 3, 6, 6 };
+                    SDL_SetRenderDrawColor(ren, 255, 235, 180, 255);
+                    SDL_RenderFillRect(ren, &cross_handle);
+
+                    // Top/bottom corner fade handles
+                    SDL_Rect h_tl = { ox, iy, 5, 5 };
+                    SDL_Rect h_tr = { ox + ow - 5, iy, 5, 5 };
+                    SDL_Rect h_bl = { ox, iy + ih - 5, 5, 5 };
+                    SDL_Rect h_br = { ox + ow - 5, iy + ih - 5, 5, 5 };
+                    SDL_SetRenderDrawColor(ren, 235, 175, 65, 255);
+                    SDL_RenderFillRect(ren, &h_tl);
+                    SDL_RenderFillRect(ren, &h_tr);
+                    SDL_RenderFillRect(ren, &h_bl);
+                    SDL_RenderFillRect(ren, &h_br);
+                }
+            }
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
         }
 
         if (marquee_selecting) {
