@@ -4,13 +4,23 @@
 #include <string.h>
 #include <math.h>
 
+static int64_t get_stream_start_pts(SimpleVideoPlayer *player) {
+    if (!player || !player->fmt_ctx || player->video_stream_idx < 0 ||
+        (unsigned int)player->video_stream_idx >= player->fmt_ctx->nb_streams) {
+        return 0;
+    }
+    int64_t st = player->fmt_ctx->streams[player->video_stream_idx]->start_time;
+    return (st != AV_NOPTS_VALUE) ? st : 0;
+}
+
 static double get_frame_pts_sec(SimpleVideoPlayer *player, double fallback_sec) {
     if (!player || !player->frame) return fallback_sec;
     int64_t ts = (player->frame->best_effort_timestamp != AV_NOPTS_VALUE)
                  ? player->frame->best_effort_timestamp
                  : player->frame->pts;
     if (ts == AV_NOPTS_VALUE) return fallback_sec;
-    double pts = (double)(ts - player->start_pts) * player->time_base;
+    int64_t start_pts = get_stream_start_pts(player);
+    double pts = (double)(ts - start_pts) * player->time_base;
     return (pts >= 0.0) ? pts : 0.0;
 }
 
@@ -140,7 +150,6 @@ int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Rend
     }
 
     player->time_base = av_q2d(stream->time_base);
-    player->start_pts = (stream->start_time != AV_NOPTS_VALUE) ? stream->start_time : 0;
 
     player->frame = av_frame_alloc();
     player->frame_rgb = av_frame_alloc();
@@ -222,7 +231,6 @@ void close_video(SimpleVideoPlayer *player) {
     }
 
     player->video_stream_idx = -1;
-    player->start_pts = 0;
     player->current_pts_sec = -1.0;
     player->is_open = false;
     player->has_active_frame = false;
@@ -239,7 +247,8 @@ void seek_video(SimpleVideoPlayer *player, double seconds) {
         return;
     }
 
-    int64_t target_pts = player->start_pts + (int64_t)(seconds / player->time_base);
+    int64_t start_pts = get_stream_start_pts(player);
+    int64_t target_pts = start_pts + (int64_t)(seconds / player->time_base);
     av_seek_frame(player->fmt_ctx, player->video_stream_idx, target_pts, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(player->codec_ctx);
 
