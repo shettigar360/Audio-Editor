@@ -97,8 +97,19 @@ AudioItem* get_active_video_clip_at_playhead(ProjectTab *p) {
     int top_track_idx = 999999;
     double cur_t = p->playhead_seconds;
 
+    bool any_solo = false;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->tracks[t].solo) { any_solo = true; break; }
+    }
+
     for (int i = 0; i < p->num_items; i++) {
         AudioItem *it = &p->items[i];
+        if (!it->has_video) continue;
+        if (it->track_idx >= 0 && it->track_idx < p->num_tracks) {
+            if (p->tracks[it->track_idx].mute) continue;
+            if (any_solo && !p->tracks[it->track_idx].solo) continue;
+        }
+
         double clip_start = it->start_time;
         double clip_end = it->start_time + it->duration;
 
@@ -267,12 +278,16 @@ int main(int argc, char *argv[]) {
                 if (p->num_items < MAX_ITEMS) {
                     push_undo_state();
                     AudioItem *it = &p->items[p->num_items];
+                    memset(it, 0, sizeof(AudioItem));
                     it->track_idx = trk;
                     it->start_time = p->playhead_seconds;
-                    if (process_media_cache(file, it) == 0) p->num_items++;
+                    if (process_media_cache(file, it) == 0) {
+                        p->num_items++;
+                        if (it->has_video) {
+                            open_video_by_path(&p->video, it->file_path, ren);
+                        }
+                    }
                 }
-                open_video_by_path(&p->video, file, ren);
-                strncpy(p->video.current_loaded_path, file, sizeof(p->video.current_loaded_path) - 1);
                 SDL_free(file);
             } else if (e.type == SDL_KEYDOWN) {
                 if (g_daw.save_prompt_open) {
@@ -341,7 +356,7 @@ int main(int argc, char *argv[]) {
                 }
                 else if (e.key.keysym.sym == SDLK_SPACE) p->is_playing = !p->is_playing;
                 else if (e.key.keysym.sym == SDLK_v) p->video.is_open = !p->video.is_open;
-                else if (e.key.keysym.sym == SDLK_HOME) { p->playhead_seconds = 0.0; seek_video(&p->video, 0.0); }
+                else if (e.key.keysym.sym == SDLK_HOME) { p->playhead_seconds = 0.0; }
                 else if (e.key.keysym.sym == SDLK_s && !(mod & KMOD_CTRL)) {
                     double cur_t = p->playhead_seconds;
                     for (int i = 0; i < p->num_items; i++) {
@@ -359,7 +374,7 @@ int main(int argc, char *argv[]) {
                                 r_item->duration = it_e - cur_t;
                                 r_item->is_selected = true;
                                 it->is_selected = false;
-                                r_item->raw_file_handle = fopen(r_item->raw_audio_path, "rb");
+                                r_item->raw_file_handle = r_item->raw_audio_path[0] ? fopen(r_item->raw_audio_path, "rb") : NULL;
                                 p->num_items++;
                                 break;
                             }
@@ -494,7 +509,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                if ((g_daw.menu_file_open || g_daw.menu_action_open) && (mx > 260 || my > 260)) {
+                if ((g_daw.menu_file_open || g_daw.menu_action_open) && (mx > 320 || my > 270)) {
                     g_daw.menu_file_open = false;
                     g_daw.menu_action_open = false;
                     g_daw.submenu_export_audio_open = false;
@@ -509,19 +524,26 @@ int main(int argc, char *argv[]) {
                         else if (my >= m_start + 24 && my < m_start + 48) { load_project_file(); p->is_dirty = false; g_daw.menu_file_open = false; continue; }
                         else if (my >= m_start + 48 && my < m_start + 72) {
                             char pth[MAX_PATH];
-                            if (open_generic_dialog(pth, sizeof(pth), "Media Files\0*.wav;*.mp3;*.flac;*.mp4;*.mkv;*.mov\0", false)) {
-                                push_undo_state();
-                                AudioItem *it = &p->items[p->num_items];
-                                it->track_idx = 0; it->start_time = p->playhead_seconds;
-                                if (process_media_cache(pth, it) == 0) p->num_items++;
-                                open_video_by_path(&p->video, pth, ren);
-                                strncpy(p->video.current_loaded_path, pth, sizeof(p->video.current_loaded_path) - 1);
+                            if (open_generic_dialog(pth, sizeof(pth), "Media Files\0*.wav;*.mp3;*.flac;*.mp4;*.mkv;*.mov;*.avi;*.webm\0All Files (*.*)\0*.*\0", false)) {
+                                if (p->num_items < MAX_ITEMS) {
+                                    push_undo_state();
+                                    AudioItem *it = &p->items[p->num_items];
+                                    memset(it, 0, sizeof(AudioItem));
+                                    it->track_idx = 0;
+                                    it->start_time = p->playhead_seconds;
+                                    if (process_media_cache(pth, it) == 0) {
+                                        p->num_items++;
+                                        if (it->has_video) {
+                                            open_video_by_path(&p->video, it->file_path, ren);
+                                        }
+                                    }
+                                }
                             }
                             g_daw.menu_file_open = false;
                             continue;
                         }
-                        else if (my >= m_start + 72 && my < m_start + 96) { g_daw.submenu_export_audio_open = !g_daw.submenu_export_audio_open; continue; }
-                        else if (my >= m_start + 96 && my < m_start + 120) { g_daw.submenu_export_video_open = !g_daw.submenu_export_video_open; continue; }
+                        else if (my >= m_start + 72 && my < m_start + 96) { g_daw.submenu_export_audio_open = !g_daw.submenu_export_audio_open; g_daw.submenu_export_video_open = false; continue; }
+                        else if (my >= m_start + 96 && my < m_start + 120) { g_daw.submenu_export_video_open = !g_daw.submenu_export_video_open; g_daw.submenu_export_audio_open = false; continue; }
                         else if (my >= m_start + 120 && my < m_start + 144) { export_batch_tracks(); g_daw.menu_file_open = false; continue; }
                     }
                     if (g_daw.submenu_export_audio_open && mx >= 200 && mx <= 310) {
@@ -530,6 +552,13 @@ int main(int argc, char *argv[]) {
                         if (my >= s_start + 22 && my < s_start + 44) { export_rendered_audio("mp3"); g_daw.menu_file_open = false; continue; }
                         if (my >= s_start + 44 && my < s_start + 66) { export_rendered_audio("flac"); g_daw.menu_file_open = false; continue; }
                         if (my >= s_start + 66 && my < s_start + 88) { export_rendered_audio("ogg"); g_daw.menu_file_open = false; continue; }
+                    }
+                    if (g_daw.submenu_export_video_open && mx >= 200 && mx <= 310) {
+                        int s_start = TABBAR_HEIGHT + TOPBAR_HEIGHT + 100;
+                        if (my >= s_start && my < s_start + 22) { export_rendered_audio("mp4"); g_daw.menu_file_open = false; continue; }
+                        if (my >= s_start + 22 && my < s_start + 44) { export_rendered_audio("mkv"); g_daw.menu_file_open = false; continue; }
+                        if (my >= s_start + 44 && my < s_start + 66) { export_rendered_audio("mov"); g_daw.menu_file_open = false; continue; }
+                        if (my >= s_start + 66 && my < s_start + 88) { export_rendered_audio("avi"); g_daw.menu_file_open = false; continue; }
                     }
                 }
 
@@ -556,7 +585,7 @@ int main(int argc, char *argv[]) {
                     else if (mx >= 122 && mx <= 186) {
                         p->show_marker_lane = !p->show_marker_lane;
                     }
-                    else if (mx >= 192 && mx <= 276) p->video.is_open = !p->video.is_open;
+                    else if (mx >= 192 && mx <= 284) p->video.is_open = !p->video.is_open;
                     else if (mx >= win_w - 228 && mx < win_w - 176) perform_undo();
                     else if (mx >= win_w - 172 && mx < win_w - 120) perform_redo();
                     else if (mx >= win_w - 116 && mx < win_w - 60) p->pixels_per_second = fmaxf(15.0f, p->pixels_per_second * 0.8f);
@@ -636,7 +665,6 @@ int main(int argc, char *argv[]) {
                 if (mx >= g_daw.tcp_width && my > ruler_y && my <= ruler_y + RULER_HEIGHT) {
                     scrubbing_ruler = true;
                     p->playhead_seconds = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
-                    seek_video(&p->video, p->playhead_seconds);
                     continue;
                 }
 
@@ -839,13 +867,12 @@ int main(int argc, char *argv[]) {
                 if (dragging_scrollbar_v) {
                     float delta = (float)(my - scrollbar_v_start_my);
                     int max_y = max_h_tracks - view_h; if (max_y < 0) max_y = 0;
-                    p->scroll_y_px = (int)(orig_scroll_y + ((float)(my - scrollbar_v_start_my) / view_h) * max_h_tracks);
+                    p->scroll_y_px = (int)(orig_scroll_y + (delta / view_h) * max_h_tracks);
                     if (p->scroll_y_px < 0) p->scroll_y_px = 0;
                     if (p->scroll_y_px > max_y) p->scroll_y_px = max_y;
                 }
                 if (scrubbing_ruler && mx >= g_daw.tcp_width && mx < win_w - SCROLLBAR_SIZE) {
                     p->playhead_seconds = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
-                    seek_video(&p->video, p->playhead_seconds);
                 }
                 if (dragging_item_idx != -1) {
                     AudioItem *it = &p->items[dragging_item_idx];
@@ -879,13 +906,17 @@ int main(int argc, char *argv[]) {
             if (v_clip != NULL) {
                 double media_internal_time = (p->playhead_seconds - v_clip->start_time) + v_clip->offset_in_file;
                 
-                if (strncmp(p->video.current_loaded_path, v_clip->raw_audio_path, sizeof(p->video.current_loaded_path)) != 0) {
-                    open_video_by_path(&p->video, v_clip->raw_audio_path, ren);
-                    strncpy(p->video.current_loaded_path, v_clip->raw_audio_path, sizeof(p->video.current_loaded_path) - 1);
+                // Load the original media container (file_path), NOT the raw PCM audio cache (raw_audio_path)
+                if (strncmp(p->video.current_loaded_path, v_clip->file_path, sizeof(p->video.current_loaded_path)) != 0 || !p->video.texture) {
+                    open_video_by_path(&p->video, v_clip->file_path, ren);
                 }
 
-                sync_video_to_audio_clock(&p->video, media_internal_time, scrubbing_ruler || !p->is_playing);
-                p->video.has_active_frame = true;
+                if (p->video.texture) {
+                    sync_video_to_audio_clock(&p->video, media_internal_time, scrubbing_ruler || !p->is_playing);
+                    p->video.has_active_frame = true;
+                } else {
+                    p->video.has_active_frame = false;
+                }
             } else {
                 p->video.has_active_frame = false;
             }
@@ -898,6 +929,7 @@ int main(int argc, char *argv[]) {
         SDL_Color c_white = { 224, 224, 224, 255 };
         SDL_Color c_muted = { 130, 130, 130, 255 };
         SDL_Color c_blue  = { 26, 86, 219, 255 };
+        (void)c_blue;
 
         // 1. Google Chrome Style Tab Bar
         SDL_Rect tab_bar = { 0, 0, win_w, TABBAR_HEIGHT };
@@ -1133,23 +1165,25 @@ int main(int argc, char *argv[]) {
             int mid_y = iy + ih / 2;
             SDL_SetRenderDrawColor(ren, 200, 200, 200, 255);
 
-            for (int col = 0; col < iw; col++) {
-                int px = ix + col;
-                if (px < g_daw.tcp_width || px > g_daw.tcp_width + view_w) continue;
+            if (it->peaks && it->peak_count > 0) {
+                for (int col = 0; col < iw; col++) {
+                    int px = ix + col;
+                    if (px < g_daw.tcp_width || px > g_daw.tcp_width + view_w) continue;
 
-                double cur_item_sec = it->offset_in_file + ((double)col / p->pixels_per_second);
-                int bin_idx = (int)((cur_item_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
+                    double cur_item_sec = it->offset_in_file + ((double)col / p->pixels_per_second);
+                    int bin_idx = (int)((cur_item_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
 
-                if (bin_idx >= 0 && bin_idx < it->peak_count) {
-                    float mn = it->peaks[bin_idx].min_val * gain_multiplier;
-                    float mx = it->peaks[bin_idx].max_val * gain_multiplier;
+                    if (bin_idx >= 0 && bin_idx < it->peak_count) {
+                        float mn = it->peaks[bin_idx].min_val * gain_multiplier;
+                        float mx = it->peaks[bin_idx].max_val * gain_multiplier;
 
-                    int y1 = mid_y - (int)(mx * (ih / 2.0f - 2));
-                    int y2 = mid_y - (int)(mn * (ih / 2.0f - 2));
-                    if (y1 < iy) y1 = iy;
-                    if (y2 > iy + ih) y2 = iy + ih;
-                    if (y1 == y2) y2 += 1;
-                    SDL_RenderDrawLine(ren, px, y1, px, y2);
+                        int y1 = mid_y - (int)(mx * (ih / 2.0f - 2));
+                        int y2 = mid_y - (int)(mn * (ih / 2.0f - 2));
+                        if (y1 < iy) y1 = iy;
+                        if (y2 > iy + ih) y2 = iy + ih;
+                        if (y1 == y2) y2 += 1;
+                        SDL_RenderDrawLine(ren, px, y1, px, y2);
+                    }
                 }
             }
             draw_text(ren, it->label, ix + 6, iy + 6, c_white);
