@@ -28,6 +28,14 @@ static SDL_Cursor *g_cursor_ibeam = NULL;
 // false = Crossfade OFF (existing overlapped clips stay as-is; newly moved/trimmed clips stop edge-to-edge)
 static bool g_tab_crossfade[MAX_TABS] = { true, true, true, true, true, true, true, true };
 
+// Marker selection, typing cursor, & right-click context menu state
+static int g_selected_marker_idx = -1;
+static int g_marker_cursor_pos = 0;
+static bool g_marker_context_menu_open = false;
+static int g_marker_context_target_idx = -1;
+static int g_marker_context_x = 0;
+static int g_marker_context_y = 0;
+
 static inline bool is_crossfade_active(void) {
     int idx = g_daw.active_tab;
     if (idx < 0 || idx >= MAX_TABS) idx = 0;
@@ -38,6 +46,77 @@ static inline void set_crossfade_active(bool active) {
     int idx = g_daw.active_tab;
     if (idx < 0 || idx >= MAX_TABS) idx = 0;
     g_tab_crossfade[idx] = active;
+}
+
+static inline int get_marker_tag_width(const char *text) {
+    int len = text ? (int)strlen(text) : 0;
+    int w = len * 8 + 28;
+    if (w < 84) w = 84;
+    if (w > 540) w = 540;
+    return w;
+}
+
+// Deletes marker at idx in the current tab
+static void delete_marker_at(ProjectTab *p, int idx) {
+    if (!p || idx < 0 || idx >= p->num_markers) return;
+    push_undo_state();
+    for (int m = idx; m < p->num_markers - 1; m++) {
+        p->markers[m] = p->markers[m + 1];
+    }
+    p->num_markers--;
+    if (g_selected_marker_idx == idx) g_selected_marker_idx = -1;
+    else if (g_selected_marker_idx > idx) g_selected_marker_idx--;
+
+    if (g_daw.input_focus == INPUT_FOCUS_MARKER) {
+        if (g_daw.editing_marker_idx == idx) {
+            g_daw.input_focus = INPUT_FOCUS_NONE;
+            g_daw.editing_marker_idx = -1;
+            SDL_StopTextInput();
+        } else if (g_daw.editing_marker_idx > idx) {
+            g_daw.editing_marker_idx--;
+        }
+    }
+    g_marker_context_menu_open = false;
+    g_marker_context_target_idx = -1;
+    p->is_dirty = true;
+}
+
+// Swaps two tracks (t1 and t2) and updates all AudioItem track_idx references
+static void swap_tracks(ProjectTab *p, int t1, int t2) {
+    if (!p || t1 == t2 || t1 < 0 || t2 < 0 || t1 >= p->num_tracks || t2 >= p->num_tracks) return;
+
+    Track tmp_trk = p->tracks[t1];
+    p->tracks[t1] = p->tracks[t2];
+    p->tracks[t2] = tmp_trk;
+    p->tracks[t1].id = t1 + 1;
+    p->tracks[t2].id = t2 + 1;
+
+    char tmp_name[64];
+    memcpy(tmp_name, p->track_names[t1], sizeof(tmp_name));
+    memcpy(p->track_names[t1], p->track_names[t2], sizeof(tmp_name));
+    memcpy(p->track_names[t2], tmp_name, sizeof(tmp_name));
+
+    float tmp_db = p->track_db[t1];
+    p->track_db[t1] = p->track_db[t2];
+    p->track_db[t2] = tmp_db;
+
+    int tmp_h = p->track_heights[t1];
+    p->track_heights[t1] = p->track_heights[t2];
+    p->track_heights[t2] = tmp_h;
+
+    bool tmp_sel = p->track_selected[t1];
+    p->track_selected[t1] = p->track_selected[t2];
+    p->track_selected[t2] = tmp_sel;
+
+    for (int i = 0; i < p->num_items; i++) {
+        if (p->items[i].track_idx == t1) p->items[i].track_idx = t2;
+        else if (p->items[i].track_idx == t2) p->items[i].track_idx = t1;
+    }
+
+    if (g_daw.editing_track_name_idx == t1) g_daw.editing_track_name_idx = t2;
+    else if (g_daw.editing_track_name_idx == t2) g_daw.editing_track_name_idx = t1;
+
+    p->is_dirty = true;
 }
 
 // Computes equal-power crossfade gain (sin/cos S-law) for any overlapping clips and micro de-click ramps at sample time t_sec
@@ -353,6 +432,13 @@ int main(int argc, char *argv[]) {
     int track_orig_height = 0;
     int mouse_drag_start_y = 0;
 
+    // Track Header Up/Down Reorder Drag State
+    int dragging_track_order_idx = -1;
+    bool dragging_track_order_pushed_undo = false;
+
+    // Marker Dragging State
+    int dragging_marker_idx = -1;
+
     SDL_Event e;
     while (running) {
         ProjectTab *p = get_cur_tab();
@@ -417,9 +503,21 @@ int main(int argc, char *argv[]) {
             } else if (e.type == SDL_TEXTINPUT) {
                 if (g_daw.save_prompt_open) continue;
                 if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME) {
-                    if (strlen(g_daw.editing_name_buf) + strlen(e.text.text) < 63) strcat(g_daw.editing_name_buf, e.text.text);
+                    if (strlen(g_daw.editing_name_buf) + strlen(e.text.text) < 63) {
+                        strcat(g_daw.editing_name_buf, e.text.text);
+                    }
                 } else if (g_daw.input_focus == INPUT_FOCUS_MARKER) {
-                    if (strlen(g_daw.editing_marker_buf) + strlen(e.text.text) < 63) strcat(g_daw.editing_marker_buf, e.text.text);
+                    size_t cur_len = strlen(g_daw.editing_marker_buf);
+                    size_t add_len = strlen(e.text.text);
+                    if (g_marker_cursor_pos < 0) g_marker_cursor_pos = 0;
+                    if ((size_t)g_marker_cursor_pos > cur_len) g_marker_cursor_pos = (int)cur_len;
+                    if (cur_len + add_len < 63) {
+                        memmove(g_daw.editing_marker_buf + g_marker_cursor_pos + add_len,
+                                g_daw.editing_marker_buf + g_marker_cursor_pos,
+                                cur_len - (size_t)g_marker_cursor_pos + 1);
+                        memcpy(g_daw.editing_marker_buf + g_marker_cursor_pos, e.text.text, add_len);
+                        g_marker_cursor_pos += (int)add_len;
+                    }
                 }
             } else if (e.type == SDL_DROPFILE) {
                 if (g_daw.save_prompt_open) { SDL_free(e.drop.file); continue; }
@@ -476,6 +574,10 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 if (g_daw.input_focus == INPUT_FOCUS_MARKER) {
+                    size_t l = strlen(g_daw.editing_marker_buf);
+                    if (g_marker_cursor_pos < 0) g_marker_cursor_pos = 0;
+                    if ((size_t)g_marker_cursor_pos > l) g_marker_cursor_pos = (int)l;
+
                     if (e.key.keysym.sym == SDLK_RETURN) {
                         strncpy(p->markers[g_daw.editing_marker_idx].text, g_daw.editing_marker_buf, 63);
                         g_daw.input_focus = INPUT_FOCUS_NONE;
@@ -487,8 +589,26 @@ int main(int argc, char *argv[]) {
                         g_daw.editing_marker_idx = -1;
                         SDL_StopTextInput();
                     } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                        size_t l = strlen(g_daw.editing_marker_buf);
-                        if (l > 0) g_daw.editing_marker_buf[l - 1] = '\0';
+                        if (g_marker_cursor_pos > 0 && l > 0) {
+                            memmove(g_daw.editing_marker_buf + g_marker_cursor_pos - 1,
+                                    g_daw.editing_marker_buf + g_marker_cursor_pos,
+                                    l - (size_t)g_marker_cursor_pos + 1);
+                            g_marker_cursor_pos--;
+                        }
+                    } else if (e.key.keysym.sym == SDLK_DELETE) {
+                        if ((size_t)g_marker_cursor_pos < l) {
+                            memmove(g_daw.editing_marker_buf + g_marker_cursor_pos,
+                                    g_daw.editing_marker_buf + g_marker_cursor_pos + 1,
+                                    l - (size_t)g_marker_cursor_pos);
+                        }
+                    } else if (e.key.keysym.sym == SDLK_LEFT) {
+                        if (g_marker_cursor_pos > 0) g_marker_cursor_pos--;
+                    } else if (e.key.keysym.sym == SDLK_RIGHT) {
+                        if ((size_t)g_marker_cursor_pos < l) g_marker_cursor_pos++;
+                    } else if (e.key.keysym.sym == SDLK_HOME) {
+                        g_marker_cursor_pos = 0;
+                    } else if (e.key.keysym.sym == SDLK_END) {
+                        g_marker_cursor_pos = (int)l;
                     }
                     continue;
                 }
@@ -499,19 +619,24 @@ int main(int argc, char *argv[]) {
                     save_project_file();
                     p->is_dirty = false;
                 }
+                else if (e.key.keysym.sym == SDLK_DELETE || e.key.keysym.sym == SDLK_BACKSPACE) {
+                    if (g_selected_marker_idx >= 0 && g_selected_marker_idx < p->num_markers) {
+                        delete_marker_at(p, g_selected_marker_idx);
+                    }
+                }
                 else if (e.key.keysym.sym == SDLK_EQUALS || e.key.keysym.sym == SDLK_PLUS || e.key.keysym.sym == SDLK_KP_PLUS)
                     p->pixels_per_second = fminf(400.0f, p->pixels_per_second * 1.25f);
                 else if (e.key.keysym.sym == SDLK_MINUS || e.key.keysym.sym == SDLK_KP_MINUS)
                     p->pixels_per_second = fmaxf(15.0f, p->pixels_per_second * 0.8f);
                 else if (e.key.keysym.sym == SDLK_m) {
+                    p->show_marker_lane = true;
                     if (p->num_markers < MAX_MARKERS) {
-                        DawMarker *mk = &p->markers[p->num_markers++];
+                        push_undo_state();
+                        int new_m = p->num_markers++;
+                        DawMarker *mk = &p->markers[new_m];
                         mk->time_sec = p->playhead_seconds;
                         snprintf(mk->text, sizeof(mk->text), "Marker %d", p->num_markers);
-                        g_daw.input_focus = INPUT_FOCUS_MARKER;
-                        g_daw.editing_marker_idx = p->num_markers - 1;
-                        strncpy(g_daw.editing_marker_buf, mk->text, 63);
-                        SDL_StartTextInput();
+                        g_selected_marker_idx = new_m;
                         p->is_dirty = true;
                     }
                 }
@@ -572,18 +697,57 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // Handle Marker Right-Click Context Menu ("Delete Marker")
+                if (g_marker_context_menu_open) {
+                    int cm_w = 128, cm_h = 28;
+                    if (mx >= g_marker_context_x && mx <= g_marker_context_x + cm_w &&
+                        my >= g_marker_context_y && my <= g_marker_context_y + cm_h) {
+                        if (g_marker_context_target_idx >= 0 && g_marker_context_target_idx < p->num_markers) {
+                            delete_marker_at(p, g_marker_context_target_idx);
+                        }
+                        g_marker_context_menu_open = false;
+                        g_marker_context_target_idx = -1;
+                        continue;
+                    }
+                    g_marker_context_menu_open = false;
+                    g_marker_context_target_idx = -1;
+                }
+
                 if (g_daw.input_focus != INPUT_FOCUS_NONE) {
                     if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME) {
                         strncpy(p->track_names[g_daw.editing_track_name_idx], g_daw.editing_name_buf, 63);
                         p->is_dirty = true;
+                        g_daw.input_focus = INPUT_FOCUS_NONE;
+                        g_daw.editing_track_name_idx = -1;
+                        SDL_StopTextInput();
                     } else if (g_daw.input_focus == INPUT_FOCUS_MARKER) {
-                        strncpy(p->markers[g_daw.editing_marker_idx].text, g_daw.editing_marker_buf, 63);
-                        p->is_dirty = true;
+                        int em = g_daw.editing_marker_idx;
+                        int marker_y_chk = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT;
+                        bool clicked_inside_editing_marker = false;
+                        if (em >= 0 && em < p->num_markers && p->show_marker_lane &&
+                            my >= marker_y_chk && my <= marker_y_chk + MARKER_BAR_HEIGHT) {
+                            int mk_x = g_daw.tcp_width + (int)((p->markers[em].time_sec - p->scroll_x_sec) * p->pixels_per_second);
+                            int tag_w = get_marker_tag_width(g_daw.editing_marker_buf);
+                            if (mx >= mk_x && mx <= mk_x + tag_w) {
+                                clicked_inside_editing_marker = true;
+                                int char_pos = (mx - (mk_x + 6) + 4) / 8;
+                                int max_l = (int)strlen(g_daw.editing_marker_buf);
+                                if (char_pos < 0) char_pos = 0;
+                                if (char_pos > max_l) char_pos = max_l;
+                                g_marker_cursor_pos = char_pos;
+                            }
+                        }
+                        if (clicked_inside_editing_marker) {
+                            continue;
+                        }
+                        if (em >= 0 && em < p->num_markers) {
+                            strncpy(p->markers[em].text, g_daw.editing_marker_buf, 63);
+                            p->is_dirty = true;
+                        }
+                        g_daw.input_focus = INPUT_FOCUS_NONE;
+                        g_daw.editing_marker_idx = -1;
+                        SDL_StopTextInput();
                     }
-                    g_daw.input_focus = INPUT_FOCUS_NONE;
-                    g_daw.editing_track_name_idx = -1;
-                    g_daw.editing_marker_idx = -1;
-                    SDL_StopTextInput();
                 }
 
                 // Chrome-Style Tab Interactions
@@ -606,6 +770,7 @@ int main(int argc, char *argv[]) {
                                 request_close_tab(t);
                             } else {
                                 g_daw.active_tab = t;
+                                g_selected_marker_idx = -1;
                             }
                             break;
                         }
@@ -617,6 +782,7 @@ int main(int argc, char *argv[]) {
                         init_tab_defaults(g_daw.num_tabs, name);
                         g_tab_crossfade[g_daw.num_tabs] = true;
                         g_daw.active_tab = g_daw.num_tabs++;
+                        g_selected_marker_idx = -1;
                     }
                     continue;
                 }
@@ -770,7 +936,7 @@ int main(int argc, char *argv[]) {
 
                 int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
                 if (mx < g_daw.tcp_width && my > corner_y && my <= corner_y + RULER_HEIGHT + m_lane_h) {
-                    if (mx >= 8 && mx <= 88) {
+                    if (mx >= 8 && mx <= 88 && p->num_tracks < MAX_TRACKS) {
                         push_undo_state();
                         p->track_heights[p->num_tracks] = 84;
                         snprintf(p->track_names[p->num_tracks], 64, "Track %d", p->num_tracks + 1);
@@ -802,30 +968,67 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // ================= MARKER LANE INTERACTIONS =================
+                // 1. Right-click empty marker lane -> Add Marker
+                // 2. Double-click marker -> Typing cursor for typing text
+                // 3. Delete marker (via right-click "Delete Marker" menu, marker [x] button, or Delete key)
                 int marker_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT;
                 if (p->show_marker_lane && mx >= g_daw.tcp_width && my > marker_y && my <= marker_y + MARKER_BAR_HEIGHT) {
-                    double m_time = p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second;
-                    if (e.button.button == SDL_BUTTON_RIGHT && p->num_markers < MAX_MARKERS) {
-                        DawMarker *mk = &p->markers[p->num_markers++];
-                        mk->time_sec = m_time;
-                        snprintf(mk->text, sizeof(mk->text), "Marker %d", p->num_markers);
-                        g_daw.input_focus = INPUT_FOCUS_MARKER;
-                        g_daw.editing_marker_idx = p->num_markers - 1;
-                        strncpy(g_daw.editing_marker_buf, mk->text, 63);
-                        SDL_StartTextInput();
-                        p->is_dirty = true;
-                    } else {
-                        for (int m = 0; m < p->num_markers; m++) {
-                            int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
-                            if (abs(mx - mk_x) <= 28) {
-                                if (e.button.clicks == 2) {
-                                    g_daw.input_focus = INPUT_FOCUS_MARKER;
-                                    g_daw.editing_marker_idx = m;
-                                    strncpy(g_daw.editing_marker_buf, p->markers[m].text, 63);
-                                    SDL_StartTextInput();
-                                }
-                                break;
+                    double m_time = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
+
+                    // Check if user clicked on an existing marker tag (top-most / last drawn first)
+                    int hit_m = -1;
+                    bool hit_delete_x = false;
+                    for (int m = p->num_markers - 1; m >= 0; m--) {
+                        int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
+                        int tag_w = get_marker_tag_width(p->markers[m].text);
+                        if (mx >= mk_x && mx <= mk_x + tag_w) {
+                            hit_m = m;
+                            if (mx >= mk_x + tag_w - 16) {
+                                hit_delete_x = true;
                             }
+                            break;
+                        }
+                    }
+
+                    if (e.button.button == SDL_BUTTON_RIGHT) {
+                        if (hit_m >= 0) {
+                            // Right-clicked an existing marker -> open "Delete Marker" context menu
+                            g_selected_marker_idx = hit_m;
+                            g_marker_context_menu_open = true;
+                            g_marker_context_target_idx = hit_m;
+                            g_marker_context_x = mx;
+                            g_marker_context_y = marker_y + MARKER_BAR_HEIGHT + 2;
+                        } else if (p->num_markers < MAX_MARKERS) {
+                            // 1. Right-click on empty marker lane -> Add Marker
+                            push_undo_state();
+                            int new_idx = p->num_markers++;
+                            DawMarker *mk = &p->markers[new_idx];
+                            mk->time_sec = m_time;
+                            snprintf(mk->text, sizeof(mk->text), "Marker %d", p->num_markers);
+                            g_selected_marker_idx = new_idx;
+                            p->is_dirty = true;
+                        }
+                    } else if (e.button.button == SDL_BUTTON_LEFT) {
+                        if (hit_m >= 0) {
+                            g_selected_marker_idx = hit_m;
+                            if (hit_delete_x) {
+                                // 3. Clicked [x] button on marker tag -> Delete Marker
+                                delete_marker_at(p, hit_m);
+                            } else if (e.button.clicks >= 2) {
+                                // 2. Double-click on marker -> Open typing cursor for typing text
+                                g_daw.input_focus = INPUT_FOCUS_MARKER;
+                                g_daw.editing_marker_idx = hit_m;
+                                strncpy(g_daw.editing_marker_buf, p->markers[hit_m].text, 63);
+                                g_daw.editing_marker_buf[63] = '\0';
+                                g_marker_cursor_pos = (int)strlen(g_daw.editing_marker_buf);
+                                SDL_StartTextInput();
+                            } else {
+                                // Single click selects marker and allows dragging it along the lane
+                                dragging_marker_idx = hit_m;
+                            }
+                        } else {
+                            g_selected_marker_idx = -1;
                         }
                     }
                     continue;
@@ -833,12 +1036,27 @@ int main(int argc, char *argv[]) {
 
                 int ruler_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
                 if (mx >= g_daw.tcp_width && my > ruler_y && my <= ruler_y + RULER_HEIGHT) {
-                    scrubbing_ruler = true;
-                    p->playhead_seconds = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
+                    if (e.button.button == SDL_BUTTON_RIGHT) {
+                        // Also allow right-clicking the ruler to auto-show the marker lane and add a marker
+                        p->show_marker_lane = true;
+                        if (p->num_markers < MAX_MARKERS) {
+                            push_undo_state();
+                            double m_time = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
+                            int new_idx = p->num_markers++;
+                            DawMarker *mk = &p->markers[new_idx];
+                            mk->time_sec = m_time;
+                            snprintf(mk->text, sizeof(mk->text), "Marker %d", p->num_markers);
+                            g_selected_marker_idx = new_idx;
+                            p->is_dirty = true;
+                        }
+                    } else {
+                        scrubbing_ruler = true;
+                        p->playhead_seconds = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
+                    }
                     continue;
                 }
 
-                // Track Controls & Header Selection
+                // ================= TRACK CONTROLS, SELECTION & UP/DOWN DRAG REORDER =================
                 int header_top_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + m_lane_h;
                 if (mx < g_daw.tcp_width && my > header_top_y) {
                     int cur_y = header_top_y - p->scroll_y_px;
@@ -862,18 +1080,31 @@ int main(int argc, char *argv[]) {
                                 p->track_selected[t] = true;
                             }
 
-                            if (rel_y >= 30 && rel_y <= 56) {
-                                if (mx >= 8 && mx <= 26) { p->track_db[t] -= 1.0f; p->is_dirty = true; }
-                                else if (mx >= 76 && mx <= 94) { p->track_db[t] += 1.0f; p->is_dirty = true; }
-                                else if (mx >= 110 && mx <= 132) { p->tracks[t].mute = !p->tracks[t].mute; p->is_dirty = true; }
-                                else if (mx >= 138 && mx <= 160) { p->tracks[t].solo = !p->tracks[t].solo; p->is_dirty = true; }
-                            } else if (rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx <= g_daw.tcp_width - 16) {
-                                if (e.button.clicks == 2) {
+                            bool handled_btn = false;
+                            // Right-side Up/Down Grip Handle (x: tcp_width - 28 .. tcp_width - 6)
+                            if (mx >= g_daw.tcp_width - 28 && mx <= g_daw.tcp_width - 6) {
+                                dragging_track_order_idx = t;
+                                dragging_track_order_pushed_undo = false;
+                                handled_btn = true;
+                            } else if (rel_y >= 30 && rel_y <= 56) {
+                                if (mx >= 8 && mx <= 26) { p->track_db[t] -= 1.0f; p->is_dirty = true; handled_btn = true; }
+                                else if (mx >= 76 && mx <= 94) { p->track_db[t] += 1.0f; p->is_dirty = true; handled_btn = true; }
+                                else if (mx >= 110 && mx <= 132) { p->tracks[t].mute = !p->tracks[t].mute; p->is_dirty = true; handled_btn = true; }
+                                else if (mx >= 138 && mx <= 160) { p->tracks[t].solo = !p->tracks[t].solo; p->is_dirty = true; handled_btn = true; }
+                            } else if (rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx <= g_daw.tcp_width - 32) {
+                                if (e.button.clicks >= 2) {
                                     g_daw.input_focus = INPUT_FOCUS_TRACK_NAME;
                                     g_daw.editing_track_name_idx = t;
                                     strncpy(g_daw.editing_name_buf, p->track_names[t], 63);
                                     SDL_StartTextInput();
+                                    handled_btn = true;
                                 }
+                            }
+
+                            // Clicking and holding anywhere on the track header (outside M/S/dB buttons) starts up/down track drag
+                            if (!handled_btn && e.button.button == SDL_BUTTON_LEFT) {
+                                dragging_track_order_idx = t;
+                                dragging_track_order_pushed_undo = false;
                             }
                             break;
                         }
@@ -932,6 +1163,9 @@ int main(int argc, char *argv[]) {
                 scrubbing_ruler = false;
                 resizing_tcp_width = false;
                 resizing_track_idx = -1;
+                dragging_track_order_idx = -1;
+                dragging_track_order_pushed_undo = false;
+                dragging_marker_idx = -1;
                 g_daw.script_win_dragging = false;
                 if (dragging_item_idx != -1) p->is_dirty = true;
                 dragging_item_idx = -1; dragging_trim_left = false; dragging_trim_right = false;
@@ -978,7 +1212,12 @@ int main(int argc, char *argv[]) {
                             hovered_edge = true;
                             break;
                         }
-                        if (my >= cur_y + 6 && my <= cur_y + 28 && mx >= 8 && mx <= g_daw.tcp_width - 16) {
+                        if (mx >= g_daw.tcp_width - 28 && mx <= g_daw.tcp_width - 6 && my >= cur_y + 6 && my <= cur_y + th - 6) {
+                            SDL_SetCursor(g_cursor_size_ns);
+                            hovered_edge = true;
+                            break;
+                        }
+                        if (my >= cur_y + 6 && my <= cur_y + 28 && mx >= 8 && mx <= g_daw.tcp_width - 32) {
                             SDL_SetCursor(g_cursor_ibeam);
                             hovered_ibeam = true;
                             break;
@@ -1000,7 +1239,7 @@ int main(int argc, char *argv[]) {
                         }
                     }
                 }
-                if (!hovered_edge && !hovered_ibeam && !resizing_tcp_width && resizing_track_idx < 0) {
+                if (!hovered_edge && !hovered_ibeam && !resizing_tcp_width && resizing_track_idx < 0 && dragging_track_order_idx < 0) {
                     SDL_SetCursor(g_cursor_arrow);
                 }
 
@@ -1015,6 +1254,45 @@ int main(int argc, char *argv[]) {
                     int delta = my - mouse_drag_start_y;
                     int new_h = track_orig_height + delta;
                     if (new_h >= 50 && new_h <= 260) p->track_heights[resizing_track_idx] = new_h;
+                }
+
+                // Handle Track Header Up/Down Drag Reordering
+                if (dragging_track_order_idx >= 0 && dragging_track_order_idx < p->num_tracks) {
+                    SDL_SetCursor(g_cursor_size_ns);
+                    int cur_y = header_top_y - p->scroll_y_px;
+                    int target_trk = dragging_track_order_idx;
+                    for (int t = 0; t < p->num_tracks; t++) {
+                        int th = p->track_heights[t];
+                        int mid_y = cur_y + th / 2;
+                        if (t < dragging_track_order_idx && my < mid_y) {
+                            target_trk = t;
+                            break;
+                        } else if (t > dragging_track_order_idx && my > mid_y) {
+                            target_trk = t;
+                        }
+                        cur_y += th;
+                    }
+                    if (target_trk != dragging_track_order_idx) {
+                        if (!dragging_track_order_pushed_undo) {
+                            push_undo_state();
+                            dragging_track_order_pushed_undo = true;
+                        }
+                        while (dragging_track_order_idx > target_trk) {
+                            swap_tracks(p, dragging_track_order_idx, dragging_track_order_idx - 1);
+                            dragging_track_order_idx--;
+                        }
+                        while (dragging_track_order_idx < target_trk) {
+                            swap_tracks(p, dragging_track_order_idx, dragging_track_order_idx + 1);
+                            dragging_track_order_idx++;
+                        }
+                    }
+                }
+
+                // Handle Marker Dragging along Marker Lane
+                if (dragging_marker_idx >= 0 && dragging_marker_idx < p->num_markers) {
+                    double m_time = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
+                    p->markers[dragging_marker_idx].time_sec = m_time;
+                    p->is_dirty = true;
                 }
 
                 if (p->video.is_resizing) {
@@ -1297,6 +1575,9 @@ int main(int argc, char *argv[]) {
 
         int marker_y = corner_y + RULER_HEIGHT;
         if (p->show_marker_lane) {
+            SDL_Rect marker_clip = { g_daw.tcp_width, marker_y, view_w, MARKER_BAR_HEIGHT };
+            SDL_RenderSetClipRect(ren, &marker_clip);
+
             SDL_Rect marker_bg = { g_daw.tcp_width, marker_y, view_w, MARKER_BAR_HEIGHT };
             SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
             SDL_RenderFillRect(ren, &marker_bg);
@@ -1305,18 +1586,52 @@ int main(int argc, char *argv[]) {
 
             for (int m = 0; m < p->num_markers; m++) {
                 int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
-                if (mk_x >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
-                    SDL_Rect m_tag = { mk_x, marker_y + 2, 74, MARKER_BAR_HEIGHT - 4 };
-                    bool is_editing_this = (g_daw.input_focus == INPUT_FOCUS_MARKER && g_daw.editing_marker_idx == m);
-                    SDL_SetRenderDrawColor(ren, is_editing_this ? 26 : 48, is_editing_this ? 86 : 48, is_editing_this ? 219 : 48, 255);
+                bool is_editing_this = (g_daw.input_focus == INPUT_FOCUS_MARKER && g_daw.editing_marker_idx == m);
+                bool is_selected_this = (g_selected_marker_idx == m);
+                const char *disp_txt = is_editing_this ? g_daw.editing_marker_buf : p->markers[m].text;
+                int tag_w = get_marker_tag_width(disp_txt);
+
+                if (mk_x + tag_w >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
+                    SDL_Rect m_tag = { mk_x, marker_y + 2, tag_w, MARKER_BAR_HEIGHT - 4 };
+                    SDL_SetRenderDrawColor(ren,
+                        is_editing_this ? 24 : (is_selected_this ? 45 : 38),
+                        is_editing_this ? 72 : (is_selected_this ? 68 : 48),
+                        is_editing_this ? 165 : (is_selected_this ? 115 : 58),
+                        255);
                     SDL_RenderFillRect(ren, &m_tag);
+
+                    SDL_SetRenderDrawColor(ren,
+                        is_editing_this ? 120 : (is_selected_this ? 150 : 85),
+                        is_editing_this ? 185 : (is_selected_this ? 185 : 95),
+                        is_editing_this ? 255 : (is_selected_this ? 235 : 110),
+                        255);
+                    SDL_RenderDrawRect(ren, &m_tag);
+
+                    // Marker position indicator line on left edge
+                    SDL_SetRenderDrawColor(ren, 245, 190, 65, 255);
+                    SDL_RenderDrawLine(ren, mk_x, marker_y, mk_x, marker_y + MARKER_BAR_HEIGHT - 1);
+
+                    draw_text(ren, disp_txt, mk_x + 6, marker_y + 6, c_white);
+
+                    // Blinking Typing Cursor when double-clicked for editing text
                     if (is_editing_this) {
-                        draw_text(ren, g_daw.editing_marker_buf, mk_x + 4, marker_y + 6, c_white);
+                        int cur_pos = g_marker_cursor_pos;
+                        int max_l = (int)strlen(g_daw.editing_marker_buf);
+                        if (cur_pos < 0) cur_pos = 0;
+                        if (cur_pos > max_l) cur_pos = max_l;
+                        int cx = mk_x + 6 + cur_pos * 8;
+                        if ((SDL_GetTicks() / 450) % 2 == 0) {
+                            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                            SDL_RenderDrawLine(ren, cx, marker_y + 4, cx, marker_y + MARKER_BAR_HEIGHT - 4);
+                            SDL_RenderDrawLine(ren, cx + 1, marker_y + 4, cx + 1, marker_y + MARKER_BAR_HEIGHT - 4);
+                        }
                     } else {
-                        draw_text(ren, p->markers[m].text, mk_x + 4, marker_y + 6, c_white);
+                        // Small [x] delete button on right end of marker tag
+                        draw_text(ren, "x", mk_x + tag_w - 12, marker_y + 6, c_muted);
                     }
                 }
             }
+            SDL_RenderSetClipRect(ren, NULL);
         }
 
         int header_top_y = marker_y + m_lane_h;
@@ -1328,6 +1643,17 @@ int main(int argc, char *argv[]) {
             if (gx < g_daw.tcp_width || gx > g_daw.tcp_width + view_w) continue;
             SDL_SetRenderDrawColor(ren, 38, 38, 38, 255);
             SDL_RenderDrawLine(ren, gx, header_top_y, gx, header_top_y + view_h);
+        }
+
+        // Draw vertical marker guide lines across timeline tracks
+        if (p->show_marker_lane) {
+            for (int m = 0; m < p->num_markers; m++) {
+                int mk_x = g_daw.tcp_width + (int)((p->markers[m].time_sec - p->scroll_x_sec) * p->pixels_per_second);
+                if (mk_x >= g_daw.tcp_width && mk_x <= g_daw.tcp_width + view_w) {
+                    SDL_SetRenderDrawColor(ren, 95, 80, 40, 255);
+                    SDL_RenderDrawLine(ren, mk_x, header_top_y, mk_x, header_top_y + view_h);
+                }
+            }
         }
 
         // Timeline tracks background and light selection borders
@@ -1544,19 +1870,29 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 6. Track Header (TCP)
+        // 6. Track Header (TCP) with Up/Down Drag Handle
         SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
         for (int i = 0; i < p->num_tracks; i++) {
             int ty = get_track_y_pos(i);
             int th = p->track_heights[i];
             bool is_sel = p->track_selected[i];
+            bool is_dragging_this_trk = (dragging_track_order_idx == i);
 
             SDL_Rect tp = { 2, ty + 2, g_daw.tcp_width - 4, th - 4 };
-            SDL_SetRenderDrawColor(ren, is_sel ? 32 : 26, is_sel ? 40 : 26, is_sel ? 32 : 26, 255);
+            SDL_SetRenderDrawColor(ren,
+                is_dragging_this_trk ? 42 : (is_sel ? 32 : 26),
+                is_dragging_this_trk ? 56 : (is_sel ? 40 : 26),
+                is_dragging_this_trk ? 72 : (is_sel ? 32 : 26),
+                255);
             SDL_RenderFillRect(ren, &tp);
 
-            if (is_sel) {
+            if (is_dragging_this_trk) {
+                SDL_SetRenderDrawColor(ren, 85, 190, 245, 255);
+                SDL_RenderDrawRect(ren, &tp);
+                SDL_Rect inner_drag = { tp.x + 1, tp.y + 1, tp.w - 2, tp.h - 2 };
+                SDL_RenderDrawRect(ren, &inner_drag);
+            } else if (is_sel) {
                 SDL_SetRenderDrawColor(ren, 22, 101, 52, 255);
                 SDL_RenderDrawRect(ren, &tp);
                 SDL_Rect inner_green = { tp.x + 1, tp.y + 1, tp.w - 2, tp.h - 2 };
@@ -1564,7 +1900,7 @@ int main(int argc, char *argv[]) {
             }
 
             // Top Part: Track Name Box with clean border
-            SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 16, 22 };
+            SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 38, 22 };
             bool is_editing = (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME && g_daw.editing_track_name_idx == i);
 
             SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
@@ -1581,6 +1917,19 @@ int main(int argc, char *argv[]) {
                 }
             } else {
                 draw_text(ren, p->track_names[i], 12, ty + 10, c_white);
+            }
+
+            // Right-side Up/Down Drag Grip Handle
+            int grip_x = g_daw.tcp_width - 24;
+            SDL_Rect grip_box = { grip_x, ty + 6, 18, 48 };
+            SDL_SetRenderDrawColor(ren, is_dragging_this_trk ? 55 : 36, is_dragging_this_trk ? 75 : 36, is_dragging_this_trk ? 95 : 36, 255);
+            SDL_RenderFillRect(ren, &grip_box);
+            SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
+            SDL_RenderDrawRect(ren, &grip_box);
+            // Draw grip bars (=) and up/down chevron hints
+            SDL_SetRenderDrawColor(ren, 165, 165, 165, 255);
+            for (int gy = ty + 22; gy <= ty + 36; gy += 4) {
+                SDL_RenderDrawLine(ren, grip_x + 4, gy, grip_x + 13, gy);
             }
 
             // Bottom Part: Controls
@@ -1641,6 +1990,16 @@ int main(int argc, char *argv[]) {
         SDL_Rect thumb_v = { win_w - SCROLLBAR_SIZE + 2, (int)thumb_y, SCROLLBAR_SIZE - 4, (int)thumb_h_sz };
         SDL_SetRenderDrawColor(ren, 65, 65, 65, 255);
         SDL_RenderFillRect(ren, &thumb_v);
+
+        // Marker Right-Click Context Menu ("Delete Marker")
+        if (g_marker_context_menu_open && g_marker_context_target_idx >= 0 && g_marker_context_target_idx < p->num_markers) {
+            SDL_Rect cm_box = { g_marker_context_x, g_marker_context_y, 128, 28 };
+            SDL_SetRenderDrawColor(ren, 28, 28, 32, 255);
+            SDL_RenderFillRect(ren, &cm_box);
+            SDL_SetRenderDrawColor(ren, 185, 65, 65, 255);
+            SDL_RenderDrawRect(ren, &cm_box);
+            draw_text(ren, "Delete Marker", g_marker_context_x + 12, g_marker_context_y + 8, c_white);
+        }
 
         // 7. Action Menu
         if (g_daw.menu_action_open) {
