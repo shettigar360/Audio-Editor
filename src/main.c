@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
+#include <time.h>
 
 #include "font.h"
 #include "video_player.h"
@@ -45,13 +46,35 @@ static double g_tab_range_end[MAX_TABS]    = { 0.0 };
 static double g_item_fade_in[MAX_TABS][MAX_ITEMS];
 static double g_item_fade_out[MAX_TABS][MAX_ITEMS];
 
-// Per-tab Track Hide state & Hide Tracks Popup Window state
+// Per-tab Track Hide state & Hide Tracks Popup Window state (with scrolling)
 static bool     g_track_hidden[MAX_TABS][MAX_TRACKS];
 static bool     g_hide_popup_open = false;
 static SDL_Rect g_hide_win_rect = { 450, 110, 380, 340 };
 static bool     g_hide_win_dragging = false;
 static int      g_hide_drag_off_x = 0;
 static int      g_hide_drag_off_y = 0;
+static int      g_hide_scroll_y = 0;
+static bool     g_hide_sb_dragging = false;
+static int      g_hide_sb_start_my = 0;
+static int      g_hide_sb_orig_scroll = 0;
+
+// Tools Menu, 100-Entry Project History Popup Window & Tab Bar Change Notification State
+#define MAX_HISTORY_ENTRIES 100
+#define HISTORY_ENTRY_LEN   128
+static bool     g_menu_tools_open = false;
+static bool     g_history_popup_open = false;
+static SDL_Rect g_history_win_rect = { 380, 96, 520, 400 };
+static bool     g_history_win_dragging = false;
+static int      g_history_drag_off_x = 0;
+static int      g_history_drag_off_y = 0;
+static int      g_history_scroll_y = 0;
+static bool     g_history_sb_dragging = false;
+static int      g_history_sb_start_my = 0;
+static int      g_history_sb_orig_scroll = 0;
+
+static char     g_tab_history[MAX_TABS][MAX_HISTORY_ENTRIES][HISTORY_ENTRY_LEN];
+static int      g_tab_history_count[MAX_TABS] = { 0 };
+static char     g_tab_notification[MAX_TABS][128];
 
 // ================= INSERT MULTIPLE MEDIA ITEMS POPUP STATE =================
 #define MAX_MULTI_IMPORT_FILES 64
@@ -156,8 +179,9 @@ typedef struct {
     char mp4_height_str[16];        // e.g. "1080"
     char mp4_fps_str[16];           // e.g. "25.00"
     char mp4_video_kbps_str[16];    // e.g. "2048"
-    ExportMp4AudioCodec mp4_audio_codec; // AAC, WAV, MP3
-    char mp4_audio_kbps_str[16];    // e.g. "128"
+    ExportMp4AudioCodec mp4_audio_codec; // AAC
+    char mp4_audio_kbps_str[16];    // "120", "192", or "320"
+    bool mp4_aac_dropdown_open;     // Dropdown for 120 / 192 / 320 kbps
 
     bool two_pass_render;           // Option: two pass render
 
@@ -190,7 +214,8 @@ static ExportDialogState g_export = {
     "25.00",
     "2048",
     EXPORT_MP4_AUDIO_AAC,
-    "128",
+    "192",
+    false,
     false,
     false,
     0,
@@ -219,6 +244,43 @@ static inline int get_valid_tab_idx(void) {
     int idx = g_daw.active_tab;
     if (idx < 0 || idx >= MAX_TABS) idx = 0;
     return idx;
+}
+
+// Records a timestamped project change ("yy:mm:dd::hh:mm:ss: <action>") in the 100-item History list
+// and updates the top Tab Bar notification banner.
+static void record_project_change(const char *action_name, bool mark_dirty) {
+    int tab = get_valid_tab_idx();
+    ProjectTab *p = get_cur_tab();
+    if (p && mark_dirty) {
+        p->is_dirty = true;
+    }
+
+    time_t now_t = time(NULL);
+    struct tm *lt = localtime(&now_t);
+    char ts_buf[32] = "26:10:20::00:00:00:";
+    if (lt) {
+        strftime(ts_buf, sizeof(ts_buf), "%y:%m:%d::%H:%M:%S:", lt);
+    }
+
+    const char *act = (action_name && action_name[0]) ? action_name : "Project Updated";
+
+    char entry[HISTORY_ENTRY_LEN];
+    snprintf(entry, sizeof(entry), "%s  %s", ts_buf, act);
+
+    int cnt = g_tab_history_count[tab];
+    if (cnt < MAX_HISTORY_ENTRIES) {
+        strncpy(g_tab_history[tab][cnt], entry, HISTORY_ENTRY_LEN - 1);
+        g_tab_history[tab][cnt][HISTORY_ENTRY_LEN - 1] = '\0';
+        g_tab_history_count[tab] = cnt + 1;
+    } else {
+        for (int i = 0; i < MAX_HISTORY_ENTRIES - 1; i++) {
+            memcpy(g_tab_history[tab][i], g_tab_history[tab][i + 1], HISTORY_ENTRY_LEN);
+        }
+        strncpy(g_tab_history[tab][MAX_HISTORY_ENTRIES - 1], entry, HISTORY_ENTRY_LEN - 1);
+        g_tab_history[tab][MAX_HISTORY_ENTRIES - 1][HISTORY_ENTRY_LEN - 1] = '\0';
+    }
+
+    snprintf(g_tab_notification[tab], sizeof(g_tab_notification[0]), "%s %s", ts_buf, act);
 }
 
 static inline bool is_crossfade_active(void) {
@@ -434,7 +496,7 @@ static void delete_marker_at(ProjectTab *p, int idx) {
     }
     g_marker_context_menu_open = false;
     g_marker_context_target_idx = -1;
-    p->is_dirty = true;
+    record_project_change("Deleted Marker", true);
 }
 
 // Swaps two tracks (t1 and t2) and updates all AudioItem track_idx references
@@ -477,7 +539,7 @@ static void swap_tracks(ProjectTab *p, int t1, int t2) {
     if (g_daw.editing_track_name_idx == t1) g_daw.editing_track_name_idx = t2;
     else if (g_daw.editing_track_name_idx == t2) g_daw.editing_track_name_idx = t1;
 
-    p->is_dirty = true;
+    record_project_change("Reordered Track", true);
 }
 
 // Helper to draw a 1px or 2px BROWN border rectangle across all UI elements
@@ -1649,7 +1711,7 @@ static void import_single_media_item(ProjectTab *p, SDL_Renderer *ren, SDL_Windo
         if (it->has_video) {
             open_video_by_path(&p->video, it->file_path, ren);
         }
-        p->is_dirty = true;
+        record_project_change("Imported Media Clip", true);
     }
 }
 
@@ -1716,6 +1778,7 @@ static void execute_multi_media_import(ProjectTab *p, SDL_Renderer *ren, SDL_Win
             p->is_dirty = true;
         }
     }
+    record_project_change("Imported Multiple Media Items", true);
     g_multi_import.num_files = 0;
 }
 
@@ -1782,6 +1845,7 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     snprintf(p->project_name, sizeof(p->project_name), "%s", fn ? fn + 1 : path);
     strip_ehs_extension(p->project_name);
     p->is_dirty = false;
+    record_project_change("Project Saved", false);
     return true;
 }
 
@@ -2001,6 +2065,7 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
     p->undo_mgr.count = 0;
     push_undo_state();
     p->is_dirty = false;
+    record_project_change("Project Imported", false);
 }
 
 void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
@@ -2142,6 +2207,143 @@ AudioItem* get_active_video_clip_at_playhead(ProjectTab *p) {
     return top_clip;
 }
 
+// Unified Clip Edge / Fade Handle / Body Hit-Test used by BOTH cursor hover (SDL_MOUSEMOTION) and click (SDL_MOUSEBUTTONDOWN).
+// Guarantees that whenever the double-arrow cursor (g_cursor_size_we) is active on a clip edge, dragging that edge ALWAYS works.
+static int hit_test_clip_interaction(ProjectTab *p, int mx, int my,
+                                     bool *out_trim_left, bool *out_trim_right,
+                                     bool *out_fade_in, bool *out_fade_out) {
+    if (out_trim_left)  *out_trim_left  = false;
+    if (out_trim_right) *out_trim_right = false;
+    if (out_fade_in)    *out_fade_in    = false;
+    if (out_fade_out)   *out_fade_out   = false;
+    if (!p || mx < g_daw.tcp_width) return -1;
+
+    const int edge_tol = 10; // Generous +-10px tolerance on left/right clip edges
+
+    // Pass 1: Check clip edges & fade handles first (top-to-bottom item order) so edge drag always succeeds when double-arrow is shown
+    for (int i = p->num_items - 1; i >= 0; i--) {
+        AudioItem *it = &p->items[i];
+        if (is_track_hidden(it->track_idx)) continue;
+        int iy = get_track_y_pos(it->track_idx);
+        int ih = p->track_heights[it->track_idx];
+        if (my < iy || my > iy + ih) continue;
+
+        int ix = g_daw.tcp_width + (int)((it->start_time - p->scroll_x_sec) * p->pixels_per_second);
+        int iw = (int)(it->duration * p->pixels_per_second);
+        if (iw < 2) iw = 2;
+
+        int fin_px  = (int)(get_item_fade_in(p, i)  * p->pixels_per_second);
+        int fout_px = (int)(get_item_fade_out(p, i) * p->pixels_per_second);
+        int fin_hx  = ix + fin_px;
+        int fout_hx = ix + iw - fout_px;
+
+        // Top 10px strip is for dragging the Fade-In / Fade-Out handle squares
+        if (my >= iy && my <= iy + 11) {
+            if (abs(mx - fin_hx) <= 8) {
+                if (out_fade_in) *out_fade_in = true;
+                return i;
+            }
+            if (abs(mx - fout_hx) <= 8) {
+                if (out_fade_out) *out_fade_out = true;
+                return i;
+            }
+        }
+
+        // Left or Right clip edge trim (works anywhere along the clip height within +-10px of ix or ix + iw)
+        if (abs(mx - ix) <= edge_tol && abs(mx - ix) <= abs(mx - (ix + iw))) {
+            if (out_trim_left) *out_trim_left = true;
+            return i;
+        }
+        if (abs(mx - (ix + iw)) <= edge_tol) {
+            if (out_trim_right) *out_trim_right = true;
+            return i;
+        }
+    }
+
+    // Pass 2: Check clip body interior for normal clip selection / moving
+    for (int i = p->num_items - 1; i >= 0; i--) {
+        AudioItem *it = &p->items[i];
+        if (is_track_hidden(it->track_idx)) continue;
+        int iy = get_track_y_pos(it->track_idx);
+        int ih = p->track_heights[it->track_idx];
+        if (my < iy || my > iy + ih) continue;
+
+        int ix = g_daw.tcp_width + (int)((it->start_time - p->scroll_x_sec) * p->pixels_per_second);
+        int iw = (int)(it->duration * p->pixels_per_second);
+        if (mx >= ix && mx <= ix + iw) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static inline bool point_in_rect(int x, int y, const SDL_Rect *r) {
+    return r && (x >= r->x && x <= r->x + r->w && y >= r->y && y <= r->y + r->h);
+}
+
+// Returns true if any modal popup is open OR if the mouse cursor (mx, my) is over any open popup window or dropdown menu.
+// Used to keep mouse cursor and focus strictly on the active popup/menu and never on the background panel.
+static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, SDL_Cursor **out_cursor) {
+    if (out_cursor) *out_cursor = g_cursor_arrow;
+
+    if (g_daw.save_prompt_open) return true;
+    if (g_multi_import.is_open) return true;
+
+    if (g_export.is_open) {
+        if (out_cursor) {
+            int ex = g_export.win_rect.x, ey = g_export.win_rect.y;
+            bool over_text = false;
+            if (my >= ey + 98 && my <= ey + 124 && mx >= ex + 130 && mx <= ex + 545) over_text = true;
+            else if (my >= ey + 132 && my <= ey + 158 && mx >= ex + 130 && mx <= ex + 545) over_text = true;
+            else if (g_export.format == EXPORT_FMT_MP4 && !g_export.mp4_aac_dropdown_open) {
+                int sy_sub = ey + 278;
+                int r1_y = sy_sub + 8;
+                int r2_y = sy_sub + 46;
+                if (my >= r1_y && my <= r1_y + 26 &&
+                    ((mx >= ex + 295 && mx <= ex + 365) || (mx >= ex + 390 && mx <= ex + 460) || (mx >= ex + 568 && mx <= ex + 648))) {
+                    over_text = true;
+                } else if (my >= r2_y && my <= r2_y + 26 && mx >= ex + 295 && mx <= ex + 395) {
+                    over_text = true;
+                }
+            }
+            if (over_text) *out_cursor = g_cursor_ibeam;
+        }
+        return true;
+    }
+
+    if (g_hide_popup_open && point_in_rect(mx, my, &g_hide_win_rect)) return true;
+    if (g_history_popup_open && point_in_rect(mx, my, &g_history_win_rect)) return true;
+    if (g_daw.script_manager_open && point_in_rect(mx, my, &g_daw.script_win_rect)) return true;
+
+    if (p && p->video.is_open && point_in_rect(mx, my, &p->video.rect)) {
+        if (out_cursor && mx >= p->video.rect.x + p->video.rect.w - 18 && my >= p->video.rect.y + p->video.rect.h - 18) {
+            *out_cursor = g_cursor_size_we;
+        }
+        return true;
+    }
+
+    int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+    if (g_daw.menu_file_open) {
+        SDL_Rect f_box = { 8, m_start, 196, 126 };
+        if (point_in_rect(mx, my, &f_box)) return true;
+    }
+    if (g_daw.menu_action_open) {
+        SDL_Rect a_box = { 60, m_start, 134, 56 };
+        if (point_in_rect(mx, my, &a_box)) return true;
+    }
+    if (g_menu_tools_open) {
+        SDL_Rect t_box = { 126, m_start, 150, 56 };
+        if (point_in_rect(mx, my, &t_box)) return true;
+    }
+    if (g_marker_context_menu_open) {
+        SDL_Rect cm_box = { g_marker_context_x, g_marker_context_y, 128, 28 };
+        if (point_in_rect(mx, my, &cm_box)) return true;
+    }
+
+    return false;
+}
+
 int main(int argc, char *argv[]) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
 
@@ -2173,6 +2375,9 @@ int main(int argc, char *argv[]) {
     memset(g_item_fade_in, 0, sizeof(g_item_fade_in));
     memset(g_item_fade_out, 0, sizeof(g_item_fade_out));
     memset(g_track_hidden, 0, sizeof(g_track_hidden));
+    memset(g_tab_history, 0, sizeof(g_tab_history));
+    memset(g_tab_history_count, 0, sizeof(g_tab_history_count));
+    memset(g_tab_notification, 0, sizeof(g_tab_notification));
 
     g_daw.num_tabs = 1;
     g_daw.active_tab = 0;
@@ -2189,6 +2394,7 @@ int main(int argc, char *argv[]) {
     init_tab_defaults(0, "Project 1");
     push_undo_state();
     g_daw.tabs[0].is_dirty = false;
+    record_project_change("Project Initialized", false);
 
     SDL_AudioSpec want;
     SDL_zero(want);
@@ -2274,9 +2480,29 @@ int main(int argc, char *argv[]) {
                     running = false;
                 }
             } else if (e.type == SDL_MOUSEWHEEL) {
-                if (g_daw.save_prompt_open || g_export.is_open) continue;
-                SDL_Keymod mod = SDL_GetModState();
                 int mx, my; SDL_GetMouseState(&mx, &my);
+                if (g_daw.save_prompt_open || g_export.is_open || g_multi_import.is_open) continue;
+                if (g_hide_popup_open && point_in_rect(mx, my, &g_hide_win_rect)) {
+                    int list_h = g_hide_win_rect.h - 106;
+                    int content_h = p->num_tracks * 26 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    g_hide_scroll_y -= e.wheel.y * 26;
+                    if (g_hide_scroll_y < 0) g_hide_scroll_y = 0;
+                    if (g_hide_scroll_y > max_sc) g_hide_scroll_y = max_sc;
+                    continue;
+                }
+                if (g_history_popup_open && point_in_rect(mx, my, &g_history_win_rect)) {
+                    int tab_i = get_valid_tab_idx();
+                    int list_h = g_history_win_rect.h - 86;
+                    int content_h = g_tab_history_count[tab_i] * 24 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    g_history_scroll_y -= e.wheel.y * 24;
+                    if (g_history_scroll_y < 0) g_history_scroll_y = 0;
+                    if (g_history_scroll_y > max_sc) g_history_scroll_y = max_sc;
+                    continue;
+                }
+                if (is_cursor_captured_by_popup_or_menu(p, mx, my, NULL)) continue;
+                SDL_Keymod mod = SDL_GetModState();
                 if (mod & KMOD_CTRL) {
                     double mouse_time = p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second;
                     p->pixels_per_second += e.wheel.y * 12.0f;
@@ -2386,7 +2612,7 @@ int main(int argc, char *argv[]) {
                         g_daw.input_focus = INPUT_FOCUS_NONE;
                         g_daw.editing_track_name_idx = -1;
                         SDL_StopTextInput();
-                        p->is_dirty = true;
+                        record_project_change("Renamed Track", true);
                     } else if (e.key.keysym.sym == SDLK_ESCAPE) {
                         g_daw.input_focus = INPUT_FOCUS_NONE;
                         g_daw.editing_track_name_idx = -1;
@@ -2407,7 +2633,7 @@ int main(int argc, char *argv[]) {
                         g_daw.input_focus = INPUT_FOCUS_NONE;
                         g_daw.editing_marker_idx = -1;
                         SDL_StopTextInput();
-                        p->is_dirty = true;
+                        record_project_change("Edited Marker Text", true);
                     } else if (e.key.keysym.sym == SDLK_ESCAPE) {
                         g_daw.input_focus = INPUT_FOCUS_NONE;
                         g_daw.editing_marker_idx = -1;
@@ -2442,8 +2668,8 @@ int main(int argc, char *argv[]) {
                 }
 
                 // Note: Pressing 'M' does NOT add a marker (markers only added via right-click)
-                if ((mod & KMOD_CTRL) && e.key.keysym.sym == SDLK_z) perform_undo();
-                else if ((mod & KMOD_CTRL) && (e.key.keysym.sym == SDLK_y || ((mod & KMOD_SHIFT) && e.key.keysym.sym == SDLK_z))) perform_redo();
+                if ((mod & KMOD_CTRL) && e.key.keysym.sym == SDLK_z) { perform_undo(); record_project_change("Undo Action", true); }
+                else if ((mod & KMOD_CTRL) && (e.key.keysym.sym == SDLK_y || ((mod & KMOD_SHIFT) && e.key.keysym.sym == SDLK_z))) { perform_redo(); record_project_change("Redo Action", true); }
                 else if ((mod & KMOD_CTRL) && e.key.keysym.sym == SDLK_s) {
                     daw_save_project_dialog(p, false);
                 }
@@ -2486,6 +2712,7 @@ int main(int argc, char *argv[]) {
                                 g_item_fade_out[tab_i][i] = 0.0;
                                 g_item_fade_in[tab_i][r_idx] = 0.0;
                                 g_item_fade_out[tab_i][r_idx] = fmin(orig_fout, r_item->duration);
+                                record_project_change("Split Media Clip", true);
                                 break;
                             }
                         }
@@ -2631,19 +2858,35 @@ int main(int argc, char *argv[]) {
                                     SDL_StartTextInput();
                                 }
                             }
-                            // Row 3: Audio: [AAC]  [128] kbps (AAC only for MP4)
+                            // Row 3: Audio: [AAC]  [ 120 / 192 / 320 kbps v ] dropdown menu
                             int r3_y = sy_sub + 84;
-                            if (my >= r3_y && my <= r3_y + 26) {
-                                g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
-                                if (mx >= ex + 295 && mx <= ex + 395) {
-                                    g_export.active_field = EXP_FIELD_MP4_A_KBPS;
-                                    SDL_StartTextInput();
+                            if (g_export.mp4_aac_dropdown_open) {
+                                int dd_x = ex + 295;
+                                int dd_y = r3_y + 26;
+                                int dd_w = 130;
+                                if (mx >= dd_x && mx <= dd_x + dd_w && my >= dd_y && my <= dd_y + 78) {
+                                    int sel_row = (my - dd_y) / 26;
+                                    if (sel_row == 0) strcpy(g_export.mp4_audio_kbps_str, "120");
+                                    else if (sel_row == 1) strcpy(g_export.mp4_audio_kbps_str, "192");
+                                    else if (sel_row == 2) strcpy(g_export.mp4_audio_kbps_str, "320");
+                                    g_export.mp4_aac_dropdown_open = false;
+                                    continue;
                                 }
                             }
+                            if (my >= r3_y && my <= r3_y + 26) {
+                                g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
+                                if (mx >= ex + 295 && mx <= ex + 425) {
+                                    g_export.mp4_aac_dropdown_open = !g_export.mp4_aac_dropdown_open;
+                                    continue;
+                                }
+                            }
+                            g_export.mp4_aac_dropdown_open = false;
+                        } else {
+                            g_export.mp4_aac_dropdown_open = false;
                         }
 
-                        // 7. Option: Two-pass render checkbox (ey + 440 .. ey + 466)
-                        int sy_opt = ey + 440;
+                        // 7. Option: Two-pass render checkbox (ey + 436 .. ey + 460)
+                        int sy_opt = ey + 436;
                         if (my >= sy_opt && my <= sy_opt + 24 && mx >= ex + 22 && mx <= ex + 240) {
                             g_export.two_pass_render = !g_export.two_pass_render;
                         }
@@ -2712,12 +2955,11 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // ================= HIDE TRACKS POPUP WINDOW INTERACTIONS =================
+                // ================= HIDE TRACKS POPUP WINDOW INTERACTIONS (WITH SCROLLBAR) =================
                 if (g_hide_popup_open) {
                     SDL_Rect *hr = &g_hide_win_rect;
                     int hx = hr->x, hy = hr->y, hw = hr->w, hh = hr->h;
 
-                    // Title bar drag or [X] close
                     if (mx >= hx && mx <= hx + hw && my >= hy && my <= hy + 28) {
                         if (mx >= hx + hw - 28) {
                             g_hide_popup_open = false;
@@ -2730,26 +2972,69 @@ int main(int argc, char *argv[]) {
                     }
 
                     if (mx >= hx && mx <= hx + hw && my >= hy + 28 && my <= hy + hh) {
-                        // Track checkbox list area (hy + 58 .. hy + hh - 48)
                         int list_y = hy + 58;
                         int list_h = hh - 106;
-                        if (my >= list_y && my < list_y + list_h && mx >= hx + 14 && mx <= hx + hw - 14) {
-                            int row = (my - (list_y + 4)) / 26;
+                        int sb_x = hx + hw - 28;
+                        if (my >= list_y && my < list_y + list_h && mx >= sb_x && mx <= hx + hw - 14) {
+                            g_hide_sb_dragging = true;
+                            g_hide_sb_start_my = my;
+                            g_hide_sb_orig_scroll = g_hide_scroll_y;
+                            continue;
+                        }
+                        if (my >= list_y && my < list_y + list_h && mx >= hx + 14 && mx < sb_x) {
+                            int row = (my - (list_y + 4) + g_hide_scroll_y) / 26;
                             if (row >= 0 && row < p->num_tracks) {
                                 set_track_hidden(row, !is_track_hidden(row));
+                                record_project_change(is_track_hidden(row) ? "Hidden Track" : "Shown Track", true);
                             }
                         }
 
-                        // Bottom action buttons: [Show All], [Hide All], [Close]
                         int b_y = hy + hh - 38;
                         if (my >= b_y && my <= b_y + 28) {
                             if (mx >= hx + 14 && mx <= hx + 114) {
                                 for (int t = 0; t < p->num_tracks; t++) set_track_hidden(t, false);
+                                record_project_change("Shown All Tracks", true);
                             } else if (mx >= hx + 124 && mx <= hx + 224) {
                                 for (int t = 0; t < p->num_tracks; t++) set_track_hidden(t, true);
+                                record_project_change("Hidden All Tracks", true);
                             } else if (mx >= hx + hw - 94 && mx <= hx + hw - 14) {
                                 g_hide_popup_open = false;
                             }
+                        }
+                        continue;
+                    }
+                }
+
+                // ================= PROJECT HISTORY POPUP WINDOW INTERACTIONS (100 ITEMS) =================
+                if (g_history_popup_open) {
+                    SDL_Rect *hsr = &g_history_win_rect;
+                    int hx = hsr->x, hy = hsr->y, hw = hsr->w, hh = hsr->h;
+
+                    if (mx >= hx && mx <= hx + hw && my >= hy && my <= hy + 28) {
+                        if (mx >= hx + hw - 28) {
+                            g_history_popup_open = false;
+                        } else {
+                            g_history_win_dragging = true;
+                            g_history_drag_off_x = mx - hx;
+                            g_history_drag_off_y = my - hy;
+                        }
+                        continue;
+                    }
+
+                    if (mx >= hx && mx <= hx + hw && my >= hy + 28 && my <= hy + hh) {
+                        int list_y = hy + 38;
+                        int list_h = hh - 86;
+                        int sb_x = hx + hw - 28;
+                        if (my >= list_y && my < list_y + list_h && mx >= sb_x && mx <= hx + hw - 14) {
+                            g_history_sb_dragging = true;
+                            g_history_sb_start_my = my;
+                            g_history_sb_orig_scroll = g_history_scroll_y;
+                            continue;
+                        }
+
+                        int b_y = hy + hh - 38;
+                        if (my >= b_y && my <= b_y + 28 && mx >= hx + hw - 98 && mx <= hx + hw - 14) {
+                            g_history_popup_open = false;
                         }
                         continue;
                     }
@@ -2847,8 +3132,12 @@ int main(int argc, char *argv[]) {
                         memset(g_item_fade_in[g_daw.num_tabs], 0, sizeof(g_item_fade_in[0]));
                         memset(g_item_fade_out[g_daw.num_tabs], 0, sizeof(g_item_fade_out[0]));
                         memset(g_track_hidden[g_daw.num_tabs], 0, sizeof(g_track_hidden[0]));
+                        memset(g_tab_history[g_daw.num_tabs], 0, sizeof(g_tab_history[0]));
+                        g_tab_history_count[g_daw.num_tabs] = 0;
+                        g_tab_notification[g_daw.num_tabs][0] = '\0';
                         g_daw.active_tab = g_daw.num_tabs++;
                         g_selected_marker_idx = -1;
+                        record_project_change("Project Created", false);
                     }
                     continue;
                 }
@@ -2903,31 +3192,29 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                if ((g_daw.menu_file_open || g_daw.menu_action_open) && (mx > 320 || my > 270)) {
-                    g_daw.menu_file_open = false;
-                    g_daw.menu_action_open = false;
-                    g_daw.submenu_export_audio_open = false;
-                    g_daw.submenu_export_video_open = false;
-                    continue;
-                }
-
                 if (g_daw.menu_file_open) {
-                    if (mx >= 8 && mx <= 200) {
-                        int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+                    int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+                    if (mx >= 8 && mx <= 204 && my >= m_start && my <= m_start + 126) {
                         if (my >= m_start && my < m_start + 24) {
-                            // Row 0: Import Project (.ehs) -> Clean Project Import with full metadata restoration
+                            // Row 0: Import Project (.ehs)
                             g_daw.menu_file_open = false;
                             daw_load_project_dialog(p, ren, win);
                             continue;
                         }
                         else if (my >= m_start + 24 && my < m_start + 48) {
-                            // Row 1: Export Project (.ehs) -> Clean Project Export with full metadata
+                            // Row 1: Export Project (.ehs)
+                            g_daw.menu_file_open = false;
+                            daw_save_project_dialog(p, false);
+                            continue;
+                        }
+                        else if (my >= m_start + 48 && my < m_start + 72) {
+                            // Row 2: Project Save As
                             g_daw.menu_file_open = false;
                             daw_save_project_dialog(p, true);
                             continue;
                         }
-                        else if (my >= m_start + 48 && my < m_start + 72) {
-                            // Row 2: Import Media (supports single or multiple media files)
+                        else if (my >= m_start + 72 && my < m_start + 96) {
+                            // Row 3: Import Media (supports single or multiple media files)
                             g_daw.menu_file_open = false;
                             static char sel_files[MAX_MULTI_IMPORT_FILES][512];
                             int num_sel = open_multi_media_dialog(sel_files, MAX_MULTI_IMPORT_FILES);
@@ -2952,8 +3239,8 @@ int main(int argc, char *argv[]) {
                             }
                             continue;
                         }
-                        else if (my >= m_start + 72 && my < m_start + 100) {
-                            // Row 3: Opens the unified Export Media Popup Window
+                        else if (my >= m_start + 96 && my <= m_start + 126) {
+                            // Row 4: Export Media (no 3 dots)
                             g_export.is_open = true;
                             g_export.win_rect.x = (win_w - g_export.win_rect.w) / 2;
                             g_export.win_rect.y = (win_h - g_export.win_rect.h) / 2;
@@ -2961,41 +3248,84 @@ int main(int argc, char *argv[]) {
                             g_export.progress_pct = 0;
                             g_export.elapsed_sec = 0.0;
                             g_export.est_remaining_sec = 0.0;
+                            g_export.mp4_aac_dropdown_open = false;
                             g_export.status_msg[0] = '\0';
                             g_daw.menu_file_open = false;
                             g_daw.submenu_export_audio_open = false;
                             g_daw.submenu_export_video_open = false;
                             continue;
                         }
+                    } else if (my > TABBAR_HEIGHT + TOPBAR_HEIGHT || mx > 260) {
+                        g_daw.menu_file_open = false;
+                        continue;
                     }
                 }
 
                 if (g_daw.menu_action_open) {
-                    if (mx >= 60 && mx <= 194) {
-                        int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+                    int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+                    if (mx >= 60 && mx <= 194 && my >= m_start && my <= m_start + 56) {
                         if (my >= m_start && my < m_start + 26) {
                             g_daw.script_manager_open = true;
                             g_daw.script_manager_is_python = false;
                             g_daw.menu_action_open = false;
                             continue;
-                        } else if (my >= m_start + 26 && my < m_start + 52) {
+                        } else if (my >= m_start + 26 && my <= m_start + 56) {
                             g_daw.script_manager_open = true;
                             g_daw.script_manager_is_python = true;
                             g_daw.menu_action_open = false;
                             continue;
                         }
+                    } else if (my > TABBAR_HEIGHT + TOPBAR_HEIGHT || mx < 60 || mx > 260) {
+                        g_daw.menu_action_open = false;
+                        continue;
+                    }
+                }
+
+                if (g_menu_tools_open) {
+                    int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+                    if (mx >= 126 && mx <= 276 && my >= m_start && my <= m_start + 56) {
+                        if (my >= m_start && my < m_start + 26) {
+                            // Submenu 1: Marker
+                            p->show_marker_lane = !p->show_marker_lane;
+                            g_menu_tools_open = false;
+                            continue;
+                        } else if (my >= m_start + 26 && my <= m_start + 56) {
+                            // Submenu 2: History (opens 100-entry Project History popup window)
+                            g_history_popup_open = true;
+                            g_history_win_rect.x = (win_w - g_history_win_rect.w) / 2;
+                            g_history_win_rect.y = (win_h - g_history_win_rect.h) / 2;
+                            g_menu_tools_open = false;
+                            continue;
+                        }
+                    } else if (my > TABBAR_HEIGHT + TOPBAR_HEIGHT || mx < 126 || mx > 280) {
+                        g_menu_tools_open = false;
+                        continue;
                     }
                 }
 
                 if (my >= TABBAR_HEIGHT && my <= TABBAR_HEIGHT + TOPBAR_HEIGHT) {
-                    // Left-side top menu: File | Action | Marker | Video
-                    if (mx >= 8 && mx <= 54) { g_daw.menu_file_open = !g_daw.menu_file_open; g_daw.menu_action_open = false; }
-                    else if (mx >= 60 && mx <= 120) { g_daw.menu_action_open = !g_daw.menu_action_open; g_daw.menu_file_open = false; }
-                    else if (mx >= 126 && mx <= 190) { p->show_marker_lane = !p->show_marker_lane; }
-                    else if (mx >= 196 && mx <= 256) { p->video.is_open = !p->video.is_open; }
+                    // Left-side top menu: File | Action | Tools | Video
+                    if (mx >= 8 && mx <= 54) {
+                        g_daw.menu_file_open = !g_daw.menu_file_open;
+                        g_daw.menu_action_open = false;
+                        g_menu_tools_open = false;
+                    }
+                    else if (mx >= 60 && mx <= 120) {
+                        g_daw.menu_action_open = !g_daw.menu_action_open;
+                        g_daw.menu_file_open = false;
+                        g_menu_tools_open = false;
+                    }
+                    else if (mx >= 126 && mx <= 184) {
+                        g_menu_tools_open = !g_menu_tools_open;
+                        g_daw.menu_file_open = false;
+                        g_daw.menu_action_open = false;
+                    }
+                    else if (mx >= 190 && mx <= 250) {
+                        p->video.is_open = !p->video.is_open;
+                    }
                     // Right-side top menu: Undo | Redo | Zoom- | Zoom+ | Range | Crossfade | Hide | Save
-                    else if (mx >= win_w - 520 && mx <= win_w - 468) { perform_undo(); }
-                    else if (mx >= win_w - 462 && mx <= win_w - 410) { perform_redo(); }
+                    else if (mx >= win_w - 520 && mx <= win_w - 468) { perform_undo(); record_project_change("Undo Action", true); }
+                    else if (mx >= win_w - 462 && mx <= win_w - 410) { perform_redo(); record_project_change("Redo Action", true); }
                     else if (mx >= win_w - 404 && mx <= win_w - 348) { p->pixels_per_second = fmaxf(15.0f, p->pixels_per_second * 0.8f); }
                     else if (mx >= win_w - 342 && mx <= win_w - 286) { p->pixels_per_second = fminf(400.0f, p->pixels_per_second * 1.25f); }
                     else if (mx >= win_w - 280 && mx <= win_w - 220) { handle_top_menu_range_button(p); }
@@ -3025,6 +3355,7 @@ int main(int argc, char *argv[]) {
                         p->track_heights[p->num_tracks] = 84;
                         snprintf(p->track_names[p->num_tracks], 64, "Track %d", p->num_tracks + 1);
                         p->num_tracks++;
+                        record_project_change("Added New Track", true);
                     } else if (mx >= 94 && mx <= 180) p->is_playing = !p->is_playing;
                     continue;
                 }
@@ -3086,7 +3417,7 @@ int main(int argc, char *argv[]) {
                             snprintf(def_txt, sizeof(def_txt), "Marker %d", p->num_markers);
                             set_marker_full_str(p, new_idx, def_txt);
                             g_selected_marker_idx = new_idx;
-                            p->is_dirty = true;
+                            record_project_change("Added Marker", true);
                         }
                     } else if (e.button.button == SDL_BUTTON_LEFT) {
                         if (hit_m >= 0) {
@@ -3157,7 +3488,7 @@ int main(int argc, char *argv[]) {
                             snprintf(def_txt, sizeof(def_txt), "Marker %d", p->num_markers);
                             set_marker_full_str(p, new_idx, def_txt);
                             g_selected_marker_idx = new_idx;
-                            p->is_dirty = true;
+                            record_project_change("Added Marker", true);
                         }
                     } else {
                         scrubbing_ruler = true;
@@ -3196,10 +3527,10 @@ int main(int argc, char *argv[]) {
                                 dragging_track_order_pushed_undo = false;
                                 handled_btn = true;
                             } else if (rel_y >= 30 && rel_y <= 56) {
-                                if (mx >= 8 && mx <= 26) { p->track_db[t] -= 1.0f; p->is_dirty = true; handled_btn = true; }
-                                else if (mx >= 76 && mx <= 94) { p->track_db[t] += 1.0f; p->is_dirty = true; handled_btn = true; }
-                                else if (mx >= 110 && mx <= 132) { p->tracks[t].mute = !p->tracks[t].mute; p->is_dirty = true; handled_btn = true; }
-                                else if (mx >= 138 && mx <= 160) { p->tracks[t].solo = !p->tracks[t].solo; p->is_dirty = true; handled_btn = true; }
+                                if (mx >= 8 && mx <= 26) { p->track_db[t] -= 1.0f; record_project_change("Adjusted Track Volume", true); handled_btn = true; }
+                                else if (mx >= 76 && mx <= 94) { p->track_db[t] += 1.0f; record_project_change("Adjusted Track Volume", true); handled_btn = true; }
+                                else if (mx >= 110 && mx <= 132) { p->tracks[t].mute = !p->tracks[t].mute; record_project_change("Toggled Track Mute", true); handled_btn = true; }
+                                else if (mx >= 138 && mx <= 160) { p->tracks[t].solo = !p->tracks[t].solo; record_project_change("Toggled Track Solo", true); handled_btn = true; }
                             } else if (rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx <= g_daw.tcp_width - 32) {
                                 if (e.button.clicks >= 2) {
                                     g_daw.input_focus = INPUT_FOCUS_TRACK_NAME;
@@ -3223,54 +3554,28 @@ int main(int argc, char *argv[]) {
 
                 if (mx >= g_daw.tcp_width && my > header_top_y && my < win_h - SCROLLBAR_SIZE) {
                     double click_time = p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second;
-                    int cur_y = header_top_y - p->scroll_y_px;
-                    int click_track = -1;
-                    for (int t = 0; t < p->num_tracks; t++) {
-                        if (is_track_hidden(t)) continue;
-                        if (my >= cur_y && my < cur_y + p->track_heights[t]) { click_track = t; break; }
-                        cur_y += p->track_heights[t];
-                    }
 
-                    bool clicked_clip = false;
-                    for (int i = p->num_items - 1; i >= 0; i--) {
-                        AudioItem *it = &p->items[i];
-                        if (is_track_hidden(it->track_idx)) continue;
-                        if (it->track_idx == click_track && click_time >= it->start_time && click_time <= it->start_time + it->duration) {
-                            clicked_clip = true;
-                            push_undo_state();
-                            if (ctrl_pressed) it->is_selected = !it->is_selected;
-                            else if (!shift_pressed && !it->is_selected) {
-                                for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
-                                it->is_selected = true;
-                            }
-                            dragging_item_idx = i;
-                            drag_start_mouse_time = click_time;
-                            item_orig_start = it->start_time;
-                            item_orig_dur = it->duration;
-                            item_orig_offset = it->offset_in_file;
+                    bool hit_tl = false, hit_tr = false, hit_fi = false, hit_fo = false;
+                    int hit_idx = hit_test_clip_interaction(p, mx, my, &hit_tl, &hit_tr, &hit_fi, &hit_fo);
 
-                            int ix = g_daw.tcp_width + (int)((it->start_time - p->scroll_x_sec) * p->pixels_per_second);
-                            int iw = (int)(it->duration * p->pixels_per_second);
-                            int iy = get_track_y_pos(it->track_idx) + 2;
-                            int fin_px  = (int)(get_item_fade_in(p, i)  * p->pixels_per_second);
-                            int fout_px = (int)(get_item_fade_out(p, i) * p->pixels_per_second);
-                            int fin_hx  = ix + fin_px;
-                            int fout_hx = ix + iw - fout_px;
-
-                            if (my >= iy && my <= iy + 18 && abs(mx - fin_hx) <= 10) {
-                                dragging_fade_in = true;
-                            } else if (my >= iy && my <= iy + 18 && abs(mx - fout_hx) <= 10) {
-                                dragging_fade_out = true;
-                            } else if (mx <= ix + 8) {
-                                dragging_trim_left = true;
-                            } else if (mx >= ix + iw - 8) {
-                                dragging_trim_right = true;
-                            }
-                            break;
+                    if (hit_idx >= 0) {
+                        AudioItem *it = &p->items[hit_idx];
+                        push_undo_state();
+                        if (ctrl_pressed) it->is_selected = !it->is_selected;
+                        else if (!shift_pressed && !it->is_selected) {
+                            for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
+                            it->is_selected = true;
                         }
-                    }
-
-                    if (!clicked_clip) {
+                        dragging_item_idx = hit_idx;
+                        drag_start_mouse_time = click_time;
+                        item_orig_start = it->start_time;
+                        item_orig_dur = it->duration;
+                        item_orig_offset = it->offset_in_file;
+                        dragging_trim_left  = hit_tl;
+                        dragging_trim_right = hit_tr;
+                        dragging_fade_in    = hit_fi;
+                        dragging_fade_out   = hit_fo;
+                    } else {
                         if (!ctrl_pressed && !shift_pressed) {
                             for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
                         }
@@ -3284,6 +3589,9 @@ int main(int argc, char *argv[]) {
                 p->video.is_dragging = false; p->video.is_resizing = false;
                 g_export.is_dragging = false;
                 g_hide_win_dragging = false;
+                g_hide_sb_dragging = false;
+                g_history_win_dragging = false;
+                g_history_sb_dragging = false;
                 g_multi_import.is_dragging = false;
                 dragging_scrollbar_h = false; dragging_scrollbar_v = false;
                 scrubbing_ruler = false;
@@ -3295,7 +3603,12 @@ int main(int argc, char *argv[]) {
                 dragging_track_order_idx = -1;
                 dragging_track_order_pushed_undo = false;
                 g_daw.script_win_dragging = false;
-                if (dragging_item_idx != -1) p->is_dirty = true;
+                if (dragging_item_idx != -1) {
+                    if (dragging_fade_in) record_project_change("Adjusted Clip Fade-In", true);
+                    else if (dragging_fade_out) record_project_change("Adjusted Clip Fade-Out", true);
+                    else if (dragging_trim_left || dragging_trim_right) record_project_change("Trimmed Clip Edge", true);
+                    else record_project_change("Moved Media Clip", true);
+                }
                 dragging_item_idx = -1;
                 dragging_trim_left = false; dragging_trim_right = false;
                 dragging_fade_in = false; dragging_fade_out = false;
@@ -3325,24 +3638,91 @@ int main(int argc, char *argv[]) {
                 if (g_export.is_open && g_export.is_dragging) {
                     g_export.win_rect.x = mx - g_export.drag_off_x;
                     g_export.win_rect.y = my - g_export.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
                     continue;
                 }
 
                 if (g_multi_import.is_open && g_multi_import.is_dragging) {
                     g_multi_import.win_rect.x = mx - g_multi_import.drag_off_x;
                     g_multi_import.win_rect.y = my - g_multi_import.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
                     continue;
                 }
 
                 if (g_hide_popup_open && g_hide_win_dragging) {
                     g_hide_win_rect.x = mx - g_hide_drag_off_x;
                     g_hide_win_rect.y = my - g_hide_drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+
+                if (g_hide_popup_open && g_hide_sb_dragging) {
+                    int list_h = g_hide_win_rect.h - 106;
+                    int content_h = p->num_tracks * 26 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    if (max_sc > 0 && list_h > 0) {
+                        int delta_y = my - g_hide_sb_start_my;
+                        g_hide_scroll_y = g_hide_sb_orig_scroll + (delta_y * content_h) / list_h;
+                        if (g_hide_scroll_y < 0) g_hide_scroll_y = 0;
+                        if (g_hide_scroll_y > max_sc) g_hide_scroll_y = max_sc;
+                    }
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+
+                if (g_history_popup_open && g_history_win_dragging) {
+                    g_history_win_rect.x = mx - g_history_drag_off_x;
+                    g_history_win_rect.y = my - g_history_drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+
+                if (g_history_popup_open && g_history_sb_dragging) {
+                    int tab_i = get_valid_tab_idx();
+                    int list_h = g_history_win_rect.h - 86;
+                    int content_h = g_tab_history_count[tab_i] * 24 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    if (max_sc > 0 && list_h > 0) {
+                        int delta_y = my - g_history_sb_start_my;
+                        g_history_scroll_y = g_history_sb_orig_scroll + (delta_y * content_h) / list_h;
+                        if (g_history_scroll_y < 0) g_history_scroll_y = 0;
+                        if (g_history_scroll_y > max_sc) g_history_scroll_y = max_sc;
+                    }
+                    SDL_SetCursor(g_cursor_arrow);
                     continue;
                 }
 
                 if (g_daw.script_win_dragging) {
                     g_daw.script_win_rect.x = mx - g_daw.script_drag_offset_x;
                     g_daw.script_win_rect.y = my - g_daw.script_drag_offset_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+
+                if (p->video.is_resizing) {
+                    int new_w = mx - p->video.rect.x;
+                    int new_h = my - p->video.rect.y;
+                    if (new_w >= 160) p->video.rect.w = new_w;
+                    if (new_h >= 100) p->video.rect.h = new_h;
+                    SDL_SetCursor(g_cursor_size_we);
+                    continue;
+                }
+                if (p->video.is_dragging) {
+                    p->video.rect.x = mx - p->video.drag_x;
+                    p->video.rect.y = my - p->video.drag_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+
+                // Request #1: When cursor is over any popup window or dropdown menu, keep cursor focused on popup/menu, not background panel
+                if (dragging_item_idx == -1 && !resizing_tcp_width && resizing_track_idx < 0 &&
+                    dragging_track_order_idx < 0 && !dragging_range_left && !dragging_range_right && !dragging_range_body &&
+                    !dragging_scrollbar_h && !dragging_scrollbar_v && !scrubbing_ruler) {
+                    SDL_Cursor *popup_cur = g_cursor_arrow;
+                    if (is_cursor_captured_by_popup_or_menu(p, mx, my, &popup_cur)) {
+                        SDL_SetCursor(popup_cur);
+                        continue;
+                    }
                 }
 
                 int ruler_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
@@ -3385,28 +3765,18 @@ int main(int argc, char *argv[]) {
                         }
                         cur_y += th;
                     }
-                } else if (!hovered_edge && mx >= g_daw.tcp_width && my > header_top_y) {
-                    for (int i = 0; i < p->num_items; i++) {
-                        AudioItem *it = &p->items[i];
-                        if (is_track_hidden(it->track_idx)) continue;
-                        int ix = g_daw.tcp_width + (int)((it->start_time - p->scroll_x_sec) * p->pixels_per_second);
-                        int iw = (int)(it->duration * p->pixels_per_second);
-                        int iy = get_track_y_pos(it->track_idx);
-                        int fin_hx  = ix + (int)(get_item_fade_in(p, i)  * p->pixels_per_second);
-                        int fout_hx = ix + iw - (int)(get_item_fade_out(p, i) * p->pixels_per_second);
-                        if (my >= iy && my <= iy + p->track_heights[it->track_idx]) {
-                            if (abs(mx - ix) <= 8 || abs(mx - (ix + iw)) <= 8 ||
-                                (my <= iy + 20 && (abs(mx - fin_hx) <= 10 || abs(mx - fout_hx) <= 10))) {
-                                SDL_SetCursor(g_cursor_size_we);
-                                hovered_edge = true;
-                                break;
-                            }
-                        }
+                } else if (!hovered_edge && mx >= g_daw.tcp_width && my > header_top_y && my < win_h - SCROLLBAR_SIZE) {
+                    // Request #5: Use exact same hit_test_clip_interaction as mouse down so double-arrow ALWAYS means edge is draggable
+                    bool h_tl = false, h_tr = false, h_fi = false, h_fo = false;
+                    int h_idx = hit_test_clip_interaction(p, mx, my, &h_tl, &h_tr, &h_fi, &h_fo);
+                    if (h_idx >= 0 && (h_tl || h_tr || h_fi || h_fo)) {
+                        SDL_SetCursor(g_cursor_size_we);
+                        hovered_edge = true;
                     }
                 }
                 if (!hovered_edge && !hovered_ibeam && !resizing_tcp_width && resizing_track_idx < 0 &&
                     dragging_track_order_idx < 0 && !dragging_range_left && !dragging_range_right &&
-                    !dragging_fade_in && !dragging_fade_out) {
+                    !dragging_fade_in && !dragging_fade_out && !dragging_trim_left && !dragging_trim_right) {
                     SDL_SetCursor(g_cursor_arrow);
                 }
 
@@ -3676,13 +4046,45 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &btn_add_tab, false, false);
         draw_text(ren, "+", cur_tab_x + 12, 9, c_white);
 
-        // 2. Top Bar (Left: File Action Marker Video | Right: Undo Redo Zoom- Zoom+ Range Crossfade Hide)
+        // Request #6: Project Change Notification Badge in the Top Tab Bar Section
+        int notif_x = cur_tab_x + add_btn_w + 10;
+        int notif_w = win_w - notif_x - 8;
+        if (notif_w > 120) {
+            int cur_t_idx = get_valid_tab_idx();
+            SDL_Rect notif_box = { notif_x, 3, notif_w, TABBAR_HEIGHT - 6 };
+            SDL_SetRenderDrawColor(ren, p->is_dirty ? 36 : 24, p->is_dirty ? 28 : 24, p->is_dirty ? 22 : 24, 255);
+            SDL_RenderFillRect(ren, &notif_box);
+            draw_brown_border_rect(ren, &notif_box, p->is_dirty, !p->is_dirty);
+
+            // Indicator dot
+            SDL_Rect dot_r = { notif_x + 8, 11, 8, 8 };
+            if (p->is_dirty) {
+                SDL_SetRenderDrawColor(ren, 235, 145, 45, 255);
+            } else {
+                SDL_SetRenderDrawColor(ren, 95, 175, 95, 255);
+            }
+            SDL_RenderFillRect(ren, &dot_r);
+
+            char notif_disp[200];
+            if (g_tab_notification[cur_t_idx][0] != '\0') {
+                snprintf(notif_disp, sizeof(notif_disp), "%s: %s",
+                         p->is_dirty ? "Modified" : "Saved",
+                         g_tab_notification[cur_t_idx]);
+            } else {
+                snprintf(notif_disp, sizeof(notif_disp), "%s",
+                         p->is_dirty ? "Modified (Unsaved changes)" : "Ready");
+            }
+            SDL_Rect notif_clip = { notif_x + 22, 4, notif_w - 28, TABBAR_HEIGHT - 8 };
+            draw_text_clipped(ren, notif_disp, notif_x + 22, 9, c_white, &notif_clip, NULL);
+        }
+
+        // 2. Top Bar (Left: File Action Tools Video | Right: Undo Redo Zoom- Zoom+ Range Crossfade Hide Save)
         SDL_Rect topbar = { 0, TABBAR_HEIGHT, win_w, TOPBAR_HEIGHT };
         SDL_SetRenderDrawColor(ren, 28, 28, 28, 255);
         SDL_RenderFillRect(ren, &topbar);
         draw_brown_border_rect(ren, &topbar, false, true);
 
-        // Left-side top menu: File | Action | Marker | Video
+        // Left-side top menu: File | Action | Tools | Video
         SDL_Rect btn_file = { 8, TABBAR_HEIGHT + 5, 46, 26 };
         SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
         SDL_RenderFillRect(ren, &btn_file);
@@ -3695,17 +4097,18 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &btn_act, g_daw.menu_action_open, false);
         draw_text(ren, "Action", 66, TABBAR_HEIGHT + 13, c_white);
 
-        SDL_Rect btn_mk_toggle = { 126, TABBAR_HEIGHT + 5, 64, 26 };
-        SDL_SetRenderDrawColor(ren, p->show_marker_lane ? 62 : 40, p->show_marker_lane ? 46 : 40, p->show_marker_lane ? 32 : 40, 255);
-        SDL_RenderFillRect(ren, &btn_mk_toggle);
-        draw_brown_border_rect(ren, &btn_mk_toggle, p->show_marker_lane, false);
-        draw_text(ren, "Marker", 134, TABBAR_HEIGHT + 13, c_white);
+        bool tools_active = g_menu_tools_open || g_history_popup_open || p->show_marker_lane;
+        SDL_Rect btn_tools = { 126, TABBAR_HEIGHT + 5, 58, 26 };
+        SDL_SetRenderDrawColor(ren, tools_active ? 62 : 40, tools_active ? 46 : 40, tools_active ? 32 : 40, 255);
+        SDL_RenderFillRect(ren, &btn_tools);
+        draw_brown_border_rect(ren, &btn_tools, g_menu_tools_open, false);
+        draw_text(ren, "Tools", 135, TABBAR_HEIGHT + 13, c_white);
 
-        SDL_Rect v_menu = { 196, TABBAR_HEIGHT + 5, 60, 26 };
+        SDL_Rect v_menu = { 190, TABBAR_HEIGHT + 5, 60, 26 };
         SDL_SetRenderDrawColor(ren, p->video.is_open ? 62 : 40, p->video.is_open ? 46 : 40, p->video.is_open ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &v_menu);
         draw_brown_border_rect(ren, &v_menu, p->video.is_open, false);
-        draw_text(ren, "Video", 206, TABBAR_HEIGHT + 13, c_white);
+        draw_text(ren, "Video", 200, TABBAR_HEIGHT + 13, c_white);
 
         // Center Timecode Display
         char clock_buf[32];
@@ -4492,18 +4895,31 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Delete", sr->x + 236, by + 8, c_white);
         }
 
-        // File Menu (Unified single "Export Media..." option)
+        // Tools Menu (Submenus: Marker, History)
+        if (g_menu_tools_open) {
+            int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+            SDL_Rect t_box = { 126, m_start, 150, 56 };
+            SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
+            SDL_RenderFillRect(ren, &t_box);
+            draw_brown_border_rect(ren, &t_box, true, false);
+
+            draw_text(ren, p->show_marker_lane ? "Marker [ON]" : "Marker", 136, m_start + 8, c_white);
+            draw_text(ren, "History", 136, m_start + 32, c_white);
+        }
+
+        // File Menu (Import Project, Export Project, Project Save As, Import Media, Export Media)
         if (g_daw.menu_file_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect m_box = { 8, m_start, 192, 102 };
+            SDL_Rect m_box = { 8, m_start, 196, 126 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &m_box);
-            draw_brown_border_rect(ren, &m_box, false, false);
+            draw_brown_border_rect(ren, &m_box, true, false);
 
             draw_text(ren, "Import Project (.ehs)", 16, m_start + 6, c_white);
             draw_text(ren, "Export Project (.ehs)", 16, m_start + 30, c_white);
-            draw_text(ren, "Import Media", 16, m_start + 54, c_white);
-            draw_text(ren, "Export Media...", 16, m_start + 78, c_white);
+            draw_text(ren, "Project Save As", 16, m_start + 54, c_white);
+            draw_text(ren, "Import Media", 16, m_start + 78, c_white);
+            draw_text(ren, "Export Media", 16, m_start + 102, c_white);
         }
 
         // Floating Video Monitor (With Black Gap Handling & Brown Borders)
@@ -4852,8 +5268,7 @@ int main(int argc, char *argv[]) {
                 }
                 draw_text(ren, "kbps", ex + 405, r2_y + 7, c_white);
 
-                // Row 3 (matching image_736e58.png — AAC only for MP4 video):
-                // Audio: [ AAC ]   [ 128 ] kbps
+                // Row 3: Audio: [ AAC ]   [ 120 / 192 / 320 kbps  v ] dropdown menu
                 int r3_y = sy_sub + 84;
                 draw_text(ren, "Audio:", ex + 34, r3_y + 7, c_white);
 
@@ -4863,18 +5278,14 @@ int main(int argc, char *argv[]) {
                 draw_brown_border_rect(ren, &box_ac_aac, true, false);
                 draw_text(ren, "AAC", ex + 104, r3_y + 7, c_white);
 
-                SDL_Rect box_akbps = { ex + 295, r3_y, 100, 26 };
-                bool ed_ak = (g_export.active_field == EXP_FIELD_MP4_A_KBPS);
-                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+                SDL_Rect box_akbps = { ex + 295, r3_y, 130, 26 };
+                SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
                 SDL_RenderFillRect(ren, &box_akbps);
-                draw_brown_border_rect(ren, &box_akbps, ed_ak, false);
-                draw_text(ren, g_export.mp4_audio_kbps_str, box_akbps.x + 8, r3_y + 7, c_white);
-                if (ed_ak && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                    int cx = box_akbps.x + 8 + (int)strlen(g_export.mp4_audio_kbps_str) * 8;
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, r3_y + 5, cx, r3_y + 21);
-                }
-                draw_text(ren, "kbps", ex + 405, r3_y + 7, c_white);
+                draw_brown_border_rect(ren, &box_akbps, g_export.mp4_aac_dropdown_open, false);
+                char aac_rate_lbl[32];
+                snprintf(aac_rate_lbl, sizeof(aac_rate_lbl), "%s kbps", g_export.mp4_audio_kbps_str);
+                draw_text(ren, aac_rate_lbl, box_akbps.x + 10, r3_y + 7, c_white);
+                draw_text(ren, "v", box_akbps.x + box_akbps.w - 18, r3_y + 7, c_muted);
             }
 
             // ---- 5. OPTION: TWO-PASS RENDER CHECKBOX ----
@@ -4889,6 +5300,28 @@ int main(int argc, char *argv[]) {
                 draw_text(ren, "x", ex + 28, sy_opt + 5, c_white);
             }
             draw_text(ren, "Option: Two-pass render", ex + 50, sy_opt + 6, c_white);
+
+            // Render MP4 AAC Bitrate Dropdown Menu on top if open (120 kbps, 192 kbps, 320 kbps)
+            if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
+                int dd_x = ex + 295;
+                int dd_y = sy_sub + 84 + 26;
+                int dd_w = 130;
+                SDL_Rect dd_box = { dd_x, dd_y, dd_w, 78 };
+                SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+                SDL_RenderFillRect(ren, &dd_box);
+                draw_brown_border_rect(ren, &dd_box, true, false);
+
+                const char *rates[3] = { "120", "192", "320" };
+                const char *rate_labels[3] = { "120 kbps", "192 kbps", "320 kbps" };
+                for (int r_i = 0; r_i < 3; r_i++) {
+                    bool is_cur = (strcmp(g_export.mp4_audio_kbps_str, rates[r_i]) == 0);
+                    SDL_Rect r_item = { dd_x + 2, dd_y + r_i * 26 + 2, dd_w - 4, 22 };
+                    SDL_SetRenderDrawColor(ren, is_cur ? 68 : 30, is_cur ? 48 : 28, is_cur ? 32 : 26, 255);
+                    SDL_RenderFillRect(ren, &r_item);
+                    draw_brown_border_rect(ren, &r_item, is_cur, !is_cur);
+                    draw_text(ren, rate_labels[r_i], dd_x + 12, dd_y + r_i * 26 + 7, c_white);
+                }
+            }
 
             // ---- 6. PROCESSING PROGRESS BAR, PERCENTAGE (%) & PROCESSING TIME ----
             SDL_Rect bar_bg = { ex + 22, ey + 468, ew - 44, 24 };
@@ -4939,7 +5372,7 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Cancel", ex + ew - 92, btn_y + 10, c_white);
         }
 
-        // ================= HIDE TRACKS POPUP WINDOW =================
+        // ================= HIDE TRACKS POPUP WINDOW (WITH SCROLLING) =================
         if (g_hide_popup_open) {
             SDL_Rect *hr = &g_hide_win_rect;
             int hx = hr->x, hy = hr->y, hw = hr->w, hh = hr->h;
@@ -4961,20 +5394,26 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Hide Tracks", hx + 12, hy + 8, c_white);
             draw_text(ren, "X", hx + hw - 18, hy + 8, c_white);
 
-            draw_text(ren, "Click checkbox to hide track:", hx + 14, hy + 36, c_muted);
+            draw_text(ren, "Click checkbox to hide track (scroll wheel / bar):", hx + 14, hy + 36, c_muted);
 
             SDL_Rect list_box = { hx + 14, hy + 58, hw - 28, hh - 106 };
             SDL_SetRenderDrawColor(ren, 18, 17, 16, 255);
             SDL_RenderFillRect(ren, &list_box);
             draw_brown_border_rect(ren, &list_box, false, true);
 
-            SDL_RenderSetClipRect(ren, &list_box);
+            int content_h = p->num_tracks * 26 + 8;
+            int max_sc = (content_h > list_box.h) ? (content_h - list_box.h) : 0;
+            if (g_hide_scroll_y > max_sc) g_hide_scroll_y = max_sc;
+            if (g_hide_scroll_y < 0) g_hide_scroll_y = 0;
+
+            SDL_Rect items_clip = { list_box.x + 2, list_box.y + 2, list_box.w - 18, list_box.h - 4 };
+            SDL_RenderSetClipRect(ren, &items_clip);
             for (int t = 0; t < p->num_tracks; t++) {
-                int ry = list_box.y + 4 + t * 26;
+                int ry = list_box.y + 4 + t * 26 - g_hide_scroll_y;
                 if (ry + 24 < list_box.y || ry > list_box.y + list_box.h) continue;
 
                 bool hid = is_track_hidden(t);
-                SDL_Rect row_r = { list_box.x + 4, ry, list_box.w - 8, 24 };
+                SDL_Rect row_r = { list_box.x + 4, ry, list_box.w - 22, 24 };
                 SDL_SetRenderDrawColor(ren, hid ? 48 : 28, hid ? 34 : 26, hid ? 24 : 24, 255);
                 SDL_RenderFillRect(ren, &row_r);
                 draw_brown_border_rect(ren, &row_r, hid, !hid);
@@ -4990,11 +5429,26 @@ int main(int argc, char *argv[]) {
                 char trk_lbl[96];
                 snprintf(trk_lbl, sizeof(trk_lbl), "%d. %s", t + 1, p->track_names[t]);
                 SDL_Rect lbl_clip = { row_r.x + 30, ry + 2, row_r.w - 104, 20 };
-                draw_text_clipped(ren, trk_lbl, row_r.x + 32, ry + 5, c_white, &lbl_clip, &list_box);
+                draw_text_clipped(ren, trk_lbl, row_r.x + 32, ry + 5, c_white, &lbl_clip, &items_clip);
 
                 draw_text(ren, hid ? "Hidden" : "Visible", row_r.x + row_r.w - 64, ry + 5, hid ? c_white : c_muted);
             }
             SDL_RenderSetClipRect(ren, NULL);
+
+            // Vertical Scrollbar inside Hide Tracks list
+            SDL_Rect sb_track = { list_box.x + list_box.w - 14, list_box.y + 2, 12, list_box.h - 4 };
+            SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+            SDL_RenderFillRect(ren, &sb_track);
+            draw_brown_border_rect(ren, &sb_track, false, true);
+
+            int thumb_h = (content_h > list_box.h && content_h > 0)
+                          ? fmax(24, (sb_track.h * list_box.h) / content_h)
+                          : sb_track.h;
+            int thumb_y = sb_track.y + ((max_sc > 0) ? ((g_hide_scroll_y * (sb_track.h - thumb_h)) / max_sc) : 0);
+            SDL_Rect sb_thumb = { sb_track.x + 1, thumb_y, sb_track.w - 2, thumb_h };
+            SDL_SetRenderDrawColor(ren, 92, 64, 42, 255);
+            SDL_RenderFillRect(ren, &sb_thumb);
+            draw_brown_border_rect(ren, &sb_thumb, false, false);
 
             int b_y = hy + hh - 38;
             SDL_Rect b_show_all = { hx + 14, b_y, 100, 28 };
@@ -5014,6 +5468,87 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &b_close);
             draw_brown_border_rect(ren, &b_close, true, false);
             draw_text(ren, "Close", hx + hw - 74, b_y + 8, c_white);
+        }
+
+        // ================= PROJECT HISTORY POPUP WINDOW (100 CHANGES LIST) =================
+        if (g_history_popup_open) {
+            SDL_Rect *hsr = &g_history_win_rect;
+            int hx = hsr->x, hy = hsr->y, hw = hsr->w, hh = hsr->h;
+            int tab_i = get_valid_tab_idx();
+            int h_cnt = g_tab_history_count[tab_i];
+
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+            SDL_Rect hs_shadow = { hx + 6, hy + 6, hw, hh };
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
+            SDL_RenderFillRect(ren, &hs_shadow);
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+            SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+            SDL_RenderFillRect(ren, hsr);
+            draw_brown_border_rect(ren, hsr, true, false);
+
+            SDL_Rect hs_hdr = { hx, hy, hw, 28 };
+            SDL_SetRenderDrawColor(ren, 42, 34, 28, 255);
+            SDL_RenderFillRect(ren, &hs_hdr);
+            draw_brown_border_rect(ren, &hs_hdr, false, false);
+            char hs_title[96];
+            snprintf(hs_title, sizeof(hs_title), "Project History (%d / 100 Changes)", h_cnt);
+            draw_text(ren, hs_title, hx + 12, hy + 8, c_white);
+            draw_text(ren, "X", hx + hw - 18, hy + 8, c_white);
+
+            SDL_Rect list_box = { hx + 14, hy + 38, hw - 28, hh - 86 };
+            SDL_SetRenderDrawColor(ren, 18, 17, 16, 255);
+            SDL_RenderFillRect(ren, &list_box);
+            draw_brown_border_rect(ren, &list_box, false, true);
+
+            int content_h = h_cnt * 24 + 8;
+            int max_sc = (content_h > list_box.h) ? (content_h - list_box.h) : 0;
+            if (g_history_scroll_y > max_sc) g_history_scroll_y = max_sc;
+            if (g_history_scroll_y < 0) g_history_scroll_y = 0;
+
+            SDL_Rect hs_clip = { list_box.x + 2, list_box.y + 2, list_box.w - 18, list_box.h - 4 };
+            SDL_RenderSetClipRect(ren, &hs_clip);
+            for (int r = 0; r < h_cnt; r++) {
+                // Display newest changes first (from h_cnt - 1 down to 0)
+                int src_idx = (h_cnt - 1) - r;
+                int ry = list_box.y + 4 + r * 24 - g_history_scroll_y;
+                if (ry + 22 < list_box.y || ry > list_box.y + list_box.h) continue;
+
+                SDL_Rect row_r = { list_box.x + 4, ry, list_box.w - 22, 22 };
+                SDL_SetRenderDrawColor(ren, (r == 0) ? 42 : 26, (r == 0) ? 32 : 24, (r == 0) ? 24 : 22, 255);
+                SDL_RenderFillRect(ren, &row_r);
+                draw_brown_border_rect(ren, &row_r, r == 0, r != 0);
+
+                char row_txt[160];
+                snprintf(row_txt, sizeof(row_txt), "%03d. %s", src_idx + 1, g_tab_history[tab_i][src_idx]);
+                SDL_Rect r_clip = { row_r.x + 6, ry + 2, row_r.w - 12, 18 };
+                draw_text_clipped(ren, row_txt, row_r.x + 8, ry + 4, (r == 0) ? c_white : c_muted, &r_clip, &hs_clip);
+            }
+            SDL_RenderSetClipRect(ren, NULL);
+
+            // Vertical Scrollbar inside History list
+            SDL_Rect sb_track = { list_box.x + list_box.w - 14, list_box.y + 2, 12, list_box.h - 4 };
+            SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+            SDL_RenderFillRect(ren, &sb_track);
+            draw_brown_border_rect(ren, &sb_track, false, true);
+
+            int thumb_h = (content_h > list_box.h && content_h > 0)
+                          ? fmax(24, (sb_track.h * list_box.h) / content_h)
+                          : sb_track.h;
+            int thumb_y = sb_track.y + ((max_sc > 0) ? ((g_history_scroll_y * (sb_track.h - thumb_h)) / max_sc) : 0);
+            SDL_Rect sb_thumb = { sb_track.x + 1, thumb_y, sb_track.w - 2, thumb_h };
+            SDL_SetRenderDrawColor(ren, 92, 64, 42, 255);
+            SDL_RenderFillRect(ren, &sb_thumb);
+            draw_brown_border_rect(ren, &sb_thumb, false, false);
+
+            int b_y = hy + hh - 38;
+            draw_text(ren, "Format: yy:mm:dd::hh:mm:ss:", hx + 16, b_y + 8, c_muted);
+
+            SDL_Rect b_close = { hx + hw - 98, b_y, 84, 28 };
+            SDL_SetRenderDrawColor(ren, 68, 46, 30, 255);
+            SDL_RenderFillRect(ren, &b_close);
+            draw_brown_border_rect(ren, &b_close, true, false);
+            draw_text(ren, "Close", hx + hw - 76, b_y + 8, c_white);
         }
 
         // ================= INSERT MULTIPLE MEDIA ITEMS POPUP WINDOW =================
