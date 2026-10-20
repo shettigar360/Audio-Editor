@@ -743,21 +743,214 @@ static void paste_clipboard_items_at_playhead(ProjectTab *p) {
     record_project_change("Edit: Paste", true);
 }
 
-// Helper to draw a 1px or 2px BROWN border rectangle across all UI elements
+#ifndef DAW_THEME_STATE_DEFINED
+#define DAW_THEME_STATE_DEFINED
+
+#define MAX_SAVED_THEMES 32
+#define THEMES_JSON_FILENAME "themes_settings.json"
+
+typedef struct {
+    char name[48];
+    uint8_t r, g, b, a;
+} SavedThemeEntry;
+
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+
+    // Active ARGB Theme Color (Default Orange: R=205, G=138, B=72, A=255)
+    uint8_t r, g, b, a;
+    float h, s, v;
+
+    bool dragging_sv;
+    bool dragging_hue;
+    bool dragging_alpha;
+
+    bool code_focused;
+    char code_buf[64];
+
+    SavedThemeEntry saved[MAX_SAVED_THEMES];
+    int num_saved;
+    int selected_saved_idx;
+    int saved_scroll_y;
+    bool saved_sb_dragging;
+    int saved_sb_start_my;
+    int saved_sb_orig_scroll;
+
+    char status_msg[128];
+} ThemeManagerState;
+
+static ThemeManagerState g_theme = {
+    false,
+    { 340, 88, 580, 420 },
+    false, 0, 0,
+    205, 138, 72, 255,
+    29.77f, 0.6488f, 0.8039f,
+    false, false, false,
+    false,
+    "rgba(205, 138, 72, 1.00)",
+    {{{0}, 0, 0, 0, 0}}, 0, 0, 0, false, 0, 0,
+    ""
+};
+
+// Script Manager window scrolling, edge-resize, and status state
+static int  g_script_scroll_y = 0;
+static bool g_script_sb_dragging = false;
+static int  g_script_sb_start_my = 0;
+static int  g_script_sb_orig_scroll = 0;
+static int  g_script_resize_edge = 0;
+static int  g_script_resize_start_mx = 0;
+static int  g_script_resize_start_my = 0;
+static SDL_Rect g_script_resize_orig_rect = { 390, 140, 480, 320 };
+static char g_script_status_msg[128] = "";
+
+static inline void theme_hsv_to_rgb(float h, float s, float v, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    if (s < 0.0f) s = 0.0f;
+    if (s > 1.0f) s = 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    while (h < 0.0f) h += 360.0f;
+    while (h >= 360.0f) h -= 360.0f;
+
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float rf = 0.0f, gf = 0.0f, bf = 0.0f;
+
+    if (h < 60.0f)       { rf = c; gf = x; bf = 0.0f; }
+    else if (h < 120.0f) { rf = x; gf = c; bf = 0.0f; }
+    else if (h < 180.0f) { rf = 0.0f; gf = c; bf = x; }
+    else if (h < 240.0f) { rf = 0.0f; gf = x; bf = c; }
+    else if (h < 300.0f) { rf = x; gf = 0.0f; bf = c; }
+    else                 { rf = c; gf = 0.0f; bf = x; }
+
+    int ri = (int)((rf + m) * 255.0f + 0.5f);
+    int gi = (int)((gf + m) * 255.0f + 0.5f);
+    int bi = (int)((bf + m) * 255.0f + 0.5f);
+    if (ri < 0) ri = 0; else if (ri > 255) ri = 255;
+    if (gi < 0) gi = 0; else if (gi > 255) gi = 255;
+    if (bi < 0) bi = 0; else if (bi > 255) bi = 255;
+    if (out_r) *out_r = (uint8_t)ri;
+    if (out_g) *out_g = (uint8_t)gi;
+    if (out_b) *out_b = (uint8_t)bi;
+}
+
+static inline void theme_rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b, float *out_h, float *out_s, float *out_v) {
+    float rf = (float)r / 255.0f;
+    float gf = (float)g / 255.0f;
+    float bf = (float)b / 255.0f;
+    float cmax = fmaxf(rf, fmaxf(gf, bf));
+    float cmin = fminf(rf, fminf(gf, bf));
+    float delta = cmax - cmin;
+
+    float h = 0.0f;
+    if (delta > 0.0001f) {
+        if (cmax == rf) {
+            h = 60.0f * fmodf((gf - bf) / delta, 6.0f);
+        } else if (cmax == gf) {
+            h = 60.0f * (((bf - rf) / delta) + 2.0f);
+        } else {
+            h = 60.0f * (((rf - gf) / delta) + 4.0f);
+        }
+    }
+    if (h < 0.0f) h += 360.0f;
+    float s = (cmax > 0.0001f) ? (delta / cmax) : 0.0f;
+    float v = cmax;
+    if (out_h) *out_h = h;
+    if (out_s) *out_s = s;
+    if (out_v) *out_v = v;
+}
+
+static inline void sync_theme_code_string(void) {
+    snprintf(g_theme.code_buf, sizeof(g_theme.code_buf),
+             "rgba(%d, %d, %d, %.2f)",
+             (int)g_theme.r, (int)g_theme.g, (int)g_theme.b,
+             (double)g_theme.a / 255.0);
+}
+
+// Computes effective RGB of active theme blended with its alpha over dark base so UI elements stay readable
+static inline void get_theme_effective_rgb(uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    float af = (float)g_theme.a / 255.0f;
+    if (af < 0.15f) af = 0.15f;
+    int er = (int)(36.0f * (1.0f - af) + (float)g_theme.r * af + 0.5f);
+    int eg = (int)(36.0f * (1.0f - af) + (float)g_theme.g * af + 0.5f);
+    int eb = (int)(36.0f * (1.0f - af) + (float)g_theme.b * af + 0.5f);
+    if (er < 0) er = 0; else if (er > 255) er = 255;
+    if (eg < 0) eg = 0; else if (eg > 255) eg = 255;
+    if (eb < 0) eb = 0; else if (eb > 255) eb = 255;
+    if (out_r) *out_r = (uint8_t)er;
+    if (out_g) *out_g = (uint8_t)eg;
+    if (out_b) *out_b = (uint8_t)eb;
+}
+
+// Computes a subtle theme-tinted surface fill color for headers, active buttons, and scrollbar thumbs
+static inline void get_theme_surface_rgb(uint8_t base_val, float weight, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    uint8_t er, eg, eb;
+    get_theme_effective_rgb(&er, &eg, &eb);
+    int sr = (int)((float)base_val * (1.0f - weight) + (float)er * weight + 0.5f);
+    int sg = (int)((float)base_val * (1.0f - weight) + (float)eg * weight + 0.5f);
+    int sb = (int)((float)base_val * (1.0f - weight) + (float)eb * weight + 0.5f);
+    if (sr < 0) sr = 0; else if (sr > 255) sr = 255;
+    if (sg < 0) sg = 0; else if (sg > 255) sg = 255;
+    if (sb < 0) sb = 0; else if (sb > 255) sb = 255;
+    if (out_r) *out_r = (uint8_t)sr;
+    if (out_g) *out_g = (uint8_t)sg;
+    if (out_b) *out_b = (uint8_t)sb;
+}
+
+static inline SDL_Color get_theme_accent_sdl_color(void) {
+    uint8_t er, eg, eb;
+    get_theme_effective_rgb(&er, &eg, &eb);
+    int ar = er + 25; if (ar > 255) ar = 255;
+    int ag = eg + 25; if (ag > 255) ag = 255;
+    int ab = eb + 20; if (ab > 255) ab = 255;
+    SDL_Color c = { (Uint8)ar, (Uint8)ag, (Uint8)ab, 255 };
+    return c;
+}
+static void init_default_saved_themes(void) {
+    if (g_theme.num_saved > 0) return;
+    static const struct { const char *name; uint8_t r, g, b, a; } defs[] = {
+        { "Default Orange", 205, 138,  72, 255 },
+        { "Emerald Green",   77, 191,  59, 130 },
+        { "Forest Green",    77, 191,  59, 255 },
+        { "Studio Blue",     68, 150, 235, 255 },
+        { "Royal Purple",   162,  98, 232, 255 },
+        { "Crimson Red",    224,  78,  78, 255 },
+        { "Cyber Cyan",      48, 198, 208, 255 }
+    };
+    int nd = (int)(sizeof(defs) / sizeof(defs[0]));
+    for (int i = 0; i < nd && g_theme.num_saved < MAX_SAVED_THEMES; i++) {
+        SavedThemeEntry *st = &g_theme.saved[g_theme.num_saved++];
+        strncpy(st->name, defs[i].name, sizeof(st->name) - 1);
+        st->name[sizeof(st->name) - 1] = '\0';
+        st->r = defs[i].r;
+        st->g = defs[i].g;
+        st->b = defs[i].b;
+        st->a = defs[i].a;
+    }
+}
+#endif // DAW_THEME_STATE_DEFINED
+
+// Helper to draw a 1px or 2px THEME-COLORED border rectangle across all UI elements (default Orange)
 static inline void draw_brown_border_rect(SDL_Renderer *ren, const SDL_Rect *r, bool thick, bool faded) {
     if (!r || r->w <= 0 || r->h <= 0) return;
+    uint8_t br, bg, bb;
+    get_theme_effective_rgb(&br, &bg, &bb);
     if (thick) {
-        SDL_SetRenderDrawColor(ren, 205, 138, 72, 255);
+        SDL_SetRenderDrawColor(ren, br, bg, bb, 255);
         SDL_RenderDrawRect(ren, r);
         if (r->w > 2 && r->h > 2) {
             SDL_Rect inner = { r->x + 1, r->y + 1, r->w - 2, r->h - 2 };
             SDL_RenderDrawRect(ren, &inner);
         }
     } else if (faded) {
-        SDL_SetRenderDrawColor(ren, 118, 78, 46, 255);
+        SDL_SetRenderDrawColor(ren, (uint8_t)((br * 58) / 100), (uint8_t)((bg * 57) / 100), (uint8_t)((bb * 63) / 100), 255);
         SDL_RenderDrawRect(ren, r);
     } else {
-        SDL_SetRenderDrawColor(ren, 152, 98, 54, 255);
+        SDL_SetRenderDrawColor(ren, (uint8_t)((br * 74) / 100), (uint8_t)((bg * 71) / 100), (uint8_t)((bb * 75) / 100), 255);
         SDL_RenderDrawRect(ren, r);
     }
 }
@@ -784,6 +977,230 @@ static void draw_text_clipped(SDL_Renderer *ren, const char *text, int x, int y,
         draw_text(ren, text, x, y, col);
     }
     SDL_RenderSetClipRect(ren, parent_clip);
+}
+
+// Renders the Tools -> Themes ARGB Popup Window (matching image_0d0094.png & image_0d0834.png)
+static void render_themes_popup_window(SDL_Renderer *ren) {
+    if (!g_theme.is_open) return;
+    init_default_saved_themes();
+
+    SDL_Rect *wr = &g_theme.win_rect;
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white = { 228, 228, 228, 255 };
+    SDL_Color c_muted = { 150, 145, 140, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    // Drop Shadow
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    // Main Window Box
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    // Title Bar
+    SDL_Rect hdr = { wx, wy, ww, 30 };
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(28, 0.22f, &hr, &hg, &hb);
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Themes - ARGB Color Settings", wx + 14, wy + 9, c_white);
+    draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
+
+    // ---- LEFT SIDE: 2D SV Square, Hue Rainbow Slider, Checkerboard Alpha Slider, rgba() Code Box ----
+    int p_x = wx + 18;
+    int sv_y = wy + 44;
+    int sv_w = 256;
+    int sv_h = 164;
+
+    // 1. 2D Saturation / Value Color Square (matching image_0d0094.png top box)
+    for (int gy = 0; gy < sv_h; gy += 2) {
+        float v_val = 1.0f - ((float)gy / (float)(sv_h - 1));
+        for (int gx = 0; gx < sv_w; gx += 2) {
+            float s_val = (float)gx / (float)(sv_w - 1);
+            uint8_t cr, cg, cb;
+            theme_hsv_to_rgb(g_theme.h, s_val, v_val, &cr, &cg, &cb);
+            SDL_Rect cell = { p_x + gx, sv_y + gy, 2, 2 };
+            SDL_SetRenderDrawColor(ren, cr, cg, cb, 255);
+            SDL_RenderFillRect(ren, &cell);
+        }
+    }
+    SDL_Rect sv_rect = { p_x, sv_y, sv_w, sv_h };
+    draw_brown_border_rect(ren, &sv_rect, false, false);
+
+    // Selector square inside 2D SV picker
+    int cur_sv_x = p_x + (int)(g_theme.s * (float)(sv_w - 1));
+    int cur_sv_y = sv_y + (int)((1.0f - g_theme.v) * (float)(sv_h - 1));
+    SDL_Rect sv_knob_out = { cur_sv_x - 7, cur_sv_y - 7, 14, 14 };
+    SDL_Rect sv_knob_in  = { cur_sv_x - 6, cur_sv_y - 6, 12, 12 };
+    SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
+    SDL_RenderDrawRect(ren, &sv_knob_out);
+    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+    SDL_RenderDrawRect(ren, &sv_knob_in);
+
+    // 2. Rainbow Hue Slider Bar (matching image_0d0094.png middle bar)
+    int hue_y = wy + 220;
+    int bar_h = 18;
+    for (int gx = 0; gx < sv_w; gx++) {
+        float h_deg = ((float)gx / (float)(sv_w - 1)) * 360.0f;
+        uint8_t hr_c, hg_c, hb_c;
+        theme_hsv_to_rgb(h_deg, 1.0f, 1.0f, &hr_c, &hg_c, &hb_c);
+        SDL_SetRenderDrawColor(ren, hr_c, hg_c, hb_c, 255);
+        SDL_RenderDrawLine(ren, p_x + gx, hue_y, p_x + gx, hue_y + bar_h - 1);
+    }
+    SDL_Rect hue_rect = { p_x, hue_y, sv_w, bar_h };
+    draw_brown_border_rect(ren, &hue_rect, false, false);
+
+    int hue_thumb_x = p_x + (int)((g_theme.h / 360.0f) * (float)(sv_w - 1));
+    uint8_t pure_r, pure_g, pure_b;
+    theme_hsv_to_rgb(g_theme.h, 1.0f, 1.0f, &pure_r, &pure_g, &pure_b);
+    SDL_Rect hue_thumb = { hue_thumb_x - 5, hue_y - 3, 10, bar_h + 6 };
+    SDL_SetRenderDrawColor(ren, pure_r, pure_g, pure_b, 255);
+    SDL_RenderFillRect(ren, &hue_thumb);
+    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+    SDL_RenderDrawRect(ren, &hue_thumb);
+
+    // 3. Checkerboard Alpha Slider Bar (matching image_0d0094.png bottom bar)
+    int alpha_y = wy + 250;
+    for (int gy = 0; gy < bar_h; gy += 6) {
+        for (int gx = 0; gx < sv_w; gx += 6) {
+            bool light = (((gx / 6) + (gy / 6)) % 2) == 0;
+            uint8_t chk_c = light ? 215 : 155;
+            float a_u = (float)gx / (float)(sv_w - 1);
+            uint8_t br_c = (uint8_t)((float)chk_c * (1.0f - a_u) + (float)g_theme.r * a_u + 0.5f);
+            uint8_t bg_c = (uint8_t)((float)chk_c * (1.0f - a_u) + (float)g_theme.g * a_u + 0.5f);
+            uint8_t bb_c = (uint8_t)((float)chk_c * (1.0f - a_u) + (float)g_theme.b * a_u + 0.5f);
+            int cw = (gx + 6 > sv_w) ? (sv_w - gx) : 6;
+            int ch = (gy + 6 > bar_h) ? (bar_h - gy) : 6;
+            SDL_Rect cell = { p_x + gx, alpha_y + gy, cw, ch };
+            SDL_SetRenderDrawColor(ren, br_c, bg_c, bb_c, 255);
+            SDL_RenderFillRect(ren, &cell);
+        }
+    }
+    SDL_Rect alpha_rect = { p_x, alpha_y, sv_w, bar_h };
+    draw_brown_border_rect(ren, &alpha_rect, false, false);
+
+    int alpha_thumb_x = p_x + (int)(((float)g_theme.a / 255.0f) * (float)(sv_w - 1));
+    SDL_Rect alpha_thumb = { alpha_thumb_x - 5, alpha_y - 3, 10, bar_h + 6 };
+    SDL_SetRenderDrawColor(ren, g_theme.r, g_theme.g, g_theme.b, 255);
+    SDL_RenderFillRect(ren, &alpha_thumb);
+    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+    SDL_RenderDrawRect(ren, &alpha_thumb);
+
+    // 4. Editable rgba(R, G, B, A) / ARGB Code Input Box (matching image_0d0834.png)
+    int code_y = wy + 284;
+    SDL_Rect code_box = { p_x, code_y, 212, 30 };
+    SDL_SetRenderDrawColor(ren, 16, 15, 14, 255);
+    SDL_RenderFillRect(ren, &code_box);
+    draw_brown_border_rect(ren, &code_box, g_theme.code_focused, false);
+
+    SDL_Rect code_clip = { code_box.x + 4, code_box.y + 2, code_box.w - 8, code_box.h - 4 };
+    draw_text_clipped(ren, g_theme.code_buf, code_box.x + 8, code_y + 9, c_white, &code_clip, NULL);
+    if (g_theme.code_focused && ((SDL_GetTicks() / 450) % 2 == 0)) {
+        int cx = code_box.x + 8 + (int)strlen(g_theme.code_buf) * 8;
+        if (cx < code_box.x + code_box.w - 4) {
+            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+            SDL_RenderDrawLine(ren, cx, code_y + 6, cx, code_y + 24);
+        }
+    }
+
+    // Live Color Swatch next to rgba() code box
+    SDL_Rect swatch_box = { p_x + 218, code_y, 38, 30 };
+    SDL_SetRenderDrawColor(ren, g_theme.r, g_theme.g, g_theme.b, 255);
+    SDL_RenderFillRect(ren, &swatch_box);
+    draw_brown_border_rect(ren, &swatch_box, true, false);
+
+    // ARGB Hex Readout
+    char hex_lbl[64];
+    snprintf(hex_lbl, sizeof(hex_lbl), "ARGB Hex: #%02X%02X%02X%02X",
+             (unsigned int)g_theme.a, (unsigned int)g_theme.r,
+             (unsigned int)g_theme.g, (unsigned int)g_theme.b);
+    draw_text(ren, hex_lbl, p_x, code_y + 38, c_accent);
+
+    // 5. Left Bottom Buttons: [Save Theme] and [Default Orange]
+    int b_y = wy + 350;
+    SDL_Rect btn_save_th = { p_x, b_y, 124, 30 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &btn_save_th);
+    draw_brown_border_rect(ren, &btn_save_th, true, false);
+    draw_text(ren, "Save Theme", p_x + 22, b_y + 9, c_white);
+
+    SDL_Rect btn_def_th = { p_x + 132, b_y, 124, 30 };
+    SDL_SetRenderDrawColor(ren, 42, 38, 34, 255);
+    SDL_RenderFillRect(ren, &btn_def_th);
+    draw_brown_border_rect(ren, &btn_def_th, false, false);
+    draw_text(ren, "Default Orange", p_x + 138, b_y + 9, c_white);
+
+    // ---- RIGHT SIDE: Saved Themes List (Keep Themes for Future) ----
+    int rx = wx + 292;
+    int rw = ww - 308;
+    draw_text(ren, "Saved Themes (Click to Apply):", rx, wy + 44, c_white);
+
+    SDL_Rect list_box = { rx, wy + 64, rw, 316 };
+    SDL_SetRenderDrawColor(ren, 18, 17, 16, 255);
+    SDL_RenderFillRect(ren, &list_box);
+    draw_brown_border_rect(ren, &list_box, false, true);
+
+    int content_h = g_theme.num_saved * 28 + 8;
+    int max_sc = (content_h > list_box.h) ? (content_h - list_box.h) : 0;
+    if (g_theme.saved_scroll_y > max_sc) g_theme.saved_scroll_y = max_sc;
+    if (g_theme.saved_scroll_y < 0) g_theme.saved_scroll_y = 0;
+
+    SDL_Rect list_clip = { list_box.x + 2, list_box.y + 2, list_box.w - 18, list_box.h - 4 };
+    SDL_RenderSetClipRect(ren, &list_clip);
+    for (int i = 0; i < g_theme.num_saved; i++) {
+        int ry = list_box.y + 4 + i * 28 - g_theme.saved_scroll_y;
+        if (ry + 26 < list_box.y || ry > list_box.y + list_box.h) continue;
+
+        SavedThemeEntry *st = &g_theme.saved[i];
+        bool is_active = (st->r == g_theme.r && st->g == g_theme.g && st->b == g_theme.b && st->a == g_theme.a);
+        SDL_Rect row_r = { list_box.x + 4, ry, list_box.w - 22, 25 };
+        SDL_SetRenderDrawColor(ren, is_active ? hr : 26, is_active ? hg : 24, is_active ? hb : 22, 255);
+        SDL_RenderFillRect(ren, &row_r);
+        draw_brown_border_rect(ren, &row_r, is_active, !is_active);
+
+        // Swatch inside row
+        SDL_Rect sw = { row_r.x + 5, ry + 4, 17, 17 };
+        SDL_SetRenderDrawColor(ren, st->r, st->g, st->b, 255);
+        SDL_RenderFillRect(ren, &sw);
+        draw_brown_border_rect(ren, &sw, false, false);
+
+        char item_lbl[128];
+        snprintf(item_lbl, sizeof(item_lbl), "%s (%d,%d,%d,%.2f)",
+                 st->name, (int)st->r, (int)st->g, (int)st->b, (double)st->a / 255.0);
+        SDL_Rect row_clip = { row_r.x + 28, ry + 2, row_r.w - 32, 20 };
+        draw_text_clipped(ren, item_lbl, row_r.x + 28, ry + 6, is_active ? c_white : c_muted, &row_clip, &list_clip);
+    }
+    SDL_RenderSetClipRect(ren, NULL);
+
+    // Scrollbar for Saved Themes list
+    SDL_Rect sb_track = { list_box.x + list_box.w - 14, list_box.y + 2, 12, list_box.h - 4 };
+    SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+    SDL_RenderFillRect(ren, &sb_track);
+    draw_brown_border_rect(ren, &sb_track, false, true);
+
+    int thumb_h = (content_h > list_box.h && content_h > 0)
+                  ? fmax(24, (sb_track.h * list_box.h) / content_h)
+                  : sb_track.h;
+    int thumb_y = sb_track.y + ((max_sc > 0) ? ((g_theme.saved_scroll_y * (sb_track.h - thumb_h)) / max_sc) : 0);
+    SDL_Rect sb_thumb = { sb_track.x + 1, thumb_y, sb_track.w - 2, thumb_h };
+    uint8_t tr_c, tg_c, tb_c;
+    get_theme_surface_rgb(42, 0.45f, &tr_c, &tg_c, &tb_c);
+    SDL_SetRenderDrawColor(ren, tr_c, tg_c, tb_c, 255);
+    SDL_RenderFillRect(ren, &sb_thumb);
+    draw_brown_border_rect(ren, &sb_thumb, false, false);
+
+    // Footer Status Line
+    const char *st_txt = g_theme.status_msg[0]
+        ? g_theme.status_msg
+        : "Saved permanently to themes_settings.json & keyboard_shortcuts.json";
+    SDL_Rect st_clip = { wx + 18, wy + wh - 28, ww - 36, 20 };
+    draw_text_clipped(ren, st_txt, wx + 18, wy + wh - 24, c_muted, &st_clip, NULL);
 }
 
 // Computes equal-power crossfade gain (sin/cos S-law) for any overlapping clips and micro de-click ramps at sample time t_sec
@@ -2522,6 +2939,198 @@ static inline bool point_in_rect(int x, int y, const SDL_Rect *r) {
 #include <sys/stat.h>
 #endif
 
+#ifndef DAW_THEME_STATE_DEFINED
+#define DAW_THEME_STATE_DEFINED
+
+#define MAX_SAVED_THEMES 32
+#define THEMES_JSON_FILENAME "themes_settings.json"
+
+typedef struct {
+    char name[48];
+    uint8_t r, g, b, a;
+} SavedThemeEntry;
+
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+
+    // Active ARGB Theme Color (Default Orange: R=205, G=138, B=72, A=255)
+    uint8_t r, g, b, a;
+    float h, s, v;
+
+    bool dragging_sv;
+    bool dragging_hue;
+    bool dragging_alpha;
+
+    bool code_focused;
+    char code_buf[64];
+
+    SavedThemeEntry saved[MAX_SAVED_THEMES];
+    int num_saved;
+    int selected_saved_idx;
+    int saved_scroll_y;
+    bool saved_sb_dragging;
+    int saved_sb_start_my;
+    int saved_sb_orig_scroll;
+
+    char status_msg[128];
+} ThemeManagerState;
+
+static ThemeManagerState g_theme = {
+    false,
+    { 340, 88, 580, 420 },
+    false, 0, 0,
+    205, 138, 72, 255,
+    29.77f, 0.6488f, 0.8039f,
+    false, false, false,
+    false,
+    "rgba(205, 138, 72, 1.00)",
+    {{{0}, 0, 0, 0, 0}}, 0, 0, 0, false, 0, 0,
+    ""
+};
+
+// Script Manager window scrolling, edge-resize, and status state
+static int  g_script_scroll_y = 0;
+static bool g_script_sb_dragging = false;
+static int  g_script_sb_start_my = 0;
+static int  g_script_sb_orig_scroll = 0;
+static int  g_script_resize_edge = 0;
+static int  g_script_resize_start_mx = 0;
+static int  g_script_resize_start_my = 0;
+static SDL_Rect g_script_resize_orig_rect = { 390, 140, 480, 320 };
+static char g_script_status_msg[128] = "";
+
+static inline void theme_hsv_to_rgb(float h, float s, float v, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    if (s < 0.0f) s = 0.0f;
+    if (s > 1.0f) s = 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    while (h < 0.0f) h += 360.0f;
+    while (h >= 360.0f) h -= 360.0f;
+
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float rf = 0.0f, gf = 0.0f, bf = 0.0f;
+
+    if (h < 60.0f)       { rf = c; gf = x; bf = 0.0f; }
+    else if (h < 120.0f) { rf = x; gf = c; bf = 0.0f; }
+    else if (h < 180.0f) { rf = 0.0f; gf = c; bf = x; }
+    else if (h < 240.0f) { rf = 0.0f; gf = x; bf = c; }
+    else if (h < 300.0f) { rf = x; gf = 0.0f; bf = c; }
+    else                 { rf = c; gf = 0.0f; bf = x; }
+
+    int ri = (int)((rf + m) * 255.0f + 0.5f);
+    int gi = (int)((gf + m) * 255.0f + 0.5f);
+    int bi = (int)((bf + m) * 255.0f + 0.5f);
+    if (ri < 0) ri = 0; else if (ri > 255) ri = 255;
+    if (gi < 0) gi = 0; else if (gi > 255) gi = 255;
+    if (bi < 0) bi = 0; else if (bi > 255) bi = 255;
+    if (out_r) *out_r = (uint8_t)ri;
+    if (out_g) *out_g = (uint8_t)gi;
+    if (out_b) *out_b = (uint8_t)bi;
+}
+
+static inline void theme_rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b, float *out_h, float *out_s, float *out_v) {
+    float rf = (float)r / 255.0f;
+    float gf = (float)g / 255.0f;
+    float bf = (float)b / 255.0f;
+    float cmax = fmaxf(rf, fmaxf(gf, bf));
+    float cmin = fminf(rf, fminf(gf, bf));
+    float delta = cmax - cmin;
+
+    float h = 0.0f;
+    if (delta > 0.0001f) {
+        if (cmax == rf) {
+            h = 60.0f * fmodf((gf - bf) / delta, 6.0f);
+        } else if (cmax == gf) {
+            h = 60.0f * (((bf - rf) / delta) + 2.0f);
+        } else {
+            h = 60.0f * (((rf - gf) / delta) + 4.0f);
+        }
+    }
+    if (h < 0.0f) h += 360.0f;
+    float s = (cmax > 0.0001f) ? (delta / cmax) : 0.0f;
+    float v = cmax;
+    if (out_h) *out_h = h;
+    if (out_s) *out_s = s;
+    if (out_v) *out_v = v;
+}
+
+static inline void sync_theme_code_string(void) {
+    snprintf(g_theme.code_buf, sizeof(g_theme.code_buf),
+             "rgba(%d, %d, %d, %.2f)",
+             (int)g_theme.r, (int)g_theme.g, (int)g_theme.b,
+             (double)g_theme.a / 255.0);
+}
+
+// Computes effective RGB of active theme blended with its alpha over dark base so UI elements stay readable
+static inline void get_theme_effective_rgb(uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    float af = (float)g_theme.a / 255.0f;
+    if (af < 0.15f) af = 0.15f;
+    int er = (int)(36.0f * (1.0f - af) + (float)g_theme.r * af + 0.5f);
+    int eg = (int)(36.0f * (1.0f - af) + (float)g_theme.g * af + 0.5f);
+    int eb = (int)(36.0f * (1.0f - af) + (float)g_theme.b * af + 0.5f);
+    if (er < 0) er = 0; else if (er > 255) er = 255;
+    if (eg < 0) eg = 0; else if (eg > 255) eg = 255;
+    if (eb < 0) eb = 0; else if (eb > 255) eb = 255;
+    if (out_r) *out_r = (uint8_t)er;
+    if (out_g) *out_g = (uint8_t)eg;
+    if (out_b) *out_b = (uint8_t)eb;
+}
+
+// Computes a subtle theme-tinted surface fill color for headers, active buttons, and scrollbar thumbs
+static inline void get_theme_surface_rgb(uint8_t base_val, float weight, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    uint8_t er, eg, eb;
+    get_theme_effective_rgb(&er, &eg, &eb);
+    int sr = (int)((float)base_val * (1.0f - weight) + (float)er * weight + 0.5f);
+    int sg = (int)((float)base_val * (1.0f - weight) + (float)eg * weight + 0.5f);
+    int sb = (int)((float)base_val * (1.0f - weight) + (float)eb * weight + 0.5f);
+    if (sr < 0) sr = 0; else if (sr > 255) sr = 255;
+    if (sg < 0) sg = 0; else if (sg > 255) sg = 255;
+    if (sb < 0) sb = 0; else if (sb > 255) sb = 255;
+    if (out_r) *out_r = (uint8_t)sr;
+    if (out_g) *out_g = (uint8_t)sg;
+    if (out_b) *out_b = (uint8_t)sb;
+}
+
+static inline SDL_Color get_theme_accent_sdl_color(void) {
+    uint8_t er, eg, eb;
+    get_theme_effective_rgb(&er, &eg, &eb);
+    int ar = er + 25; if (ar > 255) ar = 255;
+    int ag = eg + 25; if (ag > 255) ag = 255;
+    int ab = eb + 20; if (ab > 255) ab = 255;
+    SDL_Color c = { (Uint8)ar, (Uint8)ag, (Uint8)ab, 255 };
+    return c;
+}
+static void init_default_saved_themes(void) {
+    if (g_theme.num_saved > 0) return;
+    static const struct { const char *name; uint8_t r, g, b, a; } defs[] = {
+        { "Default Orange", 205, 138,  72, 255 },
+        { "Emerald Green",   77, 191,  59, 130 },
+        { "Forest Green",    77, 191,  59, 255 },
+        { "Studio Blue",     68, 150, 235, 255 },
+        { "Royal Purple",   162,  98, 232, 255 },
+        { "Crimson Red",    224,  78,  78, 255 },
+        { "Cyber Cyan",      48, 198, 208, 255 }
+    };
+    int nd = (int)(sizeof(defs) / sizeof(defs[0]));
+    for (int i = 0; i < nd && g_theme.num_saved < MAX_SAVED_THEMES; i++) {
+        SavedThemeEntry *st = &g_theme.saved[g_theme.num_saved++];
+        strncpy(st->name, defs[i].name, sizeof(st->name) - 1);
+        st->name[sizeof(st->name) - 1] = '\0';
+        st->r = defs[i].r;
+        st->g = defs[i].g;
+        st->b = defs[i].b;
+        st->a = defs[i].a;
+    }
+}
+#endif // DAW_THEME_STATE_DEFINED
+
+
 #define MAX_DAW_ACTIONS 256
 #define MAX_ACTION_SHORTCUTS 6
 #define SHORTCUT_STR_LEN 36
@@ -2922,6 +3531,28 @@ static void write_shortcuts_json_to_stream(FILE *f) {
     }
     fprintf(f, "  ],\n");
 
+    fprintf(f, "  \"theme_settings\": {\n");
+    fprintf(f, "    \"r\": %d,\n", (int)g_theme.r);
+    fprintf(f, "    \"g\": %d,\n", (int)g_theme.g);
+    fprintf(f, "    \"b\": %d,\n", (int)g_theme.b);
+    fprintf(f, "    \"a\": %d,\n", (int)g_theme.a);
+    fprintf(f, "    \"rgba\": \"rgba(%d, %d, %d, %.2f)\",\n",
+            (int)g_theme.r, (int)g_theme.g, (int)g_theme.b, (double)g_theme.a / 255.0);
+    fprintf(f, "    \"argb_hex\": \"#%02X%02X%02X%02X\",\n",
+            (unsigned int)g_theme.a, (unsigned int)g_theme.r, (unsigned int)g_theme.g, (unsigned int)g_theme.b);
+    fprintf(f, "    \"saved_themes\": [\n");
+    for (int t = 0; t < g_theme.num_saved; t++) {
+        char esc_tname[128];
+        json_escape_string(g_theme.saved[t].name, esc_tname, sizeof(esc_tname));
+        fprintf(f, "      { \"name\": \"%s\", \"r\": %d, \"g\": %d, \"b\": %d, \"a\": %d }%s\n",
+                esc_tname,
+                (int)g_theme.saved[t].r, (int)g_theme.saved[t].g,
+                (int)g_theme.saved[t].b, (int)g_theme.saved[t].a,
+                (t + 1 < g_theme.num_saved) ? "," : "");
+    }
+    fprintf(f, "    ]\n");
+    fprintf(f, "  },\n");
+
     fprintf(f, "  \"custom_scripts\": [\n");
     for (int s = 0; s < g_daw.num_scripts; s++) {
         DawScript *sc = &g_daw.scripts[s];
@@ -2960,6 +3591,141 @@ static void save_keyboard_shortcuts_json(void) {
             fclose(f_local);
         }
     }
+}
+
+static void write_themes_json_to_stream(FILE *f) {
+    if (!f) return;
+    init_default_saved_themes();
+    fprintf(f, "{\n");
+    fprintf(f, "  \"software\": \"Audio Track\",\n");
+    fprintf(f, "  \"permanent\": true,\n");
+    fprintf(f, "  \"r\": %d,\n", (int)g_theme.r);
+    fprintf(f, "  \"g\": %d,\n", (int)g_theme.g);
+    fprintf(f, "  \"b\": %d,\n", (int)g_theme.b);
+    fprintf(f, "  \"a\": %d,\n", (int)g_theme.a);
+    fprintf(f, "  \"rgba\": \"rgba(%d, %d, %d, %.2f)\",\n",
+            (int)g_theme.r, (int)g_theme.g, (int)g_theme.b, (double)g_theme.a / 255.0);
+    fprintf(f, "  \"argb_hex\": \"#%02X%02X%02X%02X\",\n",
+            (unsigned int)g_theme.a, (unsigned int)g_theme.r, (unsigned int)g_theme.g, (unsigned int)g_theme.b);
+    fprintf(f, "  \"saved_themes\": [\n");
+    for (int t = 0; t < g_theme.num_saved; t++) {
+        char esc_tname[128];
+        json_escape_string(g_theme.saved[t].name, esc_tname, sizeof(esc_tname));
+        fprintf(f, "    { \"name\": \"%s\", \"r\": %d, \"g\": %d, \"b\": %d, \"a\": %d }%s\n",
+                esc_tname,
+                (int)g_theme.saved[t].r, (int)g_theme.saved[t].g,
+                (int)g_theme.saved[t].b, (int)g_theme.saved[t].a,
+                (t + 1 < g_theme.num_saved) ? "," : "");
+    }
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+}
+
+static void save_themes_settings_json(void) {
+    init_default_saved_themes();
+    char installed_json[1024];
+    get_installed_file_path(installed_json, sizeof(installed_json), THEMES_JSON_FILENAME);
+    FILE *f = fopen(installed_json, "wb");
+    if (f) {
+        write_themes_json_to_stream(f);
+        fclose(f);
+    }
+    if (strcmp(installed_json, THEMES_JSON_FILENAME) != 0) {
+        FILE *f_local = fopen(THEMES_JSON_FILENAME, "wb");
+        if (f_local) {
+            write_themes_json_to_stream(f_local);
+            fclose(f_local);
+        }
+    }
+    save_keyboard_shortcuts_json();
+}
+
+// Parses an rgba(r, g, b, a), rgb(r, g, b), #AARRGGBB, #RRGGBB, or "r, g, b, a" string into g_theme
+static bool parse_theme_code_input(const char *str) {
+    if (!str || !str[0]) return false;
+    const char *p = str;
+    while (*p == ' ' || *p == '\t') p++;
+
+    // 1. Hex format: #AARRGGBB or #RRGGBB or 0xAARRGGBB
+    if (*p == '#' || (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))) {
+        if (*p == '#') p++;
+        else p += 2;
+        char hex[16] = {0};
+        int hl = 0;
+        while (isxdigit((unsigned char)*p) && hl < 8) {
+            hex[hl++] = *p++;
+        }
+        hex[hl] = '\0';
+        if (hl == 8) {
+            unsigned int val = (unsigned int)strtoul(hex, NULL, 16);
+            g_theme.a = (uint8_t)((val >> 24) & 0xFF);
+            g_theme.r = (uint8_t)((val >> 16) & 0xFF);
+            g_theme.g = (uint8_t)((val >> 8) & 0xFF);
+            g_theme.b = (uint8_t)(val & 0xFF);
+            theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+            sync_theme_code_string();
+            return true;
+        } else if (hl == 6) {
+            unsigned int val = (unsigned int)strtoul(hex, NULL, 16);
+            g_theme.a = 255;
+            g_theme.r = (uint8_t)((val >> 16) & 0xFF);
+            g_theme.g = (uint8_t)((val >> 8) & 0xFF);
+            g_theme.b = (uint8_t)(val & 0xFF);
+            theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+            sync_theme_code_string();
+            return true;
+        }
+        return false;
+    }
+
+    // 2. Numeric list: rgba(77, 191, 59, 0.51) or argb(...) or r, g, b, a
+    bool is_argb_order = (tolower((unsigned char)p[0]) == 'a' && tolower((unsigned char)p[1]) == 'r' && tolower((unsigned char)p[2]) == 'g' && tolower((unsigned char)p[3]) == 'b');
+    double nums[4] = { 205.0, 138.0, 72.0, 1.0 };
+    bool has_dot[4] = { false, false, false, false };
+    int count = 0;
+    while (*p && count < 4) {
+        while (*p && !isdigit((unsigned char)*p) && *p != '.') p++;
+        if (!*p) break;
+        const char *num_start = p;
+        char *endp = NULL;
+        double v = strtod(num_start, &endp);
+        if (endp == num_start) break;
+        for (const char *c = num_start; c < endp; c++) {
+            if (*c == '.') has_dot[count] = true;
+        }
+        nums[count++] = v;
+        p = endp;
+    }
+    if (count < 3) return false;
+
+    int r_i = 205, g_i = 138, b_i = 72, a_i = 255;
+    if (is_argb_order && count == 4) {
+        if (has_dot[0] || nums[0] <= 1.0) a_i = (int)(nums[0] * 255.0 + 0.5);
+        else a_i = (int)(nums[0] + 0.5);
+        r_i = (int)(nums[1] + 0.5);
+        g_i = (int)(nums[2] + 0.5);
+        b_i = (int)(nums[3] + 0.5);
+    } else {
+        r_i = (int)(nums[0] + 0.5);
+        g_i = (int)(nums[1] + 0.5);
+        b_i = (int)(nums[2] + 0.5);
+        if (count == 4) {
+            if (has_dot[3] || nums[3] <= 1.0) a_i = (int)(nums[3] * 255.0 + 0.5);
+            else a_i = (int)(nums[3] + 0.5);
+        }
+    }
+    if (r_i < 0) r_i = 0; else if (r_i > 255) r_i = 255;
+    if (g_i < 0) g_i = 0; else if (g_i > 255) g_i = 255;
+    if (b_i < 0) b_i = 0; else if (b_i > 255) b_i = 255;
+    if (a_i < 0) a_i = 0; else if (a_i > 255) a_i = 255;
+
+    g_theme.r = (uint8_t)r_i;
+    g_theme.g = (uint8_t)g_i;
+    g_theme.b = (uint8_t)b_i;
+    g_theme.a = (uint8_t)a_i;
+    theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+    sync_theme_code_string();
+    return true;
 }
 
 // Helper to parse a JSON string literal starting at *cursor (where **cursor == '"')
@@ -3046,6 +3812,114 @@ static bool json_extract_bool_field(const char *obj_start, const char *obj_end, 
     return default_val;
 }
 
+static int json_extract_int_field(const char *obj_start, const char *obj_end, const char *key, int default_val) {
+    if (!obj_start || !obj_end || !key) return default_val;
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t plen = strlen(pat);
+
+    const char *p = obj_start;
+    while (p + plen < obj_end) {
+        const char *hit = strstr(p, pat);
+        if (!hit || hit >= obj_end) return default_val;
+        const char *colon = hit + plen;
+        while (colon < obj_end && (*colon == ' ' || *colon == '\t' || *colon == '\r' || *colon == '\n')) colon++;
+        if (colon < obj_end && *colon == ':') {
+            colon++;
+            while (colon < obj_end && (*colon == ' ' || *colon == '\t' || *colon == '\r' || *colon == '\n')) colon++;
+            if (colon < obj_end && (isdigit((unsigned char)*colon) || *colon == '-')) {
+                return atoi(colon);
+            }
+        }
+        p = hit + plen;
+    }
+    return default_val;
+}
+
+static void parse_theme_json_block(const char *blk_start, const char *blk_end) {
+    if (!blk_start || !blk_end || blk_end <= blk_start) return;
+    int r = json_extract_int_field(blk_start, blk_end, "r", (int)g_theme.r);
+    int g = json_extract_int_field(blk_start, blk_end, "g", (int)g_theme.g);
+    int b = json_extract_int_field(blk_start, blk_end, "b", (int)g_theme.b);
+    int a = json_extract_int_field(blk_start, blk_end, "a", (int)g_theme.a);
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    if (a < 0) a = 0; else if (a > 255) a = 255;
+    g_theme.r = (uint8_t)r;
+    g_theme.g = (uint8_t)g;
+    g_theme.b = (uint8_t)b;
+    g_theme.a = (uint8_t)a;
+    theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+    sync_theme_code_string();
+
+    const char *st_sec = strstr(blk_start, "\"saved_themes\"");
+    if (st_sec && st_sec < blk_end) {
+        const char *arr_o = strchr(st_sec, '[');
+        const char *arr_c = arr_o ? strchr(arr_o, ']') : NULL;
+        if (arr_o && arr_c && arr_c <= blk_end) {
+            int loaded_cnt = 0;
+            const char *cur = arr_o + 1;
+            while (cur < arr_c && loaded_cnt < MAX_SAVED_THEMES) {
+                const char *os = strchr(cur, '{');
+                if (!os || os >= arr_c) break;
+                const char *oe = strchr(os, '}');
+                if (!oe || oe >= arr_c) break;
+                char tname[48] = {0};
+                json_extract_string_field(os, oe, "name", tname, sizeof(tname));
+                int tr = json_extract_int_field(os, oe, "r", 205);
+                int tg = json_extract_int_field(os, oe, "g", 138);
+                int tb = json_extract_int_field(os, oe, "b", 72);
+                int ta = json_extract_int_field(os, oe, "a", 255);
+                if (tname[0] != '\0') {
+                    SavedThemeEntry * dst = &g_theme.saved[loaded_cnt++];
+                    strncpy(dst->name, tname, sizeof(dst->name) - 1);
+                    dst->name[sizeof(dst->name) - 1] = '\0';
+                    dst->r = (uint8_t)(tr < 0 ? 0 : (tr > 255 ? 255 : tr));
+                    dst->g = (uint8_t)(tg < 0 ? 0 : (tg > 255 ? 255 : tg));
+                    dst->b = (uint8_t)(tb < 0 ? 0 : (tb > 255 ? 255 : tb));
+                    dst->a = (uint8_t)(ta < 0 ? 0 : (ta > 255 ? 255 : ta));
+                }
+                cur = oe + 1;
+            }
+            if (loaded_cnt > 0) {
+                g_theme.num_saved = loaded_cnt;
+            }
+        }
+    }
+}
+
+static bool load_themes_settings_json(void) {
+    init_default_saved_themes();
+    char installed_json[1024];
+    get_installed_file_path(installed_json, sizeof(installed_json), THEMES_JSON_FILENAME);
+
+    FILE *f = fopen(installed_json, "rb");
+    if (!f && strcmp(installed_json, THEMES_JSON_FILENAME) != 0) {
+        f = fopen(THEMES_JSON_FILENAME, "rb");
+    }
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 10 || fsize > 1024 * 1024) {
+        fclose(f);
+        return false;
+    }
+    char *buf = (char *)calloc((size_t)fsize + 1, 1);
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+    size_t n = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    buf[n] = '\0';
+    parse_theme_json_block(buf, buf + n);
+    free(buf);
+    return true;
+}
+
 // Loads permanent keyboard shortcuts and custom scripts from keyboard_shortcuts.json in the software installed folder.
 // Returns true if an existing JSON file was found and loaded; false if it needs to be created.
 static bool load_keyboard_shortcuts_json(void) {
@@ -3075,8 +3949,13 @@ static bool load_keyboard_shortcuts_json(void) {
     fclose(f);
     json_buf[read_bytes] = '\0';
 
-    // 1. Parse "custom_scripts" array first if present
+    // 0. Parse "theme_settings" block if present
+    const char *th_sec = strstr(json_buf, "\"theme_settings\"");
     const char *cs_sec = strstr(json_buf, "\"custom_scripts\"");
+    if (th_sec) {
+        const char *th_end = cs_sec ? cs_sec : (json_buf + read_bytes);
+        parse_theme_json_block(th_sec, th_end);
+    }
     if (cs_sec) {
         const char *arr_open = strchr(cs_sec, '[');
         const char *arr_close = arr_open ? strchr(arr_open, ']') : NULL;
@@ -3505,7 +4384,13 @@ static void scan_scripts_directory_to_actions(DawEngine *daw) {
         "scripts/python",
         "scripts",
         "lua",
-        "python"
+        "python",
+        "../scripts/lua",
+        "../scripts/python",
+        "../scripts",
+        "dist/scripts/lua",
+        "dist/scripts/python",
+        "dist/scripts"
     };
     int num_dirs = (int)(sizeof(rel_dirs) / sizeof(rel_dirs[0]));
     for (int i = 0; i < num_dirs; i++) {
@@ -3514,6 +4399,39 @@ static void scan_scripts_directory_to_actions(DawEngine *daw) {
         scan_single_script_folder(daw, inst_dir);
         if (strcmp(inst_dir, rel_dirs[i]) != 0) {
             scan_single_script_folder(daw, rel_dirs[i]);
+        }
+    }
+
+    // Also ensure every built-in script action in g_actions[] is listed in g_daw.scripts[]
+    // so the unified Script Manager window displays all Lua and Python scripts together.
+    for (int a = 0; a < g_num_actions; a++) {
+        if (!g_actions[a].is_script) continue;
+        const char *raw_name = g_actions[a].description;
+        if (strncmp(raw_name, "Script:", 7) == 0) {
+            raw_name += 7;
+            while (*raw_name == ' ') raw_name++;
+        }
+        if (!raw_name[0]) continue;
+        int found_s = -1;
+        for (int s = 0; s < daw->num_scripts; s++) {
+            if (str_equals_nocase(daw->scripts[s].name, raw_name) ||
+                str_equals_nocase(daw->scripts[s].name, g_actions[a].description)) {
+                found_s = s;
+                break;
+            }
+        }
+        if (found_s < 0 && daw->num_scripts < MAX_SCRIPTS) {
+            found_s = daw->num_scripts++;
+            memset(&daw->scripts[found_s], 0, sizeof(DawScript));
+            strncpy(daw->scripts[found_s].name, raw_name, sizeof(daw->scripts[found_s].name) - 1);
+            strncpy(daw->scripts[found_s].filepath, g_actions[a].script_filepath, sizeof(daw->scripts[found_s].filepath) - 1);
+            daw->scripts[found_s].is_python = g_actions[a].is_python || str_ends_with_nocase(raw_name, ".py");
+            if (g_actions[a].num_shortcuts > 0) {
+                strncpy(daw->scripts[found_s].shortcut, g_actions[a].shortcuts[0], sizeof(daw->scripts[found_s].shortcut) - 1);
+            }
+        }
+        if (found_s >= 0) {
+            g_actions[a].linked_script_idx = found_s;
         }
     }
 
@@ -3663,10 +4581,12 @@ static void init_keyboard_actions_system(void) {
 
     // Load saved permanent shortcuts from keyboard_shortcuts.json in installed folder,
     // and auto-detect any manually created .lua / .py scripts in scripts/ folders.
+    init_default_saved_themes();
     load_keyboard_shortcuts_json();
+    load_themes_settings_json();
     scan_scripts_directory_to_actions(&g_daw);
-    // Always write/update keyboard_shortcuts.json in the software installed folder so it exists permanently
-    save_keyboard_shortcuts_json();
+    // Always write/update keyboard_shortcuts.json and themes_settings.json in the software installed folder so they exist permanently
+    save_themes_settings_json();
     refresh_filtered_actions();
 }
 
@@ -3803,7 +4723,13 @@ static bool resolve_script_filepath(DawActionEntry *act, char *out_path, size_t 
         "scripts/python/",
         "scripts/",
         "lua/",
-        "python/"
+        "python/",
+        "../scripts/lua/",
+        "../scripts/python/",
+        "../scripts/",
+        "dist/scripts/lua/",
+        "dist/scripts/python/",
+        "dist/scripts/"
     };
     int nf = (int)(sizeof(folders) / sizeof(folders[0]));
     for (int i = 0; i < nf; i++) {
@@ -3831,6 +4757,339 @@ static bool resolve_script_filepath(DawActionEntry *act, char *out_path, size_t 
     return false;
 }
 
+
+// ================= UNIVERSAL DYNAMIC SCRIPT EXPRESSION & VARIABLE EVALUATOR =================
+#define MAX_SCRIPT_VARS 32
+typedef struct {
+    char name[48];
+    double value;
+} ScriptVarBinding;
+
+typedef struct {
+    ScriptVarBinding vars[MAX_SCRIPT_VARS];
+    int num_vars;
+} ScriptEvalContext;
+
+static void script_ctx_set_var(ScriptEvalContext *ctx, const char *name, double val) {
+    if (!ctx || !name || !name[0]) return;
+    for (int i = 0; i < ctx->num_vars; i++) {
+        if (strcmp(ctx->vars[i].name, name) == 0) {
+            ctx->vars[i].value = val;
+            return;
+        }
+    }
+    if (ctx->num_vars < MAX_SCRIPT_VARS) {
+        strncpy(ctx->vars[ctx->num_vars].name, name, sizeof(ctx->vars[0].name) - 1);
+        ctx->vars[ctx->num_vars].name[sizeof(ctx->vars[0].name) - 1] = '\0';
+        ctx->vars[ctx->num_vars].value = val;
+        ctx->num_vars++;
+    }
+}
+
+static bool script_ctx_get_var(const ScriptEvalContext *ctx, const char *name, double *out_val) {
+    if (!ctx || !name || !name[0]) return false;
+    for (int i = 0; i < ctx->num_vars; i++) {
+        if (strcmp(ctx->vars[i].name, name) == 0) {
+            if (out_val) *out_val = ctx->vars[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static double parse_script_expr_add(const char **p, const ScriptEvalContext *ctx);
+
+static void skip_expr_spaces(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\r' || **p == '\n') (*p)++;
+}
+
+static double parse_script_expr_primary(const char **p, const ScriptEvalContext *ctx) {
+    skip_expr_spaces(p);
+    if (**p == '+') { (*p)++; return parse_script_expr_primary(p, ctx); }
+    if (**p == '-') { (*p)++; return -parse_script_expr_primary(p, ctx); }
+    if (**p == '(') {
+        (*p)++;
+        double v = parse_script_expr_add(p, ctx);
+        skip_expr_spaces(p);
+        if (**p == ')') (*p)++;
+        return v;
+    }
+    if (isdigit((unsigned char)**p) || (**p == '.' && isdigit((unsigned char)*(*p + 1)))) {
+        char *endp = NULL;
+        double v = strtod(*p, &endp);
+        if (endp && endp != *p) {
+            *p = endp;
+            return v;
+        }
+    }
+    if (isalpha((unsigned char)**p) || **p == '_') {
+        char ident[48] = {0};
+        size_t k = 0;
+        while (isalnum((unsigned char)**p) || **p == '_' || **p == '.') {
+            if (k + 1 < sizeof(ident)) ident[k++] = **p;
+            (*p)++;
+        }
+        ident[k] = '\0';
+        skip_expr_spaces(p);
+        // Handle math functions like math.abs(...), math.floor(...), math.max(...), math.min(...)
+        if (**p == '(') {
+            (*p)++;
+            double arg1 = parse_script_expr_add(p, ctx);
+            double arg2 = 0.0;
+            skip_expr_spaces(p);
+            if (**p == ',') {
+                (*p)++;
+                arg2 = parse_script_expr_add(p, ctx);
+            }
+            skip_expr_spaces(p);
+            if (**p == ')') (*p)++;
+            if (str_contains_nocase(ident, "abs")) return fabs(arg1);
+            if (str_contains_nocase(ident, "floor")) return floor(arg1);
+            if (str_contains_nocase(ident, "ceil")) return ceil(arg1);
+            if (str_contains_nocase(ident, "sqrt")) return (arg1 >= 0.0) ? sqrt(arg1) : 0.0;
+            if (str_contains_nocase(ident, "max")) return fmax(arg1, arg2);
+            if (str_contains_nocase(ident, "min")) return fmin(arg1, arg2);
+            if (str_contains_nocase(ident, "GetCursorPosition")) {
+                double c = 0.0;
+                script_ctx_get_var(ctx, "cursor", &c);
+                return c;
+            }
+            return arg1;
+        }
+        if (str_equals_nocase(ident, "true")) return 1.0;
+        if (str_equals_nocase(ident, "false")) return 0.0;
+        double val = 0.0;
+        if (script_ctx_get_var(ctx, ident, &val)) return val;
+    }
+    return 0.0;
+}
+
+static double parse_script_expr_mul(const char **p, const ScriptEvalContext *ctx) {
+    double left = parse_script_expr_primary(p, ctx);
+    for (;;) {
+        skip_expr_spaces(p);
+        char op = **p;
+        if (op != '*' && op != '/' && op != '%') break;
+        (*p)++;
+        double right = parse_script_expr_primary(p, ctx);
+        if (op == '*') left *= right;
+        else if (op == '/') left = (fabs(right) > 1e-12) ? (left / right) : 0.0;
+        else if (op == '%') left = (fabs(right) > 1e-12) ? fmod(left, right) : 0.0;
+    }
+    return left;
+}
+
+static double parse_script_expr_add(const char **p, const ScriptEvalContext *ctx) {
+    double left = parse_script_expr_mul(p, ctx);
+    for (;;) {
+        skip_expr_spaces(p);
+        char op = **p;
+        if (op != '+' && op != '-') break;
+        // Stop at Lua comment '--'
+        if (op == '-' && *(*p + 1) == '-') break;
+        (*p)++;
+        double right = parse_script_expr_mul(p, ctx);
+        if (op == '+') left += right;
+        else left -= right;
+    }
+    return left;
+}
+
+static double eval_script_math_expr(const char *expr_str, const ScriptEvalContext *ctx) {
+    if (!expr_str || !expr_str[0]) return 0.0;
+    const char *p = expr_str;
+    return parse_script_expr_add(&p, ctx);
+}
+
+// Populates standard per-clip variables into ScriptEvalContext so any formula works out of the box
+static void populate_clip_eval_context(ScriptEvalContext *ctx, ProjectTab *p, int item_idx, int sel_order, int sel_total) {
+    if (!ctx || !p || item_idx < 0 || item_idx >= p->num_items) return;
+    int tab = get_valid_tab_idx();
+    AudioItem *it = &p->items[item_idx];
+    script_ctx_set_var(ctx, "pos", it->start_time);
+    script_ctx_set_var(ctx, "position", it->start_time);
+    script_ctx_set_var(ctx, "start_time", it->start_time);
+    script_ctx_set_var(ctx, "D_POSITION", it->start_time);
+    script_ctx_set_var(ctx, "len", it->duration);
+    script_ctx_set_var(ctx, "length", it->duration);
+    script_ctx_set_var(ctx, "duration", it->duration);
+    script_ctx_set_var(ctx, "D_LENGTH", it->duration);
+    script_ctx_set_var(ctx, "end_pos", it->start_time + it->duration);
+    script_ctx_set_var(ctx, "center", it->start_time + it->duration * 0.5);
+    script_ctx_set_var(ctx, "center_pos", it->start_time + it->duration * 0.5);
+    script_ctx_set_var(ctx, "mid", it->start_time + it->duration * 0.5);
+    script_ctx_set_var(ctx, "offset", it->offset_in_file);
+    script_ctx_set_var(ctx, "D_STARTOFFS", it->offset_in_file);
+    script_ctx_set_var(ctx, "fadein", get_item_fade_in(p, item_idx));
+    script_ctx_set_var(ctx, "D_FADEINLEN", get_item_fade_in(p, item_idx));
+    script_ctx_set_var(ctx, "fadeout", get_item_fade_out(p, item_idx));
+    script_ctx_set_var(ctx, "D_FADEOUTLEN", get_item_fade_out(p, item_idx));
+    script_ctx_set_var(ctx, "vol", (double)g_item_vol_db[tab][item_idx]);
+    script_ctx_set_var(ctx, "D_VOL", (double)g_item_vol_db[tab][item_idx]);
+    script_ctx_set_var(ctx, "mute", g_item_muted[tab][item_idx] ? 1.0 : 0.0);
+    script_ctx_set_var(ctx, "B_MUTE", g_item_muted[tab][item_idx] ? 1.0 : 0.0);
+    script_ctx_set_var(ctx, "color", (double)g_item_color_idx[tab][item_idx]);
+    script_ctx_set_var(ctx, "I_CUSTOMCOLOR", (double)g_item_color_idx[tab][item_idx]);
+    script_ctx_set_var(ctx, "track", (double)it->track_idx);
+    script_ctx_set_var(ctx, "i", (double)sel_order);
+    script_ctx_set_var(ctx, "idx", (double)sel_order);
+    script_ctx_set_var(ctx, "count", (double)sel_total);
+    script_ctx_set_var(ctx, "sel_count", (double)sel_total);
+    script_ctx_set_var(ctx, "cursor", p->playhead_seconds);
+    script_ctx_set_var(ctx, "playhead", p->playhead_seconds);
+    script_ctx_set_var(ctx, "num_tracks", (double)p->num_tracks);
+    script_ctx_set_var(ctx, "num_items", (double)p->num_items);
+}
+
+// Splits a specific clip item_idx at exact timeline position split_t (seconds)
+static bool split_single_item_at_time(ProjectTab *p, int item_idx, double split_t, bool *io_pushed_undo) {
+    if (!p || item_idx < 0 || item_idx >= p->num_items || p->num_items >= MAX_ITEMS) return false;
+    int tab = get_valid_tab_idx();
+    AudioItem *it = &p->items[item_idx];
+    double it_s = it->start_time;
+    double it_e = it->start_time + it->duration;
+    if (split_t <= it_s + 0.02 || split_t >= it_e - 0.02) return false;
+
+    if (io_pushed_undo && !(*io_pushed_undo)) {
+        push_undo_state();
+        *io_pushed_undo = true;
+    }
+
+    int r_idx = p->num_items;
+    double orig_fin = g_item_fade_in[tab][item_idx];
+    double orig_fout = g_item_fade_out[tab][item_idx];
+    double left_dur = split_t - it_s;
+    double right_dur = it_e - split_t;
+
+    AudioItem *r_item = &p->items[r_idx];
+    memcpy(r_item, it, sizeof(AudioItem));
+    if (it->peak_count > 0 && it->peaks) {
+        r_item->peaks = (PeakBin *)calloc((size_t)it->peak_count, sizeof(PeakBin));
+        if (r_item->peaks) {
+            memcpy(r_item->peaks, it->peaks, (size_t)it->peak_count * sizeof(PeakBin));
+        }
+    }
+
+    it->duration = left_dur;
+    r_item->start_time = split_t;
+    r_item->offset_in_file = it->offset_in_file + left_dur;
+    r_item->duration = right_dur;
+    r_item->is_selected = true;
+    it->is_selected = true;
+    r_item->raw_file_handle = r_item->raw_audio_path[0] ? fopen(r_item->raw_audio_path, "rb") : NULL;
+
+    g_item_fade_in[tab][item_idx] = fmin(orig_fin, it->duration);
+    g_item_fade_out[tab][item_idx] = 0.0;
+    g_item_fade_in[tab][r_idx] = 0.0;
+    g_item_fade_out[tab][r_idx] = fmin(orig_fout, r_item->duration);
+    g_item_vol_db[tab][r_idx] = g_item_vol_db[tab][item_idx];
+    g_item_muted[tab][r_idx] = g_item_muted[tab][item_idx];
+    g_item_color_idx[tab][r_idx] = g_item_color_idx[tab][item_idx];
+    g_item_group_id[tab][r_idx] = g_item_group_id[tab][item_idx];
+    p->num_items++;
+    return true;
+}
+
+// Extracts the Nth comma-separated argument (0-indexed) inside a function call `FuncName(arg0, arg1, arg2)`
+static bool extract_func_call_arg(const char *line, const char *func_name, int arg_index, char *out_arg, size_t max_len) {
+    if (!line || !func_name || !out_arg || max_len == 0) return false;
+    out_arg[0] = '\0';
+    const char *hit = strstr(line, func_name);
+    if (!hit) return false;
+    const char *lp = strchr(hit, '(');
+    if (!lp) return false;
+    const char *p = lp + 1;
+    int cur_arg = 0;
+    int depth = 0;
+    const char *arg_s = p;
+
+    while (*p) {
+        if (*p == '(') depth++;
+        else if (*p == ')') {
+            if (depth == 0) {
+                if (cur_arg == arg_index) {
+                    size_t l = (size_t)(p - arg_s);
+                    while (l > 0 && (arg_s[0] == ' ' || arg_s[0] == '\t')) { arg_s++; l--; }
+                    while (l > 0 && (arg_s[l - 1] == ' ' || arg_s[l - 1] == '\t')) l--;
+                    if (l >= max_len) l = max_len - 1;
+                    memcpy(out_arg, arg_s, l);
+                    out_arg[l] = '\0';
+                    return true;
+                }
+                break;
+            }
+            depth--;
+        } else if (*p == ',' && depth == 0) {
+            if (cur_arg == arg_index) {
+                size_t l = (size_t)(p - arg_s);
+                while (l > 0 && (arg_s[0] == ' ' || arg_s[0] == '\t')) { arg_s++; l--; }
+                while (l > 0 && (arg_s[l - 1] == ' ' || arg_s[l - 1] == '\t')) l--;
+                if (l >= max_len) l = max_len - 1;
+                memcpy(out_arg, arg_s, l);
+                out_arg[l] = '\0';
+                return true;
+            }
+            cur_arg++;
+            arg_s = p + 1;
+        }
+        p++;
+    }
+    return false;
+}
+
+// Splits every currently selected clip at its exact midpoint (start_time + duration * 0.5)
+static bool split_selected_items_at_center(ProjectTab *p) {
+    if (!p) return false;
+    int tab = get_valid_tab_idx();
+    int orig_count = p->num_items;
+    bool did_split = false;
+
+    for (int i = 0; i < orig_count; i++) {
+        AudioItem *it = &p->items[i];
+        if (!it->is_selected) continue;
+        if (it->duration <= 0.10 || p->num_items >= MAX_ITEMS) continue;
+
+        if (!did_split) {
+            push_undo_state();
+            did_split = true;
+        }
+
+        int r_idx = p->num_items;
+        double orig_fin = g_item_fade_in[tab][i];
+        double orig_fout = g_item_fade_out[tab][i];
+        double half_dur = it->duration * 0.5;
+        double mid_t = it->start_time + half_dur;
+
+        AudioItem *r_item = &p->items[r_idx];
+        memcpy(r_item, it, sizeof(AudioItem));
+        if (it->peak_count > 0 && it->peaks) {
+            r_item->peaks = (PeakBin *)calloc((size_t)it->peak_count, sizeof(PeakBin));
+            if (r_item->peaks) {
+                memcpy(r_item->peaks, it->peaks, (size_t)it->peak_count * sizeof(PeakBin));
+            }
+        }
+
+        it->duration = half_dur;
+        r_item->start_time = mid_t;
+        r_item->offset_in_file = it->offset_in_file + half_dur;
+        r_item->duration = half_dur;
+        r_item->is_selected = true;
+        it->is_selected = true;
+        r_item->raw_file_handle = r_item->raw_audio_path[0] ? fopen(r_item->raw_audio_path, "rb") : NULL;
+
+        g_item_fade_in[tab][i]      = fmin(orig_fin, it->duration);
+        g_item_fade_out[tab][i]     = 0.0;
+        g_item_fade_in[tab][r_idx]  = 0.0;
+        g_item_fade_out[tab][r_idx] = fmin(orig_fout, r_item->duration);
+        g_item_vol_db[tab][r_idx]   = g_item_vol_db[tab][i];
+        g_item_muted[tab][r_idx]    = g_item_muted[tab][i];
+        g_item_color_idx[tab][r_idx]= g_item_color_idx[tab][i];
+        g_item_group_id[tab][r_idx] = g_item_group_id[tab][i];
+        p->num_items++;
+    }
+    return did_split;
+}
+
 // Built-in C Lua & Python Script Interpreter:
 // Reads a manually created .lua or .py script line-by-line and executes timeline/track/clip/transport commands!
 static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win,
@@ -3843,6 +5102,11 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
     bool did_any_action = false;
     bool pushed_undo = false;
     char line[1024];
+    char g_recorded_var_names[16][48];
+    char g_recorded_var_exprs[16][256];
+    int  g_num_recorded_assigns = 0;
+    memset(g_recorded_var_names, 0, sizeof(g_recorded_var_names));
+    memset(g_recorded_var_exprs, 0, sizeof(g_recorded_var_exprs));
 
     while (fgets(line, sizeof(line), f)) {
         // Trim leading whitespace
@@ -4035,10 +5299,69 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
             did_any_action = true;
         }
 
-        // 7. SplitMediaItem / split_item / split_at_cursor
-        if (str_contains_nocase(s, "SplitMediaItem") ||
-            str_contains_nocase(s, "split_item") ||
-            str_contains_nocase(s, "split_at_cursor")) {
+        // 6B. Track custom local variable assignments in Lua/Python (e.g. `local split_pos = pos + len * 0.5`)
+        if (!str_contains_nocase(s, "GetMediaItem") && !str_contains_nocase(s, "CountSelected") &&
+            !str_contains_nocase(s, "function ") && strchr(s, '=') != NULL &&
+            !str_contains_nocase(s, "==") && !str_contains_nocase(s, "~=") && !str_contains_nocase(s, "!=")) {
+            const char *lhs = s;
+            if (strncmp(lhs, "local ", 6) == 0) {
+                lhs += 6;
+                while (*lhs == ' ' || *lhs == '	') lhs++;
+            }
+            const char *eq = strchr(lhs, '=');
+            if (eq && eq > lhs) {
+                char var_name[48] = {0};
+                size_t vl = (size_t)(eq - lhs);
+                while (vl > 0 && (lhs[vl - 1] == ' ' || lhs[vl - 1] == '	')) vl--;
+                if (vl > 0 && vl < sizeof(var_name)) {
+                    memcpy(var_name, lhs, vl);
+                    var_name[vl] = '\0';
+                    bool valid_id = isalpha((unsigned char)var_name[0]) || var_name[0] == '_';
+                    for (size_t k = 1; k < vl && valid_id; k++) {
+                        if (!isalnum((unsigned char)var_name[k]) && var_name[k] != '_') valid_id = false;
+                    }
+                    if (valid_id && g_num_recorded_assigns < 16) {
+                        strncpy(g_recorded_var_names[g_num_recorded_assigns], var_name, 47);
+                        strncpy(g_recorded_var_exprs[g_num_recorded_assigns], eq + 1, 255);
+                        g_num_recorded_assigns++;
+                    }
+                }
+            }
+        }
+
+        // 7. Dynamic SplitMediaItem(item, <any math/var expression>) or split helpers
+        if (str_contains_nocase(s, "split_selected_clips_center") ||
+            str_contains_nocase(s, "split_clips_center") ||
+            str_contains_nocase(s, "split_center")) {
+            if (split_selected_items_at_center(p)) {
+                did_any_action = true;
+            }
+        } else if (str_contains_nocase(s, "SplitMediaItem")) {
+            char expr_arg[256] = {0};
+            if (extract_func_call_arg(s, "SplitMediaItem", 1, expr_arg, sizeof(expr_arg)) && expr_arg[0]) {
+                int orig_cnt = p->num_items;
+                int sel_tot = 0;
+                for (int i = 0; i < orig_cnt; i++) if (p->items[i].is_selected) sel_tot++;
+                int sel_ord = 0;
+                for (int i = 0; i < orig_cnt; i++) {
+                    if (!p->items[i].is_selected) continue;
+                    ScriptEvalContext ctx;
+                    memset(&ctx, 0, sizeof(ctx));
+                    populate_clip_eval_context(&ctx, p, i, sel_ord, sel_tot);
+                    for (int va = 0; va < g_num_recorded_assigns; va++) {
+                        double vval = eval_script_math_expr(g_recorded_var_exprs[va], &ctx);
+                        script_ctx_set_var(&ctx, g_recorded_var_names[va], vval);
+                    }
+                    double split_t = eval_script_math_expr(expr_arg, &ctx);
+                    if (split_single_item_at_time(p, i, split_t, &pushed_undo)) {
+                        did_any_action = true;
+                    }
+                    sel_ord++;
+                }
+            } else if (split_selected_items_at_center(p)) {
+                did_any_action = true;
+            }
+        } else if (str_contains_nocase(s, "split_item") || str_contains_nocase(s, "split_at_cursor")) {
             for (int a = 0; a < g_num_actions; a++) {
                 if (g_actions[a].id == ACT_ITEM_SPLIT_AT_CURSOR) {
                     execute_daw_action_by_index(p, ren, win, a);
@@ -4059,11 +5382,59 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
             did_any_action = true;
         }
 
-        // 9. SetMediaItemInfo_Value or direct item property helpers
-        if (str_contains_nocase(s, "D_POSITION") || str_contains_nocase(s, "set_item_position")) {
+        // 9. Dynamic SetMediaItemInfo_Value(item, "PROP", <any formula/var>) or direct item property helpers
+        if (str_contains_nocase(s, "SetMediaItemInfo_Value")) {
+            char prop_arg[64] = {0};
+            char val_expr[256] = {0};
+            if (extract_func_call_arg(s, "SetMediaItemInfo_Value", 1, prop_arg, sizeof(prop_arg)) &&
+                extract_func_call_arg(s, "SetMediaItemInfo_Value", 2, val_expr, sizeof(val_expr)) &&
+                val_expr[0]) {
+                if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
+                int sel_tot = 0;
+                for (int i = 0; i < p->num_items; i++) if (p->items[i].is_selected) sel_tot++;
+                int sel_ord = 0;
+                for (int i = 0; i < p->num_items; i++) {
+                    if (!p->items[i].is_selected) continue;
+                    ScriptEvalContext ctx;
+                    memset(&ctx, 0, sizeof(ctx));
+                    populate_clip_eval_context(&ctx, p, i, sel_ord, sel_tot);
+                    for (int va = 0; va < g_num_recorded_assigns; va++) {
+                        double vval = eval_script_math_expr(g_recorded_var_exprs[va], &ctx);
+                        script_ctx_set_var(&ctx, g_recorded_var_names[va], vval);
+                    }
+                    double val = eval_script_math_expr(val_expr, &ctx);
+                    if (str_contains_nocase(prop_arg, "D_POSITION")) {
+                        p->items[i].start_time = fmax(0.0, val);
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_LENGTH")) {
+                        if (val > 0.05) p->items[i].duration = val;
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_STARTOFFS")) {
+                        p->items[i].offset_in_file = fmax(0.0, val);
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_FADEINLEN")) {
+                        set_item_fade_in(p, i, fmax(0.0, val));
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_FADEOUTLEN")) {
+                        set_item_fade_out(p, i, fmax(0.0, val));
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_VOL")) {
+                        g_item_vol_db[tab][i] = (float)val;
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "B_MUTE")) {
+                        g_item_muted[tab][i] = (val != 0.0);
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "I_CUSTOMCOLOR")) {
+                        g_item_color_idx[tab][i] = ((int)val) & 7;
+                        did_any_action = true;
+                    }
+                    sel_ord++;
+                }
+            }
+        }
+        if (str_contains_nocase(s, "set_item_position")) {
             double pos = 0.0;
-            const char *tok = str_contains_nocase(s, "D_POSITION") ? "D_POSITION" : "set_item_position";
-            if (parse_number_after_token(s, tok, &pos) && pos >= 0.0) {
+            if (parse_number_after_token(s, "set_item_position", &pos) && pos >= 0.0) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected) p->items[i].start_time = pos;
@@ -4071,10 +5442,9 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
                 did_any_action = true;
             }
         }
-        if (str_contains_nocase(s, "D_LENGTH") || str_contains_nocase(s, "set_item_length")) {
+        if (str_contains_nocase(s, "set_item_length")) {
             double dur = 0.0;
-            const char *tok = str_contains_nocase(s, "D_LENGTH") ? "D_LENGTH" : "set_item_length";
-            if (parse_number_after_token(s, tok, &dur) && dur > 0.05) {
+            if (parse_number_after_token(s, "set_item_length", &dur) && dur > 0.05) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected) p->items[i].duration = dur;
@@ -4082,10 +5452,9 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
                 did_any_action = true;
             }
         }
-        if (str_contains_nocase(s, "D_FADEINLEN") || str_contains_nocase(s, "set_fade_in")) {
+        if (str_contains_nocase(s, "set_fade_in")) {
             double fin = 0.0;
-            const char *tok = str_contains_nocase(s, "D_FADEINLEN") ? "D_FADEINLEN" : "set_fade_in";
-            if (parse_number_after_token(s, tok, &fin) && fin >= 0.0) {
+            if (parse_number_after_token(s, "set_fade_in", &fin) && fin >= 0.0) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected) set_item_fade_in(p, i, fin);
@@ -4093,10 +5462,9 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
                 did_any_action = true;
             }
         }
-        if (str_contains_nocase(s, "D_FADEOUTLEN") || str_contains_nocase(s, "set_fade_out")) {
+        if (str_contains_nocase(s, "set_fade_out")) {
             double fout = 0.0;
-            const char *tok = str_contains_nocase(s, "D_FADEOUTLEN") ? "D_FADEOUTLEN" : "set_fade_out";
-            if (parse_number_after_token(s, tok, &fout) && fout >= 0.0) {
+            if (parse_number_after_token(s, "set_fade_out", &fout) && fout >= 0.0) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected) set_item_fade_out(p, i, fout);
@@ -4461,6 +5829,21 @@ static void execute_script_action_entry(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         record_project_change(desc, true);
         snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
                  "Executed: %s", desc);
+        return;
+    }
+
+    // Script: Split Center (splits selected clips at 50% midpoint)
+    if (str_contains_nocase(desc, "split center") ||
+        str_contains_nocase(desc, "split_center") ||
+        str_contains_nocase(desc, "center split")) {
+        if (split_selected_items_at_center(p)) {
+            record_project_change("Split Selected Clip(s) at Center", true);
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Split selected clip(s) at center");
+        } else {
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Select one or more clips to split at center");
+        }
         return;
     }
 
@@ -5647,11 +7030,12 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
             g_action_win.scroll_y = 0;
             refresh_filtered_actions();
         } else if (mx >= wx + 500 && mx <= wx + 584) {
-            // [Options] -> Rescan scripts folder & save keyboard_shortcuts.json
+            // [Refresh] -> Rescan scripts folder for newly added .lua / .py scripts & save keyboard_shortcuts.json
             scan_scripts_directory_to_actions(&g_daw);
             save_keyboard_shortcuts_json();
+            refresh_filtered_actions();
             snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
-                     "Saved %d actions to keyboard_shortcuts.json", g_num_actions);
+                     "Refreshed scripts folder (%d actions ready)", g_num_actions);
         } else if (mx >= wx + 592 && mx <= wx + 766) {
             // [Find shortcut...]
             g_action_win.capturing_find_shortcut = true;
@@ -5772,7 +7156,7 @@ static void render_action_window(SDL_Renderer *ren) {
     int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
     SDL_Color c_white = { 228, 228, 228, 255 };
     SDL_Color c_muted = { 150, 145, 140, 255 };
-    SDL_Color c_accent = { 235, 175, 95, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
 
     // Drop Shadow
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -5826,7 +7210,7 @@ static void render_action_window(SDL_Renderer *ren) {
     SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
     SDL_RenderFillRect(ren, &btn_opt);
     draw_brown_border_rect(ren, &btn_opt, false, false);
-    draw_text(ren, "Options", wx + 514, wy + 45, c_white);
+    draw_text(ren, "Refresh", wx + 514, wy + 45, c_white);
 
     SDL_Rect btn_find = { wx + 592, wy + 38, 174, 26 };
     SDL_SetRenderDrawColor(ren, 52, 42, 34, 255);
@@ -6068,9 +7452,27 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
             return true;
         }
     }
+    if (g_theme.is_open && point_in_rect(mx, my, &g_theme.win_rect)) {
+        if (out_cursor) {
+            int wx = g_theme.win_rect.x, wy = g_theme.win_rect.y;
+            if (mx >= wx + 18 && mx <= wx + 230 && my >= wy + 284 && my <= wy + 314) {
+                *out_cursor = g_cursor_ibeam;
+            }
+        }
+        return true;
+    }
     if (g_hide_popup_open && point_in_rect(mx, my, &g_hide_win_rect)) return true;
     if (g_history_popup_open && point_in_rect(mx, my, &g_history_win_rect)) return true;
-    if (g_daw.script_manager_open && point_in_rect(mx, my, &g_daw.script_win_rect)) return true;
+    if (g_daw.script_manager_open) {
+        VideoResizeEdge sc_edge = hit_test_video_resize_edge(&g_daw.script_win_rect, mx, my);
+        if (sc_edge != VID_RESIZE_NONE) {
+            if (out_cursor) {
+                *out_cursor = (sc_edge == VID_RESIZE_BOTTOM) ? g_cursor_size_ns : g_cursor_size_we;
+            }
+            return true;
+        }
+        if (point_in_rect(mx, my, &g_daw.script_win_rect)) return true;
+    }
 
     if (p && p->video.is_open) {
         VideoResizeEdge v_edge = g_video_fullscreen[get_valid_tab_idx()]
@@ -6093,11 +7495,11 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
         if (point_in_rect(mx, my, &f_box)) return true;
     }
     if (g_daw.menu_action_open) {
-        SDL_Rect a_box = { 60, m_start, 168, 80 };
+        SDL_Rect a_box = { 60, m_start, 168, 56 };
         if (point_in_rect(mx, my, &a_box)) return true;
     }
     if (g_menu_tools_open) {
-        SDL_Rect t_box = { 126, m_start, 150, 56 };
+        SDL_Rect t_box = { 126, m_start, 150, 82 };
         if (point_in_rect(mx, my, &t_box)) return true;
     }
     if (g_marker_context_menu_open) {
@@ -6157,7 +7559,7 @@ int main(int argc, char *argv[]) {
     g_daw.editing_track_name_idx = -1;
     g_daw.editing_marker_idx = -1;
     g_daw.script_selected_idx = -1;
-    g_daw.script_win_rect = (SDL_Rect){ 420, 180, 440, 270 };
+    g_daw.script_win_rect = (SDL_Rect){ 390, 140, 480, 320 };
 
     init_tab_defaults(0, "Project 1");
     init_keyboard_actions_system();
@@ -6269,6 +7671,24 @@ int main(int argc, char *argv[]) {
                     if (g_action_win.scroll_y > max_sc) g_action_win.scroll_y = max_sc;
                     continue;
                 }
+                if (g_daw.script_manager_open && point_in_rect(mx, my, &g_daw.script_win_rect)) {
+                    int list_h = g_daw.script_win_rect.h - 82;
+                    int content_h = g_daw.num_scripts * 24 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    g_script_scroll_y -= e.wheel.y * 28;
+                    if (g_script_scroll_y < 0) g_script_scroll_y = 0;
+                    if (g_script_scroll_y > max_sc) g_script_scroll_y = max_sc;
+                    continue;
+                }
+                if (g_theme.is_open && point_in_rect(mx, my, &g_theme.win_rect)) {
+                    int list_h = 316;
+                    int content_h = g_theme.num_saved * 28 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    g_theme.saved_scroll_y -= e.wheel.y * 28;
+                    if (g_theme.saved_scroll_y < 0) g_theme.saved_scroll_y = 0;
+                    if (g_theme.saved_scroll_y > max_sc) g_theme.saved_scroll_y = max_sc;
+                    continue;
+                }
                 if (g_history_popup_open && point_in_rect(mx, my, &g_history_win_rect)) {
                     int tab_i = get_valid_tab_idx();
                     int list_h = g_history_win_rect.h - 86;
@@ -6311,6 +7731,15 @@ int main(int argc, char *argv[]) {
                 }
             } else if (e.type == SDL_TEXTINPUT) {
                 if (g_daw.save_prompt_open) continue;
+                if (g_theme.is_open && g_theme.code_focused) {
+                    if (strlen(g_theme.code_buf) + strlen(e.text.text) < sizeof(g_theme.code_buf) - 1) {
+                        strcat(g_theme.code_buf, e.text.text);
+                        if (parse_theme_code_input(g_theme.code_buf)) {
+                            save_themes_settings_json();
+                        }
+                    }
+                    continue;
+                }
                 if (g_action_win.is_open && g_action_win.filter_focused &&
                     !g_action_win.capturing_add_shortcut && !g_action_win.capturing_find_shortcut) {
                     if (strlen(g_action_win.filter_text) + strlen(e.text.text) < sizeof(g_action_win.filter_text) - 1) {
@@ -6379,6 +7808,25 @@ int main(int argc, char *argv[]) {
                 if (g_daw.save_prompt_open) {
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
                         handle_save_modal_choice(3, &running);
+                    }
+                    continue;
+                }
+                if (g_theme.is_open && g_theme.code_focused) {
+                    if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        if (parse_theme_code_input(g_theme.code_buf)) {
+                            save_themes_settings_json();
+                            snprintf(g_theme.status_msg, sizeof(g_theme.status_msg),
+                                     "Applied & saved %s to themes_settings.json", g_theme.code_buf);
+                        }
+                        g_theme.code_focused = false;
+                        SDL_StopTextInput();
+                    } else if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        sync_theme_code_string();
+                        g_theme.code_focused = false;
+                        SDL_StopTextInput();
+                    } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
+                        size_t l = strlen(g_theme.code_buf);
+                        if (l > 0) g_theme.code_buf[l - 1] = '\0';
                     }
                     continue;
                 }
@@ -6726,6 +8174,162 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // ================= THEMES (ARGB) POPUP WINDOW INTERACTIONS =================
+                if (g_theme.is_open) {
+                    init_default_saved_themes();
+                    SDL_Rect *wr = &g_theme.win_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+
+                    if (g_theme.code_focused) {
+                        parse_theme_code_input(g_theme.code_buf);
+                        save_themes_settings_json();
+                        g_theme.code_focused = false;
+                        SDL_StopTextInput();
+                    }
+
+                    // Title bar drag or [X] close
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 30) {
+                        if (mx >= wx + ww - 28) {
+                            g_theme.is_open = false;
+                        } else {
+                            g_theme.is_dragging = true;
+                            g_theme.drag_off_x = mx - wx;
+                            g_theme.drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+
+                    if (mx >= wx && mx <= wx + ww && my >= wy + 30 && my <= wy + wh) {
+                        int p_x = wx + 18;
+                        int sv_y = wy + 44, sv_w = 256, sv_h = 164;
+                        int hue_y = wy + 220, bar_h = 18;
+                        int alpha_y = wy + 250;
+                        int code_y = wy + 284;
+                        int b_y = wy + 350;
+
+                        // 1. 2D Saturation/Value Square click/drag
+                        if (mx >= p_x && mx <= p_x + sv_w && my >= sv_y && my <= sv_y + sv_h) {
+                            g_theme.dragging_sv = true;
+                            g_theme.s = (float)(mx - p_x) / (float)(sv_w - 1);
+                            g_theme.v = 1.0f - ((float)(my - sv_y) / (float)(sv_h - 1));
+                            if (g_theme.s < 0.0f) g_theme.s = 0.0f; else if (g_theme.s > 1.0f) g_theme.s = 1.0f;
+                            if (g_theme.v < 0.0f) g_theme.v = 0.0f; else if (g_theme.v > 1.0f) g_theme.v = 1.0f;
+                            theme_hsv_to_rgb(g_theme.h, g_theme.s, g_theme.v, &g_theme.r, &g_theme.g, &g_theme.b);
+                            sync_theme_code_string();
+                            save_themes_settings_json();
+                            continue;
+                        }
+
+                        // 2. Hue Rainbow Bar click/drag
+                        if (mx >= p_x && mx <= p_x + sv_w && my >= hue_y - 4 && my <= hue_y + bar_h + 4) {
+                            g_theme.dragging_hue = true;
+                            g_theme.h = ((float)(mx - p_x) / (float)(sv_w - 1)) * 360.0f;
+                            if (g_theme.h < 0.0f) g_theme.h = 0.0f; else if (g_theme.h > 359.9f) g_theme.h = 359.9f;
+                            theme_hsv_to_rgb(g_theme.h, g_theme.s, g_theme.v, &g_theme.r, &g_theme.g, &g_theme.b);
+                            sync_theme_code_string();
+                            save_themes_settings_json();
+                            continue;
+                        }
+
+                        // 3. Alpha Bar click/drag
+                        if (mx >= p_x && mx <= p_x + sv_w && my >= alpha_y - 4 && my <= alpha_y + bar_h + 4) {
+                            g_theme.dragging_alpha = true;
+                            float af = (float)(mx - p_x) / (float)(sv_w - 1);
+                            if (af < 0.0f) af = 0.0f; else if (af > 1.0f) af = 1.0f;
+                            g_theme.a = (uint8_t)(af * 255.0f + 0.5f);
+                            sync_theme_code_string();
+                            save_themes_settings_json();
+                            continue;
+                        }
+
+                        // 4. rgba(...) Code Input Box click
+                        if (mx >= p_x && mx <= p_x + 212 && my >= code_y && my <= code_y + 30) {
+                            g_theme.code_focused = true;
+                            SDL_StartTextInput();
+                            continue;
+                        }
+
+                        // 5. [Save Theme] button -> Saves current ARGB theme into Saved Themes list for future use
+                        if (mx >= p_x && mx <= p_x + 124 && my >= b_y && my <= b_y + 30) {
+                            int slot = -1;
+                            for (int i = 0; i < g_theme.num_saved; i++) {
+                                if (g_theme.saved[i].r == g_theme.r && g_theme.saved[i].g == g_theme.g &&
+                                    g_theme.saved[i].b == g_theme.b && g_theme.saved[i].a == g_theme.a) {
+                                    slot = i;
+                                    break;
+                                }
+                            }
+                            if (slot < 0) {
+                                if (g_theme.num_saved < MAX_SAVED_THEMES) {
+                                    slot = g_theme.num_saved++;
+                                } else {
+                                    slot = MAX_SAVED_THEMES - 1;
+                                }
+                                SavedThemeEntry *st = &g_theme.saved[slot];
+                                snprintf(st->name, sizeof(st->name), "Custom Theme %d", slot);
+                                st->r = g_theme.r;
+                                st->g = g_theme.g;
+                                st->b = g_theme.b;
+                                st->a = g_theme.a;
+                            }
+                            g_theme.selected_saved_idx = slot;
+                            save_themes_settings_json();
+                            snprintf(g_theme.status_msg, sizeof(g_theme.status_msg),
+                                     "Saved '%s' (%s) to themes_settings.json",
+                                     g_theme.saved[slot].name, g_theme.code_buf);
+                            record_project_change("Saved Custom Theme", false);
+                            continue;
+                        }
+
+                        // 6. [Default Orange] button -> Restores default Orange theme
+                        if (mx >= p_x + 132 && mx <= p_x + 256 && my >= b_y && my <= b_y + 30) {
+                            g_theme.r = 205;
+                            g_theme.g = 138;
+                            g_theme.b = 72;
+                            g_theme.a = 255;
+                            theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+                            sync_theme_code_string();
+                            save_themes_settings_json();
+                            snprintf(g_theme.status_msg, sizeof(g_theme.status_msg),
+                                     "Restored Default Orange theme & saved to JSON");
+                            record_project_change("Restored Default Orange Theme", false);
+                            continue;
+                        }
+
+                        // 7. Right-side Saved Themes list & scrollbar
+                        int rx = wx + 292;
+                        int rw = ww - 308;
+                        int list_y = wy + 64;
+                        int list_h = 316;
+                        int sb_x = rx + rw - 14;
+                        if (my >= list_y && my < list_y + list_h && mx >= sb_x && mx <= rx + rw) {
+                            g_theme.saved_sb_dragging = true;
+                            g_theme.saved_sb_start_my = my;
+                            g_theme.saved_sb_orig_scroll = g_theme.saved_scroll_y;
+                            continue;
+                        }
+                        if (my >= list_y && my < list_y + list_h && mx >= rx && mx < sb_x) {
+                            int clicked_row = (my - (list_y + 4) + g_theme.saved_scroll_y) / 28;
+                            if (clicked_row >= 0 && clicked_row < g_theme.num_saved) {
+                                SavedThemeEntry *st = &g_theme.saved[clicked_row];
+                                g_theme.selected_saved_idx = clicked_row;
+                                g_theme.r = st->r;
+                                g_theme.g = st->g;
+                                g_theme.b = st->b;
+                                g_theme.a = st->a;
+                                theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+                                sync_theme_code_string();
+                                save_themes_settings_json();
+                                snprintf(g_theme.status_msg, sizeof(g_theme.status_msg),
+                                         "Applied theme '%s' & saved forever to JSON", st->name);
+                                record_project_change("Applied Saved Theme", false);
+                            }
+                            continue;
+                        }
+                        continue;
+                    }
+                }
+
                 // ================= HIDE TRACKS POPUP WINDOW INTERACTIONS (WITH SCROLLBAR) =================
                 if (g_hide_popup_open) {
                     SDL_Rect *hr = &g_hide_win_rect;
@@ -6980,8 +8584,16 @@ int main(int argc, char *argv[]) {
 
                 if (g_daw.script_manager_open) {
                     SDL_Rect *sr = &g_daw.script_win_rect;
-                    if (mx >= sr->x && mx <= sr->x + sr->w && my >= sr->y && my <= sr->y + 26) {
-                        if (mx >= sr->x + sr->w - 24) {
+                    VideoResizeEdge sc_edge = hit_test_video_resize_edge(sr, mx, my);
+                    if (sc_edge != VID_RESIZE_NONE) {
+                        g_script_resize_edge = (int)sc_edge;
+                        g_script_resize_start_mx = mx;
+                        g_script_resize_start_my = my;
+                        g_script_resize_orig_rect = *sr;
+                        continue;
+                    }
+                    if (mx >= sr->x && mx <= sr->x + sr->w && my >= sr->y && my <= sr->y + 28) {
+                        if (mx >= sr->x + sr->w - 26) {
                             g_daw.script_manager_open = false;
                         } else {
                             g_daw.script_win_dragging = true;
@@ -6990,56 +8602,61 @@ int main(int argc, char *argv[]) {
                         }
                         continue;
                     }
-                    if (mx >= sr->x && mx <= sr->x + sr->w && my >= sr->y + 26 && my <= sr->y + sr->h) {
-                        int by = sr->y + sr->h - 38;
-                        if (my >= by && my <= by + 28) {
-                            if (mx >= sr->x + 12 && mx <= sr->x + 104) {
-                                import_script_into_action_system(g_daw.script_manager_is_python);
-                                if (g_daw.num_scripts > 0) {
-                                    g_daw.script_selected_idx = g_daw.num_scripts - 1;
-                                }
-                            } else if (mx >= sr->x + 114 && mx <= sr->x + 206) {
-                                if (g_daw.script_selected_idx >= 0 && g_daw.script_selected_idx < g_daw.num_scripts) {
-                                    scan_scripts_directory_to_actions(&g_daw);
-                                    for (int a = 0; a < g_num_actions; a++) {
-                                        if (g_actions[a].linked_script_idx == g_daw.script_selected_idx) {
-                                            execute_daw_action_by_index(p, ren, win, a);
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else if (mx >= sr->x + 216 && mx <= sr->x + 308) {
-                                if (g_daw.script_selected_idx >= 0 && g_daw.script_selected_idx < g_daw.num_scripts) {
-                                    int del_sc = g_daw.script_selected_idx;
-                                    // Also remove from g_actions if user-imported
-                                    for (int a = g_num_actions - 1; a >= 0; a--) {
-                                        if (g_actions[a].linked_script_idx == del_sc && g_actions[a].id == ACT_USER_IMPORTED_SCRIPT) {
-                                            for (int k = a; k < g_num_actions - 1; k++) g_actions[k] = g_actions[k + 1];
-                                            g_num_actions--;
-                                        } else if (g_actions[a].linked_script_idx > del_sc) {
-                                            g_actions[a].linked_script_idx--;
-                                        }
-                                    }
-                                    for (int s = del_sc; s < g_daw.num_scripts - 1; s++) {
-                                        g_daw.scripts[s] = g_daw.scripts[s + 1];
-                                    }
-                                    g_daw.num_scripts--;
-                                    g_daw.script_selected_idx = -1;
-                                    refresh_filtered_actions();
-                                    save_keyboard_shortcuts_json();
-                                }
-                            }
+                    if (mx >= sr->x && mx <= sr->x + sr->w && my >= sr->y + 28 && my <= sr->y + sr->h) {
+                        int list_y = sr->y + 36;
+                        int list_h = sr->h - 82;
+                        int sb_x = sr->x + sr->w - 26;
+
+                        // Scrollbar drag inside Script Manager
+                        if (my >= list_y && my < list_y + list_h && mx >= sb_x && mx <= sr->x + sr->w - 12) {
+                            g_script_sb_dragging = true;
+                            g_script_sb_start_my = my;
+                            g_script_sb_orig_scroll = g_script_scroll_y;
+                            continue;
                         }
-                        int ly = sr->y + 34;
-                        if (my >= ly && my <= ly + 180 && mx >= sr->x + 12 && mx <= sr->x + sr->w - 12) {
-                            int r = (my - ly) / 22;
+
+                        // Script row selection & double-click execution
+                        if (my >= list_y && my < list_y + list_h && mx >= sr->x + 12 && mx < sb_x) {
+                            int r = (my - (list_y + 4) + g_script_scroll_y) / 24;
                             if (r >= 0 && r < g_daw.num_scripts) {
                                 g_daw.script_selected_idx = r;
                                 if (e.button.clicks >= 2) {
                                     scan_scripts_directory_to_actions(&g_daw);
                                     for (int a = 0; a < g_num_actions; a++) {
-                                        if (g_actions[a].linked_script_idx == r) {
+                                        if (g_actions[a].linked_script_idx == r ||
+                                            str_contains_nocase(g_actions[a].description, g_daw.scripts[r].name)) {
                                             execute_daw_action_by_index(p, ren, win, a);
+                                            snprintf(g_script_status_msg, sizeof(g_script_status_msg),
+                                                     "Executed: %s", g_daw.scripts[r].name);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Bottom buttons: [Refresh Script] and [Run Script] (Delete removed)
+                        int by = sr->y + sr->h - 38;
+                        if (my >= by && my <= by + 28) {
+                            if (mx >= sr->x + 12 && mx <= sr->x + 142) {
+                                // [Refresh Script]: Rescans scripts/ folders for any new .lua or .py files
+                                scan_scripts_directory_to_actions(&g_daw);
+                                save_keyboard_shortcuts_json();
+                                snprintf(g_script_status_msg, sizeof(g_script_status_msg),
+                                         "Refreshed scripts folder (%d scripts loaded)", g_daw.num_scripts);
+                                record_project_change("Refreshed Scripts Folder", false);
+                            } else if (mx >= sr->x + 152 && mx <= sr->x + 266) {
+                                // [Run Script]: Executes selected Lua or Python script
+                                if (g_daw.script_selected_idx >= 0 && g_daw.script_selected_idx < g_daw.num_scripts) {
+                                    int sel_s = g_daw.script_selected_idx;
+                                    scan_scripts_directory_to_actions(&g_daw);
+                                    for (int a = 0; a < g_num_actions; a++) {
+                                        if (g_actions[a].linked_script_idx == sel_s ||
+                                            str_contains_nocase(g_actions[a].description, g_daw.scripts[sel_s].name)) {
+                                            execute_daw_action_by_index(p, ren, win, a);
+                                            snprintf(g_script_status_msg, sizeof(g_script_status_msg),
+                                                     "Executed: %s", g_daw.scripts[sel_s].name);
                                             break;
                                         }
                                     }
@@ -7121,8 +8738,8 @@ int main(int argc, char *argv[]) {
 
                 if (g_daw.menu_action_open) {
                     int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-                    if (mx >= 60 && mx <= 228 && my >= m_start && my <= m_start + 80) {
-                        if (my >= m_start && my < m_start + 26) {
+                    if (mx >= 60 && mx <= 228 && my >= m_start && my <= m_start + 56) {
+                        if (my >= m_start && my < m_start + 28) {
                             // Submenu 1: Keyboard Shortcut -> Opens REAPER-style Actions & Keyboard Shortcuts popup window
                             scan_scripts_directory_to_actions(&g_daw);
                             save_keyboard_shortcuts_json();
@@ -7131,20 +8748,11 @@ int main(int argc, char *argv[]) {
                             g_action_win.win_rect.y = (win_h - g_action_win.win_rect.h) / 2;
                             g_daw.menu_action_open = false;
                             continue;
-                        } else if (my >= m_start + 26 && my < m_start + 52) {
-                            // Submenu 2: Lua Scripts (no 3 dots)
+                        } else if (my >= m_start + 28 && my <= m_start + 56) {
+                            // Submenu 2: Scripts -> Opens unified Lua & Python Script Manager popup window
                             scan_scripts_directory_to_actions(&g_daw);
                             save_keyboard_shortcuts_json();
                             g_daw.script_manager_open = true;
-                            g_daw.script_manager_is_python = false;
-                            g_daw.menu_action_open = false;
-                            continue;
-                        } else if (my >= m_start + 52 && my <= m_start + 80) {
-                            // Submenu 3: Python Scripts (no 3 dots)
-                            scan_scripts_directory_to_actions(&g_daw);
-                            save_keyboard_shortcuts_json();
-                            g_daw.script_manager_open = true;
-                            g_daw.script_manager_is_python = true;
                             g_daw.menu_action_open = false;
                             continue;
                         }
@@ -7156,17 +8764,26 @@ int main(int argc, char *argv[]) {
 
                 if (g_menu_tools_open) {
                     int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-                    if (mx >= 126 && mx <= 276 && my >= m_start && my <= m_start + 56) {
+                    if (mx >= 126 && mx <= 276 && my >= m_start && my <= m_start + 82) {
                         if (my >= m_start && my < m_start + 26) {
                             // Submenu 1: Marker
                             p->show_marker_lane = !p->show_marker_lane;
                             g_menu_tools_open = false;
                             continue;
-                        } else if (my >= m_start + 26 && my <= m_start + 56) {
+                        } else if (my >= m_start + 26 && my < m_start + 54) {
                             // Submenu 2: History (opens 100-entry Project History popup window)
                             g_history_popup_open = true;
                             g_history_win_rect.x = (win_w - g_history_win_rect.w) / 2;
                             g_history_win_rect.y = (win_h - g_history_win_rect.h) / 2;
+                            g_menu_tools_open = false;
+                            continue;
+                        } else if (my >= m_start + 54 && my <= m_start + 82) {
+                            // Submenu 3: Themes (opens ARGB Themes popup window)
+                            init_default_saved_themes();
+                            sync_theme_code_string();
+                            g_theme.is_open = true;
+                            g_theme.win_rect.x = (win_w - g_theme.win_rect.w) / 2;
+                            g_theme.win_rect.y = (win_h - g_theme.win_rect.h) / 2;
                             g_menu_tools_open = false;
                             continue;
                         }
@@ -7469,6 +9086,16 @@ int main(int argc, char *argv[]) {
                 dragging_track_order_idx = -1;
                 dragging_track_order_pushed_undo = false;
                 g_daw.script_win_dragging = false;
+                g_script_sb_dragging = false;
+                g_script_resize_edge = 0;
+                if (g_theme.dragging_sv || g_theme.dragging_hue || g_theme.dragging_alpha) {
+                    save_themes_settings_json();
+                }
+                g_theme.is_dragging = false;
+                g_theme.dragging_sv = false;
+                g_theme.dragging_hue = false;
+                g_theme.dragging_alpha = false;
+                g_theme.saved_sb_dragging = false;
                 if (dragging_item_idx != -1) {
                     if (dragging_fade_in) record_project_change("Adjusted Clip Fade-In", true);
                     else if (dragging_fade_out) record_project_change("Adjusted Clip Fade-Out", true);
@@ -7579,6 +9206,95 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                if (g_theme.is_open && g_theme.is_dragging) {
+                    g_theme.win_rect.x = mx - g_theme.drag_off_x;
+                    g_theme.win_rect.y = my - g_theme.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_theme.is_open && g_theme.dragging_sv) {
+                    int p_x = g_theme.win_rect.x + 18;
+                    int sv_y = g_theme.win_rect.y + 44, sv_w = 256, sv_h = 164;
+                    g_theme.s = (float)(mx - p_x) / (float)(sv_w - 1);
+                    g_theme.v = 1.0f - ((float)(my - sv_y) / (float)(sv_h - 1));
+                    if (g_theme.s < 0.0f) g_theme.s = 0.0f; else if (g_theme.s > 1.0f) g_theme.s = 1.0f;
+                    if (g_theme.v < 0.0f) g_theme.v = 0.0f; else if (g_theme.v > 1.0f) g_theme.v = 1.0f;
+                    theme_hsv_to_rgb(g_theme.h, g_theme.s, g_theme.v, &g_theme.r, &g_theme.g, &g_theme.b);
+                    sync_theme_code_string();
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_theme.is_open && g_theme.dragging_hue) {
+                    int p_x = g_theme.win_rect.x + 18, sv_w = 256;
+                    g_theme.h = ((float)(mx - p_x) / (float)(sv_w - 1)) * 360.0f;
+                    if (g_theme.h < 0.0f) g_theme.h = 0.0f; else if (g_theme.h > 359.9f) g_theme.h = 359.9f;
+                    theme_hsv_to_rgb(g_theme.h, g_theme.s, g_theme.v, &g_theme.r, &g_theme.g, &g_theme.b);
+                    sync_theme_code_string();
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_theme.is_open && g_theme.dragging_alpha) {
+                    int p_x = g_theme.win_rect.x + 18, sv_w = 256;
+                    float af = (float)(mx - p_x) / (float)(sv_w - 1);
+                    if (af < 0.0f) af = 0.0f; else if (af > 1.0f) af = 1.0f;
+                    g_theme.a = (uint8_t)(af * 255.0f + 0.5f);
+                    sync_theme_code_string();
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_theme.is_open && g_theme.saved_sb_dragging) {
+                    int list_h = 316;
+                    int content_h = g_theme.num_saved * 28 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    if (max_sc > 0 && list_h > 0) {
+                        int delta_y = my - g_theme.saved_sb_start_my;
+                        g_theme.saved_scroll_y = g_theme.saved_sb_orig_scroll + (delta_y * content_h) / list_h;
+                        if (g_theme.saved_scroll_y < 0) g_theme.saved_scroll_y = 0;
+                        if (g_theme.saved_scroll_y > max_sc) g_theme.saved_scroll_y = max_sc;
+                    }
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_daw.script_manager_open && g_script_resize_edge != 0) {
+                    int dx = mx - g_script_resize_start_mx;
+                    int dy = my - g_script_resize_start_my;
+                    SDL_Rect nr = g_script_resize_orig_rect;
+                    if (g_script_resize_edge == VID_RESIZE_RIGHT || g_script_resize_edge == VID_RESIZE_BOTTOM_RIGHT) {
+                        nr.w = g_script_resize_orig_rect.w + dx;
+                        if (nr.w < 360) nr.w = 360;
+                        if (nr.w > win_w - 20) nr.w = win_w - 20;
+                    }
+                    if (g_script_resize_edge == VID_RESIZE_LEFT || g_script_resize_edge == VID_RESIZE_BOTTOM_LEFT) {
+                        int nw = g_script_resize_orig_rect.w - dx;
+                        if (nw < 360) nw = 360;
+                        if (nw > win_w - 20) nw = win_w - 20;
+                        nr.x = (g_script_resize_orig_rect.x + g_script_resize_orig_rect.w) - nw;
+                        nr.w = nw;
+                    }
+                    if (g_script_resize_edge == VID_RESIZE_BOTTOM ||
+                        g_script_resize_edge == VID_RESIZE_BOTTOM_LEFT ||
+                        g_script_resize_edge == VID_RESIZE_BOTTOM_RIGHT) {
+                        nr.h = g_script_resize_orig_rect.h + dy;
+                        if (nr.h < 220) nr.h = 220;
+                        if (nr.h > win_h - 20) nr.h = win_h - 20;
+                    }
+                    g_daw.script_win_rect = nr;
+                    SDL_SetCursor((g_script_resize_edge == VID_RESIZE_BOTTOM) ? g_cursor_size_ns : g_cursor_size_we);
+                    continue;
+                }
+                if (g_daw.script_manager_open && g_script_sb_dragging) {
+                    int list_h = g_daw.script_win_rect.h - 82;
+                    int content_h = g_daw.num_scripts * 24 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    if (max_sc > 0 && list_h > 0) {
+                        int delta_y = my - g_script_sb_start_my;
+                        g_script_scroll_y = g_script_sb_orig_scroll + (delta_y * content_h) / list_h;
+                        if (g_script_scroll_y < 0) g_script_scroll_y = 0;
+                        if (g_script_scroll_y > max_sc) g_script_scroll_y = max_sc;
+                    }
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
                 if (g_daw.script_win_dragging) {
                     g_daw.script_win_rect.x = mx - g_daw.script_drag_offset_x;
                     g_daw.script_win_rect.y = my - g_daw.script_drag_offset_y;
@@ -8025,7 +9741,7 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &btn_act, g_daw.menu_action_open, false);
         draw_text(ren, "Action", 66, TABBAR_HEIGHT + 13, c_white);
 
-        bool tools_active = g_menu_tools_open || g_history_popup_open || p->show_marker_lane;
+        bool tools_active = g_menu_tools_open || g_history_popup_open || g_theme.is_open || p->show_marker_lane;
         SDL_Rect btn_tools = { 126, TABBAR_HEIGHT + 5, 58, 26 };
         SDL_SetRenderDrawColor(ren, tools_active ? 62 : 40, tools_active ? 46 : 40, tools_active ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &btn_tools);
@@ -8278,28 +9994,30 @@ int main(int argc, char *argv[]) {
 
         // Subtle vertical timeline grid lines in faded brown
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        uint8_t th_r, th_g, th_b;
+        get_theme_effective_rgb(&th_r, &th_g, &th_b);
         for (double t = start_tick; t <= end_tick; t += chosen_step) {
             int gx = g_daw.tcp_width + (int)((t - p->scroll_x_sec) * p->pixels_per_second);
             if (gx < g_daw.tcp_width || gx > g_daw.tcp_width + view_w) continue;
-            SDL_SetRenderDrawColor(ren, 118, 78, 46, 65);
+            SDL_SetRenderDrawColor(ren, (uint8_t)((th_r * 58) / 100), (uint8_t)((th_g * 57) / 100), (uint8_t)((th_b * 63) / 100), 65);
             SDL_RenderDrawLine(ren, gx, header_top_y, gx, header_top_y + view_h);
         }
 
-        // Timeline tracks: Each track has an identical simple faded brown edge; selected track edge is slightly thicker
+        // Timeline tracks: Each track has an identical simple faded theme edge; selected track edge is slightly thicker
         int track_cur_y = header_top_y - p->scroll_y_px;
         for (int i = 0; i < p->num_tracks; i++) {
             if (is_track_hidden(i)) continue;
             int th = p->track_heights[i];
             SDL_Rect lane_border = { g_daw.tcp_width, track_cur_y, view_w, th };
             if (p->track_selected[i]) {
-                SDL_SetRenderDrawColor(ren, 205, 138, 72, 235);
+                SDL_SetRenderDrawColor(ren, th_r, th_g, th_b, 235);
                 SDL_RenderDrawRect(ren, &lane_border);
                 if (th > 4 && view_w > 4) {
                     SDL_Rect lane_inner = { g_daw.tcp_width + 1, track_cur_y + 1, view_w - 2, th - 2 };
                     SDL_RenderDrawRect(ren, &lane_inner);
                 }
             } else {
-                SDL_SetRenderDrawColor(ren, 118, 78, 46, 135);
+                SDL_SetRenderDrawColor(ren, (uint8_t)((th_r * 58) / 100), (uint8_t)((th_g * 57) / 100), (uint8_t)((th_b * 63) / 100), 135);
                 SDL_RenderDrawRect(ren, &lane_border);
             }
             track_cur_y += th;
@@ -8790,82 +10508,135 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Delete Marker", g_marker_context_x + 12, g_marker_context_y + 8, c_white);
         }
 
-        // 7. Action Menu (Submenus: Keyboard Shortcut, Lua Scripts, Python Scripts - no 3 dots)
+        // 7. Action Menu (Submenus: Keyboard Shortcut, Scripts)
         if (g_daw.menu_action_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect a_box = { 60, m_start, 168, 80 };
+            SDL_Rect a_box = { 60, m_start, 168, 56 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &a_box);
             draw_brown_border_rect(ren, &a_box, true, false);
             draw_text(ren, "Keyboard Shortcut", 68, m_start + 8, c_white);
-            draw_text(ren, "Lua Scripts", 68, m_start + 33, c_white);
-            draw_text(ren, "Python Scripts", 68, m_start + 58, c_white);
+            draw_text(ren, "Scripts", 68, m_start + 34, c_white);
         }
 
-        // Script Manager (with Brown Borders)
+        // Unified Script Manager (Lua & Python Scripts, Edge-Draggable Resize, Vertical Scrollbar, Refresh Script & Run Script)
         if (g_daw.script_manager_open) {
             SDL_Rect *sr = &g_daw.script_win_rect;
+            if (sr->w < 360) sr->w = 360;
+            if (sr->h < 220) sr->h = 220;
+
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+            SDL_Rect sc_shadow = { sr->x + 6, sr->y + 6, sr->w, sr->h };
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 165);
+            SDL_RenderFillRect(ren, &sc_shadow);
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, sr);
-            draw_brown_border_rect(ren, sr, false, false);
+            draw_brown_border_rect(ren, sr, true, false);
 
-            SDL_Rect s_hdr = { sr->x, sr->y, sr->w, 26 };
-            SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
+            SDL_Rect s_hdr = { sr->x, sr->y, sr->w, 28 };
+            uint8_t shr, shg, shb;
+            get_theme_surface_rgb(32, 0.22f, &shr, &shg, &shb);
+            SDL_SetRenderDrawColor(ren, shr, shg, shb, 255);
             SDL_RenderFillRect(ren, &s_hdr);
             draw_brown_border_rect(ren, &s_hdr, false, false);
 
-            char win_title[64];
-            snprintf(win_title, sizeof(win_title), "%s Script Manager", g_daw.script_manager_is_python ? "Python" : "Lua");
-            draw_text(ren, win_title, sr->x + 8, sr->y + 8, c_white);
-            draw_text(ren, "X", sr->x + sr->w - 18, sr->y + 8, c_white);
+            draw_text(ren, "Script Manager (Lua & Python)", sr->x + 12, sr->y + 8, c_white);
+            draw_text(ren, "X", sr->x + sr->w - 20, sr->y + 8, c_white);
 
-            SDL_Rect list_box = { sr->x + 12, sr->y + 34, sr->w - 24, 180 };
+            int list_y = sr->y + 36;
+            int list_h = sr->h - 82;
+            SDL_Rect list_box = { sr->x + 12, list_y, sr->w - 24, list_h };
             SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
             SDL_RenderFillRect(ren, &list_box);
             draw_brown_border_rect(ren, &list_box, false, false);
 
+            int content_h = g_daw.num_scripts * 24 + 8;
+            int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+            if (g_script_scroll_y > max_sc) g_script_scroll_y = max_sc;
+            if (g_script_scroll_y < 0) g_script_scroll_y = 0;
+
+            SDL_Color c_accent = get_theme_accent_sdl_color();
+            SDL_Rect sc_clip = { list_box.x + 2, list_box.y + 2, list_box.w - 18, list_box.h - 4 };
+            SDL_RenderSetClipRect(ren, &sc_clip);
             for (int s = 0; s < g_daw.num_scripts; s++) {
-                int sy = sr->y + 38 + (s * 22);
-                if (s == g_daw.script_selected_idx) {
-                    SDL_Rect s_row = { sr->x + 14, sy - 2, sr->w - 28, 20 };
-                    SDL_SetRenderDrawColor(ren, 56, 42, 30, 255);
+                int sy = list_box.y + 4 + (s * 24) - g_script_scroll_y;
+                if (sy + 22 < list_box.y || sy > list_box.y + list_box.h) continue;
+
+                bool is_sel = (s == g_daw.script_selected_idx);
+                SDL_Rect s_row = { list_box.x + 4, sy, list_box.w - 22, 22 };
+                if (is_sel) {
+                    SDL_SetRenderDrawColor(ren, shr + 14, shg + 10, shb + 8, 255);
                     SDL_RenderFillRect(ren, &s_row);
                     draw_brown_border_rect(ren, &s_row, false, false);
+                } else if ((s & 1) == 1) {
+                    SDL_SetRenderDrawColor(ren, 21, 20, 19, 255);
+                    SDL_RenderFillRect(ren, &s_row);
                 }
-                draw_text(ren, g_daw.scripts[s].name, sr->x + 18, sy + 2, c_white);
-                draw_text(ren, g_daw.scripts[s].shortcut, sr->x + sr->w - 70, sy + 2, c_white);
+
+                const char *type_tag = g_daw.scripts[s].is_python ? "[PY] " : "[LUA]";
+                draw_text(ren, type_tag, s_row.x + 6, sy + 4, is_sel ? c_white : c_accent);
+
+                int sc_col_w = g_daw.scripts[s].shortcut[0] ? 90 : 8;
+                SDL_Rect name_clip = { s_row.x + 52, sy + 1, s_row.w - 56 - sc_col_w, 20 };
+                draw_text_clipped(ren, g_daw.scripts[s].name, s_row.x + 52, sy + 4, c_white, &name_clip, &sc_clip);
+
+                if (g_daw.scripts[s].shortcut[0] != '\0') {
+                    SDL_Rect key_clip = { s_row.x + s_row.w - 86, sy + 1, 80, 20 };
+                    draw_text_clipped(ren, g_daw.scripts[s].shortcut, s_row.x + s_row.w - 84, sy + 4, c_accent, &key_clip, &sc_clip);
+                }
             }
+            SDL_RenderSetClipRect(ren, NULL);
 
+            // Vertical Scrollbar for Script Manager
+            SDL_Rect sb_track = { list_box.x + list_box.w - 14, list_box.y + 2, 12, list_box.h - 4 };
+            SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+            SDL_RenderFillRect(ren, &sb_track);
+            draw_brown_border_rect(ren, &sb_track, false, true);
+
+            int thumb_h = (content_h > list_h && content_h > 0)
+                          ? fmax(24, (sb_track.h * list_h) / content_h)
+                          : sb_track.h;
+            int thumb_y = sb_track.y + ((max_sc > 0) ? ((g_script_scroll_y * (sb_track.h - thumb_h)) / max_sc) : 0);
+            SDL_Rect sb_thumb = { sb_track.x + 1, thumb_y, sb_track.w - 2, thumb_h };
+            uint8_t sbr, sbg, sbb;
+            get_theme_surface_rgb(42, 0.45f, &sbr, &sbg, &sbb);
+            SDL_SetRenderDrawColor(ren, sbr, sbg, sbb, 255);
+            SDL_RenderFillRect(ren, &sb_thumb);
+            draw_brown_border_rect(ren, &sb_thumb, false, false);
+
+            // Bottom Buttons: [Refresh Script] and [Run Script] (Delete removed)
             int by = sr->y + sr->h - 38;
-            SDL_Rect btn_add_sc = { sr->x + 12, by, 92, 28 };
-            SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
-            SDL_RenderFillRect(ren, &btn_add_sc);
-            draw_brown_border_rect(ren, &btn_add_sc, false, false);
-            draw_text(ren, "Add Script", sr->x + 18, by + 8, c_white);
+            SDL_Rect btn_ref_sc = { sr->x + 12, by, 130, 28 };
+            SDL_SetRenderDrawColor(ren, 44, 40, 36, 255);
+            SDL_RenderFillRect(ren, &btn_ref_sc);
+            draw_brown_border_rect(ren, &btn_ref_sc, false, false);
+            draw_text(ren, "Refresh Script", sr->x + 21, by + 8, c_white);
 
-            SDL_Rect btn_run_sc = { sr->x + 114, by, 92, 28 };
-            SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
+            SDL_Rect btn_run_sc = { sr->x + 152, by, 114, 28 };
+            SDL_SetRenderDrawColor(ren, shr + 16, shg + 10, shb + 6, 255);
             SDL_RenderFillRect(ren, &btn_run_sc);
-            draw_brown_border_rect(ren, &btn_run_sc, false, false);
-            draw_text(ren, "Run Script", sr->x + 120, by + 8, c_white);
+            draw_brown_border_rect(ren, &btn_run_sc, true, false);
+            draw_text(ren, "Run Script", sr->x + 169, by + 8, c_white);
 
-            SDL_Rect btn_del_sc = { sr->x + 216, by, 92, 28 };
-            SDL_SetRenderDrawColor(ren, 44, 44, 44, 255);
-            SDL_RenderFillRect(ren, &btn_del_sc);
-            draw_brown_border_rect(ren, &btn_del_sc, false, false);
-            draw_text(ren, "Delete", sr->x + 236, by + 8, c_white);
+            if (g_script_status_msg[0] != '\0' && sr->w > 300) {
+                SDL_Rect st_clip = { sr->x + 276, by + 2, sr->w - 288, 24 };
+                draw_text_clipped(ren, g_script_status_msg, sr->x + 276, by + 8, c_muted, &st_clip, NULL);
+            }
         }
 
-        // Tools Menu (Submenus: Marker, History)
+        // Tools Menu (Submenus: Marker, History, Themes)
         if (g_menu_tools_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect t_box = { 126, m_start, 150, 56 };
+            SDL_Rect t_box = { 126, m_start, 150, 82 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &t_box);
             draw_brown_border_rect(ren, &t_box, true, false);
 
             draw_text(ren, p->show_marker_lane ? "Marker [ON]" : "Marker", 136, m_start + 8, c_white);
-            draw_text(ren, "History", 136, m_start + 32, c_white);
+            draw_text(ren, "History", 136, m_start + 34, c_white);
+            draw_text(ren, "Themes", 136, m_start + 60, c_white);
         }
 
         // File Menu (Import Project, Export Project, Project Save As, Import Media, Export Media)
@@ -9646,6 +11417,11 @@ int main(int argc, char *argv[]) {
             render_action_window(ren);
         }
 
+        // Tools -> Themes ARGB Popup Window
+        if (g_theme.is_open) {
+            render_themes_popup_window(ren);
+        }
+
         // 8. Save Confirmation Dialog Modal (with Brown Borders)
         if (g_daw.save_prompt_open) {
             SDL_Rect dim_overlay = { 0, 0, win_w, win_h };
@@ -9699,7 +11475,7 @@ int main(int argc, char *argv[]) {
         SDL_Delay(16);
     }
 
-    save_keyboard_shortcuts_json();
+    save_themes_settings_json();
     if (g_daw.audio_device > 0) SDL_CloseAudioDevice(g_daw.audio_device);
     for (int t = 0; t < g_daw.num_tabs; t++) {
         close_video(&g_daw.tabs[t].video);
