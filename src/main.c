@@ -55,6 +55,8 @@ static int    g_next_item_group_id = 1;
 static double g_drag_group_orig_start[MAX_ITEMS];
 static bool   g_show_transport_bar = true;
 static int    g_saved_alt_tcp_width = 200;
+static bool     g_video_fullscreen[MAX_TABS] = { false };
+static SDL_Rect g_video_saved_rect[MAX_TABS];
 
 typedef struct {
     AudioItem item;
@@ -303,7 +305,7 @@ static void record_project_change(const char *action_name, bool mark_dirty) {
         g_tab_history[tab][MAX_HISTORY_ENTRIES - 1][HISTORY_ENTRY_LEN - 1] = '\0';
     }
 
-    snprintf(g_tab_notification[tab], sizeof(g_tab_notification[0]), "%s %s", ts_buf, act);
+    snprintf(g_tab_notification[tab], sizeof(g_tab_notification[0]), "%s", act);
 }
 
 static inline bool is_crossfade_active(void) {
@@ -2585,7 +2587,7 @@ typedef enum {
     ACT_SCRIPT_TRACKS_MOVE_TO_BOTTOM,
     ACT_SCRIPT_TRACKS_MOVE_TO_TOP,
 
-    // Action Meta / MIDI CC Modifiers (matching image_c629c7.png)
+    // Action Meta / Mousewheel Modifiers (matching image_c629c7.png)
     ACT_META_ARM_NEXT_ACTION,
     ACT_META_DISARM_ACTION,
     ACT_META_MOD_CC_PLUS_10,
@@ -2940,196 +2942,31 @@ static int find_action_by_shortcut_str(const char *chord) {
     return -1;
 }
 
-// Populates the entire REAPER-style Action & Keyboard Shortcut table (matching image_c62680.png, image_c629c7.png, and Basic Shortcut.pdf)
+// Populates ONLY the keyboard shortcuts listed in Basic Shortcut.pdf (no MIDI or extra actions)
 static void init_keyboard_actions_system(void) {
     g_num_actions = 0;
 
-    // ---- 1. VIEW & ZOOM ACTIONS (matching image_c62680.png & Basic Shortcut.pdf) ----
-    register_builtin_action(ACT_VIEW_ALT_TCP_WIDTH,
-        "View: Toggle to alternate TCP area width (alternate is zero width)",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TRACK_ZOOM_DEFAULT,
-        "View: Toggle track zoom to default height",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TRACK_ZOOM_DEFAULT_NO_PIN,
-        "View: Toggle track zoom to default height (ignore pinned tracks)",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TRACK_ZOOM_MAX_OVER,
-        "View: Toggle track zoom to maximum height (even if over 100% of arrange view)",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TRACK_ZOOM_MAX_100,
-        "View: Toggle track zoom to maximum height (limit to 100% of arrange view)",
-        "~", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TRACK_ZOOM_MIN,
-        "View: Toggle track zoom to minimum height",
-        "`", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TRACK_ZOOM_MIN_NO_PIN,
-        "View: Toggle track zoom to minimum height (ignore pinned tracks)",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TOGGLE_TRANSPORT,
-        "View: Toggle transport visible (Play/Record/Stop...)",
-        "Ctrl+Alt+T", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_SELECTED_ITEMS,
-        "View: Toggle zoom to selected items",
-        "_", NULL, NULL, NULL, false, false);
+    // ---- VIEW & ZOOM (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_VIEW_ZOOM_HORIZ_WHEEL,
-        "View: Zoom horizontally (MIDI CC relative/mousewheel)",
+        "View: Zoom horizontally (mousewheel)",
         "Mousewheel", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_HORIZ_REV_WHEEL,
-        "View: Zoom horizontally reversed (MIDI CC relative/mousewheel)",
-        NULL, NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_VIEW_SCROLL_HORIZ_WHEEL,
-        "View: Scroll horizontally (MIDI CC relative/mousewheel)",
+        "View: Scroll horizontally (mousewheel)",
         "Alt+Mousewheel", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_VIEW_ZOOM_IN_HORIZ,
         "View: Zoom in horizontal",
-        "+", "=", "Z", "Num +", false, false);
+        "Z", "+", "=", "Num +", false, false);
+    register_builtin_action(ACT_VIEW_ZOOM_OUT_HORIZ,
+        "View: Zoom out horizontal",
+        "X", "-", "Num -", NULL, false, false);
     register_builtin_action(ACT_VIEW_ZOOM_IN_VERT,
         "View: Zoom in vertical",
         "Up", "Shift+Up", NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_OUT_HORIZ,
-        "View: Zoom out horizontal",
-        "-", "X", "Num -", NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_OUT_PROJECT,
-        "View: Zoom out project",
-        "Ctrl+Page Down", NULL, NULL, NULL, false, false);
     int zv_out_idx = register_builtin_action(ACT_VIEW_ZOOM_OUT_VERT,
         "View: Zoom out vertical",
         "Down", "Shift+Down", NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_TIME_SELECTION,
-        "View: Zoom time selection",
-        "Ctrl+Num +", "Ctrl+Page Up", NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_VERT_WHEEL,
-        "View: Zoom vertically (MIDI CC relative/mousewheel)",
-        "Ctrl+Mousewheel", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_VERT_REV_WHEEL,
-        "View: Zoom vertically reversed (MIDI CC relative/mousewheel)",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_VERT_REV_SNAP,
-        "View: Zoom vertically reversed, snap to theme-defined sizes (MIDI CC relative/mousewheel)",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_ZOOM_VERT_SNAP,
-        "View: Zoom vertically, snap to theme-defined sizes (MIDI CC relative/mousewheel)",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_VKB_INPUT,
-        "Virtual MIDI keyboard: Send all input to VKB",
-        NULL, NULL, NULL, NULL, false, false);
 
-    // ---- 2. XENAKIOS / SWS ACTIONS (matching image_c62680.png & Basic Shortcut.pdf) ----
-    register_builtin_action(ACT_SWS_CREATE_NEW_TRACKS_DEP,
-        "Xenakios/SWS: [Deprecated] Create new tracks...",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_SWS_DEL_ACTIVE_TAKE_1,
-        "Xenakios/SWS: [Deprecated] Delete active take of item and...",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_SWS_DEL_ACTIVE_TAKE_2,
-        "Xenakios/SWS: [Deprecated] Delete active take of item and confirm",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_SWS_DEL_SELECTED_ITEM_SEND,
-        "Xenakios/SWS: [Deprecated] Delete selected item and send...",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_SWS_REPOSITION_ITEMS,
-        "Xenakios/SWS: Reposition selected items...",
-        "W", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_SWS_SCROLL_TRACK_VIEW_DOWN_PAGE,
-        "Xenakios/SWS: Scroll track view down (page)",
-        "Caps Lock", "Page Down", NULL, NULL, false, false);
-    register_builtin_action(ACT_SWS_SCROLL_TRACK_VIEW_UP_PAGE,
-        "Xenakios/SWS: Scroll track view up (page)",
-        "Tab", "Page Up", NULL, NULL, false, false);
-    register_builtin_action(ACT_SWS_MOVE_RIGHT_EDGE_TO_CURSOR,
-        "SWS: Move selected item(s) right edge to edit cursor",
-        "Ctrl+Num 1", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_SWS_MOVE_LEFT_EDGE_TO_CURSOR,
-        "SWS: Move selected item(s) left edge to edit cursor",
-        "Ctrl+Num 3", NULL, NULL, NULL, false, false);
-
-    // ---- 3. SCRIPTS & CUSTOM LUA / PYTHON SCRIPTS (matching image_c629c7.png & Basic Shortcut.pdf) ----
-    register_builtin_action(ACT_SCRIPT_TESTING_TIME_MATCH_3,
-        "Script: A testing time match 3 tracks.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_AUTO_ALIGN_2,
-        "Script: Auto align 2.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_AUTO_ALIGN,
-        "Script: auto align.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_AUTO_GAIN,
-        "Script: Auto gain.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_AUTO_WAVES_ALIGN,
-        "Script: auto waves align.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_CLIP_MATCH_SLICE,
-        "Script: Clip match Slice.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_CLIP_MOVE_TO_SELECTED_TRACK,
-        "Script: Clip move to selected track.lua",
-        "Alt+S", NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_CSV_EXPORT_TIMELINE,
-        "Script: CSV export Project Timeline.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_DEFAULT_6_THEME,
-        "Script: Default_6.0_theme_adjuster.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_DEFAULT_7_THEME,
-        "Script: Default_7.0_theme_adjuster.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_GROUP_AND_UNGROUP,
-        "Script: Group and Ungroup.lua",
-        "Ctrl+Alt+Shift+G", NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_LYRICS,
-        "Script: lyrics.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_PEAK_ALIGN,
-        "Script: Peak align.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_REPOSITION_ITEM,
-        "Script: Reposition item.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_TIME_MATCH_3_TRACK,
-        "Script: Time matching 3 Track System.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_TIME_MATCH_BOTTOM_CLIP,
-        "Script: Time matching along with bottom clip.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_TIME_MATCH_CLIP,
-        "Script: Time matching clip.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_TRACK_ARRANGE_SPEECH,
-        "Script: Track Arrange According to Speech length.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_TRACK_NAME_FIND_MOVE,
-        "Script: Track Name find and clip move.lua",
-        NULL, NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_TRACKS_MOVE_TO_BOTTOM,
-        "Script: Tracks move to bottom.lua",
-        "Alt+B", NULL, NULL, NULL, true, false);
-    register_builtin_action(ACT_SCRIPT_TRACKS_MOVE_TO_TOP,
-        "Script: Tracks Move to Top.lua",
-        "Alt+T", NULL, NULL, NULL, true, false);
-
-    // ---- 4. ACTION META / MIDI CC MODIFIERS (matching image_c629c7.png) ----
-    register_builtin_action(ACT_META_ARM_NEXT_ACTION,
-        "Action: Arm next action",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_META_DISARM_ACTION,
-        "Action: Disarm action",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_META_MOD_CC_PLUS_10,
-        "Action: Modify MIDI CC/mousewheel: +10%",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_META_MOD_CC_MINUS_10,
-        "Action: Modify MIDI CC/mousewheel: -10%",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_META_MOD_CC_05X,
-        "Action: Modify MIDI CC/mousewheel: 0.5x",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_META_MOD_CC_2X,
-        "Action: Modify MIDI CC/mousewheel: 2x",
-        NULL, NULL, NULL, NULL, false, false);
-
-    // ---- 5. ITEM SELECTION & NAVIGATION (matching Basic Shortcut.pdf) ----
+    // ---- ITEM SELECTION & NAVIGATION (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_ITEM_NAV_PREV_ITEM,
         "Item navigation: Select and move to previous item",
         ",", NULL, NULL, NULL, false, false);
@@ -3149,10 +2986,10 @@ static void init_keyboard_actions_system(void) {
         "Item navigation: Move cursor right to nearest item edge",
         "Num 9", NULL, NULL, NULL, false, false);
 
-    // ---- 6. AUDIO ITEM EDITING & GAIN OPERATIONS (matching Basic Shortcut.pdf) ----
+    // ---- AUDIO ITEM EDITING & GAIN OPERATIONS (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_EDIT_REMOVE_FOCUS,
         "Remove items/tracks/envelope points (depending on focus)",
-        "Delete", "Backspace", NULL, NULL, false, false);
+        "Delete", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_ITEM_TOGGLE_MUTE_FOCUS,
         "Item properties: Toggle items/tracks mute (depending on focus)",
         "Alt+M", NULL, NULL, NULL, false, false);
@@ -3165,112 +3002,60 @@ static void init_keyboard_actions_system(void) {
     register_builtin_action(ACT_ITEM_SET_CUSTOM_COLOR,
         "Item: Set to custom color...",
         "Ctrl+Alt+Shift+C", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_SPLIT_AT_CURSOR,
-        "Item: Split items at edit or play cursor",
-        "S", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_DUPLICATE_ITEMS,
-        "Item: Duplicate items",
-        "Ctrl+D", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_HEAL_SPLITS,
-        "Item: Heal splits in items",
-        "Alt+H", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_FADE_IN_TO_CURSOR,
-        "Item: Fade items in to cursor",
-        "Ctrl+Alt+I", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_FADE_OUT_FROM_CURSOR,
-        "Item: Fade items out from cursor",
-        "Ctrl+Alt+O", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_RESET_FADES,
-        "Item: Remove fade in and fade out",
-        "Ctrl+Alt+F", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_NORMALIZE_GAIN,
-        "Item: Normalize items (peak/RMS)",
-        "Ctrl+Shift+N", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_TRIM_LEFT_TO_CURSOR,
-        "Item: Trim left edge of item to edit cursor",
-        "Alt+[", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_TRIM_RIGHT_TO_CURSOR,
-        "Item: Trim right edge of item to edit cursor",
-        "Alt+]", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_SELECT_ALL_ON_TRACK,
-        "Item: Select all items on selected tracks",
-        "Ctrl+Shift+A", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_UNSELECT_ALL,
-        "Item: Unselect (clear selection of) all items",
-        "Ctrl+Alt+A", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_ITEM_TOGGLE_CROSSFADE_MODE,
-        "Options: Toggle auto-crossfade on/off",
-        "Alt+X", NULL, NULL, NULL, false, false);
 
-    // ---- 7. TRACK CONTROLS & TAB MANAGEMENT (matching Basic Shortcut.pdf) ----
+    // ---- TRACK CONTROLS & TAB MANAGEMENT (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_TRACK_TOGGLE_SOLO_SELECTED,
         "Track: Toggle solo for selected tracks",
         "Q", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_TOGGLE_MUTE_SELECTED,
-        "Track: Toggle mute for selected tracks",
-        "F6", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TRACK_MOVE_UP,
         "Track: Move tracks up",
         "Alt+Shift+Up", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TRACK_MOVE_DOWN,
         "Track: Move tracks down",
         "Alt+Shift+Down", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_INSERT_NEW,
-        "Track: Insert new track",
-        "Ctrl+T", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_DUPLICATE_SELECTED,
-        "Track: Duplicate tracks",
-        "Ctrl+Shift+D", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_REMOVE_SELECTED,
-        "Track: Remove tracks",
-        "Ctrl+Shift+Delete", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_SELECT_ALL,
-        "Track: Select all tracks",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_UNSELECT_ALL,
-        "Track: Unselect (clear selection of) all tracks",
-        NULL, NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_NUDGE_VOL_UP,
-        "Track: Nudge track volume +1dB",
-        "Ctrl+Up", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_NUDGE_VOL_DOWN,
-        "Track: Nudge track volume -1dB",
-        "Ctrl+Down", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRACK_RESET_VOL_0DB,
-        "Track: Reset track volume to 0.0dB",
-        "Ctrl+0", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TAB_SWITCH_NEXT,
         "Project tabs: Switch to next project tab",
-        "Ctrl+`", "Ctrl+Tab", NULL, NULL, false, false);
-    register_builtin_action(ACT_TAB_SWITCH_PREV,
-        "Project tabs: Switch to previous project tab",
-        "Ctrl+Shift+Tab", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TAB_NEW_PROJECT_TAB,
-        "New project tab",
-        "Ctrl+Alt+N", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TAB_CLOSE_CURRENT_TAB,
-        "Close current project tab",
-        "Ctrl+F4", NULL, NULL, NULL, false, false);
+        "Ctrl+`", NULL, NULL, NULL, false, false);
 
-    // ---- 8. TRANSPORT, EDIT, MARKERS, LOOP & FILE ACTIONS (matching Basic Shortcut.pdf) ----
+    // ---- SWS & CUSTOM LUA SCRIPTS (Basic Shortcut.pdf) ----
+    register_builtin_action(ACT_SWS_REPOSITION_ITEMS,
+        "Xenakios/SWS: Reposition selected items...",
+        "W", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_SWS_SCROLL_TRACK_VIEW_DOWN_PAGE,
+        "Xenakios/SWS: Scroll track view down (page)",
+        "Caps Lock", "Page Down", NULL, NULL, false, false);
+    register_builtin_action(ACT_SWS_SCROLL_TRACK_VIEW_UP_PAGE,
+        "Xenakios/SWS: Scroll track view up (page)",
+        "Tab", "Page Up", NULL, NULL, false, false);
+    register_builtin_action(ACT_SWS_MOVE_RIGHT_EDGE_TO_CURSOR,
+        "SWS: Move selected item(s) right edge to edit cursor",
+        "Ctrl+Num 1", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_SWS_MOVE_LEFT_EDGE_TO_CURSOR,
+        "SWS: Move selected item(s) left edge to edit cursor",
+        "Ctrl+Num 3", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_SCRIPT_CLIP_MOVE_TO_SELECTED_TRACK,
+        "Script: Clip move to selected track.lua",
+        "Alt+S", NULL, NULL, NULL, true, false);
+    register_builtin_action(ACT_SCRIPT_TRACKS_MOVE_TO_BOTTOM,
+        "Script: Tracks move to bottom.lua",
+        "Alt+B", NULL, NULL, NULL, true, false);
+    register_builtin_action(ACT_SCRIPT_TRACKS_MOVE_TO_TOP,
+        "Script: Tracks Move to Top.lua",
+        "Alt+T", NULL, NULL, NULL, true, false);
+    register_builtin_action(ACT_SCRIPT_GROUP_AND_UNGROUP,
+        "Script: Group and Ungroup.lua",
+        "Ctrl+Alt+Shift+G", NULL, NULL, NULL, true, false);
+
+    // ---- TRANSPORT & EDITING (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_TRANSPORT_PLAY_STOP,
         "Transport: Play/stop",
         "Space", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TRANSPORT_RECORD,
         "Transport: Record",
-        "R", "Ctrl+R", NULL, NULL, false, false);
-    register_builtin_action(ACT_TRANSPORT_PAUSE,
-        "Transport: Play/pause",
-        "Enter", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRANSPORT_GO_TO_START,
-        "Transport: Go to start of project",
-        "Home", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRANSPORT_GO_TO_END,
-        "Transport: Go to end of project",
-        "End", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_TRANSPORT_TOGGLE_REPEAT_RANGE,
-        "Transport: Toggle repeat / cycle range",
-        "L", NULL, NULL, NULL, false, false);
+        "R", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_SPLIT_AT_CURSOR,
+        "Item: Split items at edit or play cursor",
+        "S", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_EDIT_COPY,
         "Edit: Copy",
         "Ctrl+C", NULL, NULL, NULL, false, false);
@@ -3285,67 +3070,13 @@ static void init_keyboard_actions_system(void) {
         "Ctrl+Z", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_EDIT_REDO,
         "Edit: Redo",
-        "Ctrl+Shift+Z", "Ctrl+Y", NULL, NULL, false, false);
+        "Ctrl+Shift+Z", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_EDIT_SELECT_ALL,
         "Edit: Select all",
         "Ctrl+A", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_VIEW_SHOW_ACTION_LIST,
         "View: Show action list",
-        "Shift+?", "?", NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TOGGLE_VIDEO_WINDOW,
-        "View: Toggle video window",
-        "V", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_TOGGLE_MARKER_LANE,
-        "View: Toggle marker lane",
-        "Ctrl+M", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_SHOW_HISTORY_WINDOW,
-        "View: Show undo history window",
-        "Ctrl+Alt+H", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_VIEW_SHOW_HIDE_TRACKS_WINDOW,
-        "Track: Show track manager / hide tracks window",
-        "Ctrl+Shift+H", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_MARKER_INSERT_AT_CURSOR,
-        "Markers: Insert marker at current position",
-        "Insert", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_MARKER_NEXT,
-        "Markers: Go to next marker/project end",
-        "]", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_MARKER_PREV,
-        "Markers: Go to previous marker/project start",
-        "[", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_MARKER_DELETE_NEAREST,
-        "Markers: Delete marker near cursor",
-        "Alt+Delete", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_LOOP_SET_START_AT_CURSOR,
-        "Loop points: Set start point",
-        "I", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_LOOP_SET_END_AT_CURSOR,
-        "Loop points: Set end point",
-        "O", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_LOOP_SET_TO_SELECTED_ITEMS,
-        "Loop points: Set loop points to items",
-        "Shift+R", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_LOOP_CLEAR,
-        "Loop points: Remove (unselect) time selection and loop points",
-        "Alt+Escape", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_FILE_NEW_PROJECT,
-        "File: New project",
-        "Ctrl+N", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_FILE_OPEN_PROJECT,
-        "File: Open project...",
-        "Ctrl+O", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_FILE_SAVE_PROJECT,
-        "File: Save project",
-        "Ctrl+S", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_FILE_SAVE_PROJECT_AS,
-        "File: Save project as...",
-        "Ctrl+Alt+S", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_FILE_IMPORT_MEDIA,
-        "Insert: Media file...",
-        "Ctrl+I", NULL, NULL, NULL, false, false);
-    register_builtin_action(ACT_FILE_EXPORT_MEDIA,
-        "File: Render project to disk...",
-        "Ctrl+Alt+R", NULL, NULL, NULL, false, false);
+        "Shift+?", NULL, NULL, NULL, false, false);
 
     if (zv_out_idx >= 0) {
         g_action_win.selected_action_idx = zv_out_idx;
@@ -5283,7 +5014,8 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
     if (g_daw.script_manager_open && point_in_rect(mx, my, &g_daw.script_win_rect)) return true;
 
     if (p && p->video.is_open && point_in_rect(mx, my, &p->video.rect)) {
-        if (out_cursor && mx >= p->video.rect.x + p->video.rect.w - 18 && my >= p->video.rect.y + p->video.rect.h - 18) {
+        if (out_cursor && !g_video_fullscreen[get_valid_tab_idx()] &&
+            mx >= p->video.rect.x + p->video.rect.w - 18 && my >= p->video.rect.y + p->video.rect.h - 18) {
             *out_cursor = g_cursor_size_we;
         }
         return true;
@@ -5314,7 +5046,7 @@ int main(int argc, char *argv[]) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
 
     SDL_Window *win = SDL_CreateWindow(
-        "Professional Multitrack DAW",
+        "Audio Track",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1280, 720, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
     );
@@ -5484,7 +5216,7 @@ int main(int argc, char *argv[]) {
                 if (is_cursor_captured_by_popup_or_menu(p, mx, my, NULL)) continue;
                 SDL_Keymod mod = SDL_GetModState();
                 if (mod & KMOD_CTRL) {
-                    // Ctrl+Mousewheel: View: Zoom vertically (MIDI CC relative/mousewheel)
+                    // Ctrl+Mousewheel: View: Zoom vertically (mousewheel)
                     for (int t = 0; t < p->num_tracks; t++) {
                         int nh = p->track_heights[t] + e.wheel.y * 10;
                         if (nh < 50) nh = 50;
@@ -5492,7 +5224,7 @@ int main(int argc, char *argv[]) {
                         p->track_heights[t] = nh;
                     }
                 } else if ((mod & KMOD_ALT) || (mod & KMOD_SHIFT)) {
-                    // Alt+Mousewheel: View: Scroll horizontally (MIDI CC relative/mousewheel)
+                    // Alt+Mousewheel: View: Scroll horizontally (mousewheel)
                     p->scroll_x_sec -= e.wheel.y * (40.0f / p->pixels_per_second);
                     if (p->scroll_x_sec < 0) p->scroll_x_sec = 0;
                 } else if (mx < g_daw.tcp_width) {
@@ -5503,7 +5235,7 @@ int main(int argc, char *argv[]) {
                     if (p->scroll_y_px < 0) p->scroll_y_px = 0;
                     if (p->scroll_y_px > max_y_scroll) p->scroll_y_px = max_y_scroll;
                 } else {
-                    // Mousewheel over timeline: View: Zoom horizontally (MIDI CC relative/mousewheel)
+                    // Mousewheel over timeline: View: Zoom horizontally (mousewheel)
                     double mouse_time = p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second;
                     p->pixels_per_second += e.wheel.y * 12.0f;
                     if (p->pixels_per_second < 15.0f) p->pixels_per_second = 15.0f;
@@ -5671,6 +5403,16 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                if (e.key.keysym.sym == SDLK_ESCAPE && p->video.is_open && g_video_fullscreen[get_valid_tab_idx()]) {
+                    int v_tab = get_valid_tab_idx();
+                    g_video_fullscreen[v_tab] = false;
+                    if (g_video_saved_rect[v_tab].w >= 200 && g_video_saved_rect[v_tab].h >= 120) {
+                        p->video.rect = g_video_saved_rect[v_tab];
+                    } else {
+                        p->video.rect = (SDL_Rect){ 680, 110, 480, 294 };
+                    }
+                    continue;
+                }
                 if (g_action_win.is_open) {
                     if (handle_action_window_keydown(p, ren, win, e.key.keysym.sym, mod)) {
                         continue;
@@ -6064,6 +5806,55 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
+                if (p->video.is_open && mx >= p->video.rect.x && mx <= p->video.rect.x + p->video.rect.w &&
+                    my >= p->video.rect.y && my <= p->video.rect.y + p->video.rect.h) {
+                    int v_tab = get_valid_tab_idx();
+                    if (!g_video_fullscreen[v_tab] &&
+                        mx >= p->video.rect.x + p->video.rect.w - 18 &&
+                        my >= p->video.rect.y + p->video.rect.h - 18) {
+                        p->video.is_resizing = true;
+                    } else if (mx >= p->video.rect.x + p->video.rect.w - 24 && my <= p->video.rect.y + 24) {
+                        g_video_fullscreen[v_tab] = false;
+                        p->video.is_open = false;
+                    } else if (mx >= p->video.rect.x + p->video.rect.w - 50 &&
+                               mx <  p->video.rect.x + p->video.rect.w - 24 &&
+                               my <= p->video.rect.y + 24) {
+                        // Full Screen / Minimize (Restore) button near X
+                        if (!g_video_fullscreen[v_tab]) {
+                            g_video_saved_rect[v_tab] = p->video.rect;
+                            g_video_fullscreen[v_tab] = true;
+                            p->video.rect = (SDL_Rect){ 0, 0, win_w, win_h };
+                        } else {
+                            g_video_fullscreen[v_tab] = false;
+                            if (g_video_saved_rect[v_tab].w >= 200 && g_video_saved_rect[v_tab].h >= 120) {
+                                p->video.rect = g_video_saved_rect[v_tab];
+                            } else {
+                                p->video.rect = (SDL_Rect){ 680, 110, 480, 294 };
+                            }
+                        }
+                    } else if (my <= p->video.rect.y + 24) {
+                        if (e.button.clicks >= 2) {
+                            if (!g_video_fullscreen[v_tab]) {
+                                g_video_saved_rect[v_tab] = p->video.rect;
+                                g_video_fullscreen[v_tab] = true;
+                                p->video.rect = (SDL_Rect){ 0, 0, win_w, win_h };
+                            } else {
+                                g_video_fullscreen[v_tab] = false;
+                                if (g_video_saved_rect[v_tab].w >= 200 && g_video_saved_rect[v_tab].h >= 120) {
+                                    p->video.rect = g_video_saved_rect[v_tab];
+                                } else {
+                                    p->video.rect = (SDL_Rect){ 680, 110, 480, 294 };
+                                }
+                            }
+                        } else if (!g_video_fullscreen[v_tab]) {
+                            p->video.is_dragging = true;
+                            p->video.drag_x = mx - p->video.rect.x;
+                            p->video.drag_y = my - p->video.rect.y;
+                        }
+                    }
+                    continue;
+                }
+
                 // Chrome-Style Tab Interactions
                 if (my < TABBAR_HEIGHT) {
                     int max_tab_w = 160;
@@ -6339,19 +6130,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                if (p->video.is_open && mx >= p->video.rect.x && mx <= p->video.rect.x + p->video.rect.w &&
-                    my >= p->video.rect.y && my <= p->video.rect.y + p->video.rect.h) {
-                    if (mx >= p->video.rect.x + p->video.rect.w - 18 && my >= p->video.rect.y + p->video.rect.h - 18) {
-                        p->video.is_resizing = true;
-                    } else if (mx >= p->video.rect.x + p->video.rect.w - 24 && my <= p->video.rect.y + 24) {
-                        p->video.is_open = false;
-                    } else if (my <= p->video.rect.y + 24) {
-                        p->video.is_dragging = true;
-                        p->video.drag_x = mx - p->video.rect.x;
-                        p->video.drag_y = my - p->video.rect.y;
-                    }
-                    continue;
-                }
+
 
                 if (my >= win_h - SCROLLBAR_SIZE && mx >= g_daw.tcp_width && mx < win_w - SCROLLBAR_SIZE) {
                     dragging_scrollbar_h = true; scrollbar_h_start_mx = mx; orig_scroll_x = p->scroll_x_sec;
@@ -6705,10 +6484,22 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (p->video.is_resizing) {
-                    int new_w = mx - p->video.rect.x;
-                    int new_h = my - p->video.rect.y;
-                    if (new_w >= 160) p->video.rect.w = new_w;
-                    if (new_h >= 100) p->video.rect.h = new_h;
+                    double v_asp = (p->video.width > 0 && p->video.height > 0)
+                                   ? ((double)p->video.width / (double)p->video.height)
+                                   : (16.0 / 9.0);
+                    int raw_w = mx - p->video.rect.x;
+                    int raw_h = my - p->video.rect.y - 24;
+                    int w_from_h = (int)((double)raw_h * v_asp);
+                    int new_w = (abs(raw_w - p->video.rect.w) >= abs(w_from_h - p->video.rect.w)) ? raw_w : w_from_h;
+                    if (new_w < 240) new_w = 240;
+                    if (new_w > win_w - 20) new_w = win_w - 20;
+                    int new_h = 24 + (int)((double)new_w / v_asp);
+                    if (new_h < 159) {
+                        new_h = 159;
+                        new_w = (int)((double)(new_h - 24) * v_asp);
+                    }
+                    p->video.rect.w = new_w;
+                    p->video.rect.h = new_h;
                     SDL_SetCursor(g_cursor_size_we);
                     continue;
                 }
@@ -6759,8 +6550,7 @@ int main(int argc, char *argv[]) {
                             break;
                         }
                         if (mx >= g_daw.tcp_width - 28 && mx <= g_daw.tcp_width - 6 && my >= cur_y + 6 && my <= cur_y + th - 6) {
-                            SDL_SetCursor(g_cursor_size_ns);
-                            hovered_edge = true;
+                            SDL_SetCursor(g_cursor_arrow);
                             break;
                         }
                         if (my >= cur_y + 6 && my <= cur_y + 28 && mx >= 8 && mx <= g_daw.tcp_width - 32) {
@@ -6821,7 +6611,7 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (dragging_track_order_idx >= 0 && dragging_track_order_idx < p->num_tracks) {
-                    SDL_SetCursor(g_cursor_size_ns);
+                    SDL_SetCursor(g_cursor_arrow);
                     int cur_y = header_top_y - p->scroll_y_px;
                     int target_trk = dragging_track_order_idx;
                     for (int t = 0; t < p->num_tracks; t++) {
@@ -6852,16 +6642,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                if (p->video.is_resizing) {
-                    int new_w = mx - p->video.rect.x;
-                    int new_h = my - p->video.rect.y;
-                    if (new_w >= 160) p->video.rect.w = new_w;
-                    if (new_h >= 100) p->video.rect.h = new_h;
-                }
-                if (p->video.is_dragging) {
-                    p->video.rect.x = mx - p->video.drag_x;
-                    p->video.rect.y = my - p->video.drag_y;
-                }
+
 
                 if (dragging_scrollbar_h) {
                     float delta = (float)(mx - scrollbar_h_start_mx);
@@ -7082,12 +6863,9 @@ int main(int argc, char *argv[]) {
 
             char notif_disp[200];
             if (g_tab_notification[cur_t_idx][0] != '\0') {
-                snprintf(notif_disp, sizeof(notif_disp), "%s: %s",
-                         p->is_dirty ? "Modified" : "Saved",
-                         g_tab_notification[cur_t_idx]);
+                snprintf(notif_disp, sizeof(notif_disp), "%s", g_tab_notification[cur_t_idx]);
             } else {
-                snprintf(notif_disp, sizeof(notif_disp), "%s",
-                         p->is_dirty ? "Modified (Unsaved changes)" : "Ready");
+                snprintf(notif_disp, sizeof(notif_disp), "Ready");
             }
             SDL_Rect notif_clip = { notif_x + 22, 4, notif_w - 28, TABBAR_HEIGHT - 8 };
             draw_text_clipped(ren, notif_disp, notif_x + 22, 9, c_white, &notif_clip, NULL);
@@ -7970,11 +7748,21 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Export Media", 16, m_start + 102, c_white);
         }
 
-        // Floating Video Monitor (With Black Gap Handling & Brown Borders)
+        // Floating / Fullscreen Video Monitor (Aspect-Ratio Preserving & Fullscreen/Minimize Button near X)
         if (p->video.is_open) {
-            SDL_Rect s_rect = { p->video.rect.x + 4, p->video.rect.y + 4, p->video.rect.w, p->video.rect.h };
-            SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
-            SDL_RenderFillRect(ren, &s_rect);
+            int v_tab = get_valid_tab_idx();
+            if (g_video_fullscreen[v_tab]) {
+                p->video.rect.x = 0;
+                p->video.rect.y = 0;
+                p->video.rect.w = win_w;
+                p->video.rect.h = win_h;
+            } else {
+                if (p->video.rect.w < 240) p->video.rect.w = 480;
+                if (p->video.rect.h < 159) p->video.rect.h = 294;
+                SDL_Rect s_rect = { p->video.rect.x + 4, p->video.rect.y + 4, p->video.rect.w, p->video.rect.h };
+                SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
+                SDL_RenderFillRect(ren, &s_rect);
+            }
 
             SDL_Rect v_bar = { p->video.rect.x, p->video.rect.y, p->video.rect.w, 24 };
             SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
@@ -7982,24 +7770,71 @@ int main(int argc, char *argv[]) {
             draw_brown_border_rect(ren, &v_bar, false, false);
 
             draw_text(ren, "Video Monitor", p->video.rect.x + 8, p->video.rect.y + 7, c_white);
+
+            // Full Screen / Minimize (Restore) Symbol Button right near X
+            int fs_btn_x = p->video.rect.x + p->video.rect.w - 46;
+            int fs_btn_y = p->video.rect.y + 3;
+            SDL_Rect fs_btn = { fs_btn_x, fs_btn_y, 18, 18 };
+            SDL_SetRenderDrawColor(ren, 48, 40, 34, 255);
+            SDL_RenderFillRect(ren, &fs_btn);
+            draw_brown_border_rect(ren, &fs_btn, false, false);
+
+            SDL_SetRenderDrawColor(ren, 224, 224, 224, 255);
+            if (!g_video_fullscreen[v_tab]) {
+                // Full Screen / Expand icon (square window box with top header line)
+                SDL_Rect ico_max = { fs_btn_x + 4, fs_btn_y + 4, 10, 10 };
+                SDL_RenderDrawRect(ren, &ico_max);
+                SDL_RenderDrawLine(ren, fs_btn_x + 4, fs_btn_y + 5, fs_btn_x + 13, fs_btn_y + 5);
+            } else {
+                // Minimize / Restore Screen icon (two overlapping window squares)
+                SDL_Rect ico_back = { fs_btn_x + 6, fs_btn_y + 3, 8, 8 };
+                SDL_Rect ico_front = { fs_btn_x + 3, fs_btn_y + 6, 8, 8 };
+                SDL_RenderDrawRect(ren, &ico_back);
+                SDL_SetRenderDrawColor(ren, 48, 40, 34, 255);
+                SDL_RenderFillRect(ren, &ico_front);
+                SDL_SetRenderDrawColor(ren, 224, 224, 224, 255);
+                SDL_RenderDrawRect(ren, &ico_front);
+            }
+
+            // Close [X] Button
             draw_text(ren, "X", p->video.rect.x + p->video.rect.w - 18, p->video.rect.y + 7, c_white);
 
             SDL_Rect v_canvas = { p->video.rect.x, p->video.rect.y + 24, p->video.rect.w, p->video.rect.h - 24 };
-            
-            // Background is always solid black
+
+            // Background is always solid black (letterbox / pillarbox bars)
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderFillRect(ren, &v_canvas);
 
             if (p->video.has_active_frame && p->video.texture) {
-                SDL_RenderCopy(ren, p->video.texture, NULL, &v_canvas);
+                double v_asp = (p->video.width > 0 && p->video.height > 0)
+                               ? ((double)p->video.width / (double)p->video.height)
+                               : (16.0 / 9.0);
+                double c_asp = (v_canvas.h > 0) ? ((double)v_canvas.w / (double)v_canvas.h) : v_asp;
+                SDL_Rect dst_rect = v_canvas;
+                if (c_asp > v_asp) {
+                    dst_rect.h = v_canvas.h;
+                    dst_rect.w = (int)((double)v_canvas.h * v_asp);
+                    dst_rect.x = v_canvas.x + (v_canvas.w - dst_rect.w) / 2;
+                    dst_rect.y = v_canvas.y;
+                } else {
+                    dst_rect.w = v_canvas.w;
+                    dst_rect.h = (int)((double)v_canvas.w / v_asp);
+                    dst_rect.x = v_canvas.x;
+                    dst_rect.y = v_canvas.y + (v_canvas.h - dst_rect.h) / 2;
+                }
+                SDL_RenderCopy(ren, p->video.texture, NULL, &dst_rect);
             } else if (!p->video.texture) {
-                draw_text(ren, "No Video Stream Loaded", p->video.rect.x + 120, p->video.rect.y + 140, c_muted);
+                draw_text(ren, "No Video Stream Loaded",
+                          v_canvas.x + (v_canvas.w - 176) / 2,
+                          v_canvas.y + v_canvas.h / 2 - 4, c_muted);
             }
             draw_brown_border_rect(ren, &v_canvas, false, false);
 
-            SDL_Rect resize_handle = { p->video.rect.x + p->video.rect.w - 12, p->video.rect.y + p->video.rect.h - 12, 10, 10 };
-            SDL_SetRenderDrawColor(ren, 152, 98, 54, 255);
-            SDL_RenderFillRect(ren, &resize_handle);
+            if (!g_video_fullscreen[v_tab]) {
+                SDL_Rect resize_handle = { p->video.rect.x + p->video.rect.w - 12, p->video.rect.y + p->video.rect.h - 12, 10, 10 };
+                SDL_SetRenderDrawColor(ren, 152, 98, 54, 255);
+                SDL_RenderFillRect(ren, &resize_handle);
+            }
         }
 
         // ================= UNIFIED EXPORT MEDIA POPUP WINDOW =================
