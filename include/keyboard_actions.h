@@ -19,6 +19,198 @@
 #include <sys/stat.h>
 #endif
 
+#ifndef DAW_THEME_STATE_DEFINED
+#define DAW_THEME_STATE_DEFINED
+
+#define MAX_SAVED_THEMES 32
+#define THEMES_JSON_FILENAME "themes_settings.json"
+
+typedef struct {
+    char name[48];
+    uint8_t r, g, b, a;
+} SavedThemeEntry;
+
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+
+    // Active ARGB Theme Color (Default Orange: R=205, G=138, B=72, A=255)
+    uint8_t r, g, b, a;
+    float h, s, v;
+
+    bool dragging_sv;
+    bool dragging_hue;
+    bool dragging_alpha;
+
+    bool code_focused;
+    char code_buf[64];
+
+    SavedThemeEntry saved[MAX_SAVED_THEMES];
+    int num_saved;
+    int selected_saved_idx;
+    int saved_scroll_y;
+    bool saved_sb_dragging;
+    int saved_sb_start_my;
+    int saved_sb_orig_scroll;
+
+    char status_msg[128];
+} ThemeManagerState;
+
+static ThemeManagerState g_theme = {
+    false,
+    { 340, 88, 580, 420 },
+    false, 0, 0,
+    205, 138, 72, 255,
+    29.77f, 0.6488f, 0.8039f,
+    false, false, false,
+    false,
+    "rgba(205, 138, 72, 1.00)",
+    {{{0}, 0, 0, 0, 0}}, 0, 0, 0, false, 0, 0,
+    ""
+};
+
+// Script Manager window scrolling, edge-resize, and status state
+static int  g_script_scroll_y = 0;
+static bool g_script_sb_dragging = false;
+static int  g_script_sb_start_my = 0;
+static int  g_script_sb_orig_scroll = 0;
+static int  g_script_resize_edge = 0;
+static int  g_script_resize_start_mx = 0;
+static int  g_script_resize_start_my = 0;
+static SDL_Rect g_script_resize_orig_rect = { 390, 140, 480, 320 };
+static char g_script_status_msg[128] = "";
+
+static inline void theme_hsv_to_rgb(float h, float s, float v, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    if (s < 0.0f) s = 0.0f;
+    if (s > 1.0f) s = 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    while (h < 0.0f) h += 360.0f;
+    while (h >= 360.0f) h -= 360.0f;
+
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float rf = 0.0f, gf = 0.0f, bf = 0.0f;
+
+    if (h < 60.0f)       { rf = c; gf = x; bf = 0.0f; }
+    else if (h < 120.0f) { rf = x; gf = c; bf = 0.0f; }
+    else if (h < 180.0f) { rf = 0.0f; gf = c; bf = x; }
+    else if (h < 240.0f) { rf = 0.0f; gf = x; bf = c; }
+    else if (h < 300.0f) { rf = x; gf = 0.0f; bf = c; }
+    else                 { rf = c; gf = 0.0f; bf = x; }
+
+    int ri = (int)((rf + m) * 255.0f + 0.5f);
+    int gi = (int)((gf + m) * 255.0f + 0.5f);
+    int bi = (int)((bf + m) * 255.0f + 0.5f);
+    if (ri < 0) ri = 0; else if (ri > 255) ri = 255;
+    if (gi < 0) gi = 0; else if (gi > 255) gi = 255;
+    if (bi < 0) bi = 0; else if (bi > 255) bi = 255;
+    if (out_r) *out_r = (uint8_t)ri;
+    if (out_g) *out_g = (uint8_t)gi;
+    if (out_b) *out_b = (uint8_t)bi;
+}
+
+static inline void theme_rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b, float *out_h, float *out_s, float *out_v) {
+    float rf = (float)r / 255.0f;
+    float gf = (float)g / 255.0f;
+    float bf = (float)b / 255.0f;
+    float cmax = fmaxf(rf, fmaxf(gf, bf));
+    float cmin = fminf(rf, fminf(gf, bf));
+    float delta = cmax - cmin;
+
+    float h = 0.0f;
+    if (delta > 0.0001f) {
+        if (cmax == rf) {
+            h = 60.0f * fmodf((gf - bf) / delta, 6.0f);
+        } else if (cmax == gf) {
+            h = 60.0f * (((bf - rf) / delta) + 2.0f);
+        } else {
+            h = 60.0f * (((rf - gf) / delta) + 4.0f);
+        }
+    }
+    if (h < 0.0f) h += 360.0f;
+    float s = (cmax > 0.0001f) ? (delta / cmax) : 0.0f;
+    float v = cmax;
+    if (out_h) *out_h = h;
+    if (out_s) *out_s = s;
+    if (out_v) *out_v = v;
+}
+
+static inline void sync_theme_code_string(void) {
+    snprintf(g_theme.code_buf, sizeof(g_theme.code_buf),
+             "rgba(%d, %d, %d, %.2f)",
+             (int)g_theme.r, (int)g_theme.g, (int)g_theme.b,
+             (double)g_theme.a / 255.0);
+}
+
+// Computes effective RGB of active theme blended with its alpha over dark base so UI elements stay readable
+static inline void get_theme_effective_rgb(uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    float af = (float)g_theme.a / 255.0f;
+    if (af < 0.15f) af = 0.15f;
+    int er = (int)(36.0f * (1.0f - af) + (float)g_theme.r * af + 0.5f);
+    int eg = (int)(36.0f * (1.0f - af) + (float)g_theme.g * af + 0.5f);
+    int eb = (int)(36.0f * (1.0f - af) + (float)g_theme.b * af + 0.5f);
+    if (er < 0) er = 0; else if (er > 255) er = 255;
+    if (eg < 0) eg = 0; else if (eg > 255) eg = 255;
+    if (eb < 0) eb = 0; else if (eb > 255) eb = 255;
+    if (out_r) *out_r = (uint8_t)er;
+    if (out_g) *out_g = (uint8_t)eg;
+    if (out_b) *out_b = (uint8_t)eb;
+}
+
+// Computes a subtle theme-tinted surface fill color for headers, active buttons, and scrollbar thumbs
+static inline void get_theme_surface_rgb(uint8_t base_val, float weight, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    uint8_t er, eg, eb;
+    get_theme_effective_rgb(&er, &eg, &eb);
+    int sr = (int)((float)base_val * (1.0f - weight) + (float)er * weight + 0.5f);
+    int sg = (int)((float)base_val * (1.0f - weight) + (float)eg * weight + 0.5f);
+    int sb = (int)((float)base_val * (1.0f - weight) + (float)eb * weight + 0.5f);
+    if (sr < 0) sr = 0; else if (sr > 255) sr = 255;
+    if (sg < 0) sg = 0; else if (sg > 255) sg = 255;
+    if (sb < 0) sb = 0; else if (sb > 255) sb = 255;
+    if (out_r) *out_r = (uint8_t)sr;
+    if (out_g) *out_g = (uint8_t)sg;
+    if (out_b) *out_b = (uint8_t)sb;
+}
+
+static inline SDL_Color get_theme_accent_sdl_color(void) {
+    uint8_t er, eg, eb;
+    get_theme_effective_rgb(&er, &eg, &eb);
+    int ar = er + 25; if (ar > 255) ar = 255;
+    int ag = eg + 25; if (ag > 255) ag = 255;
+    int ab = eb + 20; if (ab > 255) ab = 255;
+    SDL_Color c = { (Uint8)ar, (Uint8)ag, (Uint8)ab, 255 };
+    return c;
+}
+static void init_default_saved_themes(void) {
+    if (g_theme.num_saved > 0) return;
+    static const struct { const char *name; uint8_t r, g, b, a; } defs[] = {
+        { "Default Orange", 205, 138,  72, 255 },
+        { "Emerald Green",   77, 191,  59, 130 },
+        { "Forest Green",    77, 191,  59, 255 },
+        { "Studio Blue",     68, 150, 235, 255 },
+        { "Royal Purple",   162,  98, 232, 255 },
+        { "Crimson Red",    224,  78,  78, 255 },
+        { "Cyber Cyan",      48, 198, 208, 255 }
+    };
+    int nd = (int)(sizeof(defs) / sizeof(defs[0]));
+    for (int i = 0; i < nd && g_theme.num_saved < MAX_SAVED_THEMES; i++) {
+        SavedThemeEntry *st = &g_theme.saved[g_theme.num_saved++];
+        strncpy(st->name, defs[i].name, sizeof(st->name) - 1);
+        st->name[sizeof(st->name) - 1] = '\0';
+        st->r = defs[i].r;
+        st->g = defs[i].g;
+        st->b = defs[i].b;
+        st->a = defs[i].a;
+    }
+}
+#endif // DAW_THEME_STATE_DEFINED
+
+
 #define MAX_DAW_ACTIONS 256
 #define MAX_ACTION_SHORTCUTS 6
 #define SHORTCUT_STR_LEN 36
@@ -419,6 +611,28 @@ static void write_shortcuts_json_to_stream(FILE *f) {
     }
     fprintf(f, "  ],\n");
 
+    fprintf(f, "  \"theme_settings\": {\n");
+    fprintf(f, "    \"r\": %d,\n", (int)g_theme.r);
+    fprintf(f, "    \"g\": %d,\n", (int)g_theme.g);
+    fprintf(f, "    \"b\": %d,\n", (int)g_theme.b);
+    fprintf(f, "    \"a\": %d,\n", (int)g_theme.a);
+    fprintf(f, "    \"rgba\": \"rgba(%d, %d, %d, %.2f)\",\n",
+            (int)g_theme.r, (int)g_theme.g, (int)g_theme.b, (double)g_theme.a / 255.0);
+    fprintf(f, "    \"argb_hex\": \"#%02X%02X%02X%02X\",\n",
+            (unsigned int)g_theme.a, (unsigned int)g_theme.r, (unsigned int)g_theme.g, (unsigned int)g_theme.b);
+    fprintf(f, "    \"saved_themes\": [\n");
+    for (int t = 0; t < g_theme.num_saved; t++) {
+        char esc_tname[128];
+        json_escape_string(g_theme.saved[t].name, esc_tname, sizeof(esc_tname));
+        fprintf(f, "      { \"name\": \"%s\", \"r\": %d, \"g\": %d, \"b\": %d, \"a\": %d }%s\n",
+                esc_tname,
+                (int)g_theme.saved[t].r, (int)g_theme.saved[t].g,
+                (int)g_theme.saved[t].b, (int)g_theme.saved[t].a,
+                (t + 1 < g_theme.num_saved) ? "," : "");
+    }
+    fprintf(f, "    ]\n");
+    fprintf(f, "  },\n");
+
     fprintf(f, "  \"custom_scripts\": [\n");
     for (int s = 0; s < g_daw.num_scripts; s++) {
         DawScript *sc = &g_daw.scripts[s];
@@ -457,6 +671,141 @@ static void save_keyboard_shortcuts_json(void) {
             fclose(f_local);
         }
     }
+}
+
+static void write_themes_json_to_stream(FILE *f) {
+    if (!f) return;
+    init_default_saved_themes();
+    fprintf(f, "{\n");
+    fprintf(f, "  \"software\": \"Audio Track\",\n");
+    fprintf(f, "  \"permanent\": true,\n");
+    fprintf(f, "  \"r\": %d,\n", (int)g_theme.r);
+    fprintf(f, "  \"g\": %d,\n", (int)g_theme.g);
+    fprintf(f, "  \"b\": %d,\n", (int)g_theme.b);
+    fprintf(f, "  \"a\": %d,\n", (int)g_theme.a);
+    fprintf(f, "  \"rgba\": \"rgba(%d, %d, %d, %.2f)\",\n",
+            (int)g_theme.r, (int)g_theme.g, (int)g_theme.b, (double)g_theme.a / 255.0);
+    fprintf(f, "  \"argb_hex\": \"#%02X%02X%02X%02X\",\n",
+            (unsigned int)g_theme.a, (unsigned int)g_theme.r, (unsigned int)g_theme.g, (unsigned int)g_theme.b);
+    fprintf(f, "  \"saved_themes\": [\n");
+    for (int t = 0; t < g_theme.num_saved; t++) {
+        char esc_tname[128];
+        json_escape_string(g_theme.saved[t].name, esc_tname, sizeof(esc_tname));
+        fprintf(f, "    { \"name\": \"%s\", \"r\": %d, \"g\": %d, \"b\": %d, \"a\": %d }%s\n",
+                esc_tname,
+                (int)g_theme.saved[t].r, (int)g_theme.saved[t].g,
+                (int)g_theme.saved[t].b, (int)g_theme.saved[t].a,
+                (t + 1 < g_theme.num_saved) ? "," : "");
+    }
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+}
+
+static void save_themes_settings_json(void) {
+    init_default_saved_themes();
+    char installed_json[1024];
+    get_installed_file_path(installed_json, sizeof(installed_json), THEMES_JSON_FILENAME);
+    FILE *f = fopen(installed_json, "wb");
+    if (f) {
+        write_themes_json_to_stream(f);
+        fclose(f);
+    }
+    if (strcmp(installed_json, THEMES_JSON_FILENAME) != 0) {
+        FILE *f_local = fopen(THEMES_JSON_FILENAME, "wb");
+        if (f_local) {
+            write_themes_json_to_stream(f_local);
+            fclose(f_local);
+        }
+    }
+    save_keyboard_shortcuts_json();
+}
+
+// Parses an rgba(r, g, b, a), rgb(r, g, b), #AARRGGBB, #RRGGBB, or "r, g, b, a" string into g_theme
+static bool parse_theme_code_input(const char *str) {
+    if (!str || !str[0]) return false;
+    const char *p = str;
+    while (*p == ' ' || *p == '\t') p++;
+
+    // 1. Hex format: #AARRGGBB or #RRGGBB or 0xAARRGGBB
+    if (*p == '#' || (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))) {
+        if (*p == '#') p++;
+        else p += 2;
+        char hex[16] = {0};
+        int hl = 0;
+        while (isxdigit((unsigned char)*p) && hl < 8) {
+            hex[hl++] = *p++;
+        }
+        hex[hl] = '\0';
+        if (hl == 8) {
+            unsigned int val = (unsigned int)strtoul(hex, NULL, 16);
+            g_theme.a = (uint8_t)((val >> 24) & 0xFF);
+            g_theme.r = (uint8_t)((val >> 16) & 0xFF);
+            g_theme.g = (uint8_t)((val >> 8) & 0xFF);
+            g_theme.b = (uint8_t)(val & 0xFF);
+            theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+            sync_theme_code_string();
+            return true;
+        } else if (hl == 6) {
+            unsigned int val = (unsigned int)strtoul(hex, NULL, 16);
+            g_theme.a = 255;
+            g_theme.r = (uint8_t)((val >> 16) & 0xFF);
+            g_theme.g = (uint8_t)((val >> 8) & 0xFF);
+            g_theme.b = (uint8_t)(val & 0xFF);
+            theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+            sync_theme_code_string();
+            return true;
+        }
+        return false;
+    }
+
+    // 2. Numeric list: rgba(77, 191, 59, 0.51) or argb(...) or r, g, b, a
+    bool is_argb_order = (tolower((unsigned char)p[0]) == 'a' && tolower((unsigned char)p[1]) == 'r' && tolower((unsigned char)p[2]) == 'g' && tolower((unsigned char)p[3]) == 'b');
+    double nums[4] = { 205.0, 138.0, 72.0, 1.0 };
+    bool has_dot[4] = { false, false, false, false };
+    int count = 0;
+    while (*p && count < 4) {
+        while (*p && !isdigit((unsigned char)*p) && *p != '.') p++;
+        if (!*p) break;
+        const char *num_start = p;
+        char *endp = NULL;
+        double v = strtod(num_start, &endp);
+        if (endp == num_start) break;
+        for (const char *c = num_start; c < endp; c++) {
+            if (*c == '.') has_dot[count] = true;
+        }
+        nums[count++] = v;
+        p = endp;
+    }
+    if (count < 3) return false;
+
+    int r_i = 205, g_i = 138, b_i = 72, a_i = 255;
+    if (is_argb_order && count == 4) {
+        if (has_dot[0] || nums[0] <= 1.0) a_i = (int)(nums[0] * 255.0 + 0.5);
+        else a_i = (int)(nums[0] + 0.5);
+        r_i = (int)(nums[1] + 0.5);
+        g_i = (int)(nums[2] + 0.5);
+        b_i = (int)(nums[3] + 0.5);
+    } else {
+        r_i = (int)(nums[0] + 0.5);
+        g_i = (int)(nums[1] + 0.5);
+        b_i = (int)(nums[2] + 0.5);
+        if (count == 4) {
+            if (has_dot[3] || nums[3] <= 1.0) a_i = (int)(nums[3] * 255.0 + 0.5);
+            else a_i = (int)(nums[3] + 0.5);
+        }
+    }
+    if (r_i < 0) r_i = 0; else if (r_i > 255) r_i = 255;
+    if (g_i < 0) g_i = 0; else if (g_i > 255) g_i = 255;
+    if (b_i < 0) b_i = 0; else if (b_i > 255) b_i = 255;
+    if (a_i < 0) a_i = 0; else if (a_i > 255) a_i = 255;
+
+    g_theme.r = (uint8_t)r_i;
+    g_theme.g = (uint8_t)g_i;
+    g_theme.b = (uint8_t)b_i;
+    g_theme.a = (uint8_t)a_i;
+    theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+    sync_theme_code_string();
+    return true;
 }
 
 // Helper to parse a JSON string literal starting at *cursor (where **cursor == '"')
@@ -543,6 +892,114 @@ static bool json_extract_bool_field(const char *obj_start, const char *obj_end, 
     return default_val;
 }
 
+static int json_extract_int_field(const char *obj_start, const char *obj_end, const char *key, int default_val) {
+    if (!obj_start || !obj_end || !key) return default_val;
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t plen = strlen(pat);
+
+    const char *p = obj_start;
+    while (p + plen < obj_end) {
+        const char *hit = strstr(p, pat);
+        if (!hit || hit >= obj_end) return default_val;
+        const char *colon = hit + plen;
+        while (colon < obj_end && (*colon == ' ' || *colon == '\t' || *colon == '\r' || *colon == '\n')) colon++;
+        if (colon < obj_end && *colon == ':') {
+            colon++;
+            while (colon < obj_end && (*colon == ' ' || *colon == '\t' || *colon == '\r' || *colon == '\n')) colon++;
+            if (colon < obj_end && (isdigit((unsigned char)*colon) || *colon == '-')) {
+                return atoi(colon);
+            }
+        }
+        p = hit + plen;
+    }
+    return default_val;
+}
+
+static void parse_theme_json_block(const char *blk_start, const char *blk_end) {
+    if (!blk_start || !blk_end || blk_end <= blk_start) return;
+    int r = json_extract_int_field(blk_start, blk_end, "r", (int)g_theme.r);
+    int g = json_extract_int_field(blk_start, blk_end, "g", (int)g_theme.g);
+    int b = json_extract_int_field(blk_start, blk_end, "b", (int)g_theme.b);
+    int a = json_extract_int_field(blk_start, blk_end, "a", (int)g_theme.a);
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    if (a < 0) a = 0; else if (a > 255) a = 255;
+    g_theme.r = (uint8_t)r;
+    g_theme.g = (uint8_t)g;
+    g_theme.b = (uint8_t)b;
+    g_theme.a = (uint8_t)a;
+    theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
+    sync_theme_code_string();
+
+    const char *st_sec = strstr(blk_start, "\"saved_themes\"");
+    if (st_sec && st_sec < blk_end) {
+        const char *arr_o = strchr(st_sec, '[');
+        const char *arr_c = arr_o ? strchr(arr_o, ']') : NULL;
+        if (arr_o && arr_c && arr_c <= blk_end) {
+            int loaded_cnt = 0;
+            const char *cur = arr_o + 1;
+            while (cur < arr_c && loaded_cnt < MAX_SAVED_THEMES) {
+                const char *os = strchr(cur, '{');
+                if (!os || os >= arr_c) break;
+                const char *oe = strchr(os, '}');
+                if (!oe || oe >= arr_c) break;
+                char tname[48] = {0};
+                json_extract_string_field(os, oe, "name", tname, sizeof(tname));
+                int tr = json_extract_int_field(os, oe, "r", 205);
+                int tg = json_extract_int_field(os, oe, "g", 138);
+                int tb = json_extract_int_field(os, oe, "b", 72);
+                int ta = json_extract_int_field(os, oe, "a", 255);
+                if (tname[0] != '\0') {
+                    SavedThemeEntry * dst = &g_theme.saved[loaded_cnt++];
+                    strncpy(dst->name, tname, sizeof(dst->name) - 1);
+                    dst->name[sizeof(dst->name) - 1] = '\0';
+                    dst->r = (uint8_t)(tr < 0 ? 0 : (tr > 255 ? 255 : tr));
+                    dst->g = (uint8_t)(tg < 0 ? 0 : (tg > 255 ? 255 : tg));
+                    dst->b = (uint8_t)(tb < 0 ? 0 : (tb > 255 ? 255 : tb));
+                    dst->a = (uint8_t)(ta < 0 ? 0 : (ta > 255 ? 255 : ta));
+                }
+                cur = oe + 1;
+            }
+            if (loaded_cnt > 0) {
+                g_theme.num_saved = loaded_cnt;
+            }
+        }
+    }
+}
+
+static bool load_themes_settings_json(void) {
+    init_default_saved_themes();
+    char installed_json[1024];
+    get_installed_file_path(installed_json, sizeof(installed_json), THEMES_JSON_FILENAME);
+
+    FILE *f = fopen(installed_json, "rb");
+    if (!f && strcmp(installed_json, THEMES_JSON_FILENAME) != 0) {
+        f = fopen(THEMES_JSON_FILENAME, "rb");
+    }
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 10 || fsize > 1024 * 1024) {
+        fclose(f);
+        return false;
+    }
+    char *buf = (char *)calloc((size_t)fsize + 1, 1);
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+    size_t n = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    buf[n] = '\0';
+    parse_theme_json_block(buf, buf + n);
+    free(buf);
+    return true;
+}
+
 // Loads permanent keyboard shortcuts and custom scripts from keyboard_shortcuts.json in the software installed folder.
 // Returns true if an existing JSON file was found and loaded; false if it needs to be created.
 static bool load_keyboard_shortcuts_json(void) {
@@ -572,8 +1029,13 @@ static bool load_keyboard_shortcuts_json(void) {
     fclose(f);
     json_buf[read_bytes] = '\0';
 
-    // 1. Parse "custom_scripts" array first if present
+    // 0. Parse "theme_settings" block if present
+    const char *th_sec = strstr(json_buf, "\"theme_settings\"");
     const char *cs_sec = strstr(json_buf, "\"custom_scripts\"");
+    if (th_sec) {
+        const char *th_end = cs_sec ? cs_sec : (json_buf + read_bytes);
+        parse_theme_json_block(th_sec, th_end);
+    }
     if (cs_sec) {
         const char *arr_open = strchr(cs_sec, '[');
         const char *arr_close = arr_open ? strchr(arr_open, ']') : NULL;
@@ -1002,7 +1464,13 @@ static void scan_scripts_directory_to_actions(DawEngine *daw) {
         "scripts/python",
         "scripts",
         "lua",
-        "python"
+        "python",
+        "../scripts/lua",
+        "../scripts/python",
+        "../scripts",
+        "dist/scripts/lua",
+        "dist/scripts/python",
+        "dist/scripts"
     };
     int num_dirs = (int)(sizeof(rel_dirs) / sizeof(rel_dirs[0]));
     for (int i = 0; i < num_dirs; i++) {
@@ -1011,6 +1479,39 @@ static void scan_scripts_directory_to_actions(DawEngine *daw) {
         scan_single_script_folder(daw, inst_dir);
         if (strcmp(inst_dir, rel_dirs[i]) != 0) {
             scan_single_script_folder(daw, rel_dirs[i]);
+        }
+    }
+
+    // Also ensure every built-in script action in g_actions[] is listed in g_daw.scripts[]
+    // so the unified Script Manager window displays all Lua and Python scripts together.
+    for (int a = 0; a < g_num_actions; a++) {
+        if (!g_actions[a].is_script) continue;
+        const char *raw_name = g_actions[a].description;
+        if (strncmp(raw_name, "Script:", 7) == 0) {
+            raw_name += 7;
+            while (*raw_name == ' ') raw_name++;
+        }
+        if (!raw_name[0]) continue;
+        int found_s = -1;
+        for (int s = 0; s < daw->num_scripts; s++) {
+            if (str_equals_nocase(daw->scripts[s].name, raw_name) ||
+                str_equals_nocase(daw->scripts[s].name, g_actions[a].description)) {
+                found_s = s;
+                break;
+            }
+        }
+        if (found_s < 0 && daw->num_scripts < MAX_SCRIPTS) {
+            found_s = daw->num_scripts++;
+            memset(&daw->scripts[found_s], 0, sizeof(DawScript));
+            strncpy(daw->scripts[found_s].name, raw_name, sizeof(daw->scripts[found_s].name) - 1);
+            strncpy(daw->scripts[found_s].filepath, g_actions[a].script_filepath, sizeof(daw->scripts[found_s].filepath) - 1);
+            daw->scripts[found_s].is_python = g_actions[a].is_python || str_ends_with_nocase(raw_name, ".py");
+            if (g_actions[a].num_shortcuts > 0) {
+                strncpy(daw->scripts[found_s].shortcut, g_actions[a].shortcuts[0], sizeof(daw->scripts[found_s].shortcut) - 1);
+            }
+        }
+        if (found_s >= 0) {
+            g_actions[a].linked_script_idx = found_s;
         }
     }
 
@@ -1160,10 +1661,12 @@ static void init_keyboard_actions_system(void) {
 
     // Load saved permanent shortcuts from keyboard_shortcuts.json in installed folder,
     // and auto-detect any manually created .lua / .py scripts in scripts/ folders.
+    init_default_saved_themes();
     load_keyboard_shortcuts_json();
+    load_themes_settings_json();
     scan_scripts_directory_to_actions(&g_daw);
-    // Always write/update keyboard_shortcuts.json in the software installed folder so it exists permanently
-    save_keyboard_shortcuts_json();
+    // Always write/update keyboard_shortcuts.json and themes_settings.json in the software installed folder so they exist permanently
+    save_themes_settings_json();
     refresh_filtered_actions();
 }
 
@@ -1300,7 +1803,13 @@ static bool resolve_script_filepath(DawActionEntry *act, char *out_path, size_t 
         "scripts/python/",
         "scripts/",
         "lua/",
-        "python/"
+        "python/",
+        "../scripts/lua/",
+        "../scripts/python/",
+        "../scripts/",
+        "dist/scripts/lua/",
+        "dist/scripts/python/",
+        "dist/scripts/"
     };
     int nf = (int)(sizeof(folders) / sizeof(folders[0]));
     for (int i = 0; i < nf; i++) {
@@ -1328,6 +1837,339 @@ static bool resolve_script_filepath(DawActionEntry *act, char *out_path, size_t 
     return false;
 }
 
+
+// ================= UNIVERSAL DYNAMIC SCRIPT EXPRESSION & VARIABLE EVALUATOR =================
+#define MAX_SCRIPT_VARS 32
+typedef struct {
+    char name[48];
+    double value;
+} ScriptVarBinding;
+
+typedef struct {
+    ScriptVarBinding vars[MAX_SCRIPT_VARS];
+    int num_vars;
+} ScriptEvalContext;
+
+static void script_ctx_set_var(ScriptEvalContext *ctx, const char *name, double val) {
+    if (!ctx || !name || !name[0]) return;
+    for (int i = 0; i < ctx->num_vars; i++) {
+        if (strcmp(ctx->vars[i].name, name) == 0) {
+            ctx->vars[i].value = val;
+            return;
+        }
+    }
+    if (ctx->num_vars < MAX_SCRIPT_VARS) {
+        strncpy(ctx->vars[ctx->num_vars].name, name, sizeof(ctx->vars[0].name) - 1);
+        ctx->vars[ctx->num_vars].name[sizeof(ctx->vars[0].name) - 1] = '\0';
+        ctx->vars[ctx->num_vars].value = val;
+        ctx->num_vars++;
+    }
+}
+
+static bool script_ctx_get_var(const ScriptEvalContext *ctx, const char *name, double *out_val) {
+    if (!ctx || !name || !name[0]) return false;
+    for (int i = 0; i < ctx->num_vars; i++) {
+        if (strcmp(ctx->vars[i].name, name) == 0) {
+            if (out_val) *out_val = ctx->vars[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static double parse_script_expr_add(const char **p, const ScriptEvalContext *ctx);
+
+static void skip_expr_spaces(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\r' || **p == '\n') (*p)++;
+}
+
+static double parse_script_expr_primary(const char **p, const ScriptEvalContext *ctx) {
+    skip_expr_spaces(p);
+    if (**p == '+') { (*p)++; return parse_script_expr_primary(p, ctx); }
+    if (**p == '-') { (*p)++; return -parse_script_expr_primary(p, ctx); }
+    if (**p == '(') {
+        (*p)++;
+        double v = parse_script_expr_add(p, ctx);
+        skip_expr_spaces(p);
+        if (**p == ')') (*p)++;
+        return v;
+    }
+    if (isdigit((unsigned char)**p) || (**p == '.' && isdigit((unsigned char)*(*p + 1)))) {
+        char *endp = NULL;
+        double v = strtod(*p, &endp);
+        if (endp && endp != *p) {
+            *p = endp;
+            return v;
+        }
+    }
+    if (isalpha((unsigned char)**p) || **p == '_') {
+        char ident[48] = {0};
+        size_t k = 0;
+        while (isalnum((unsigned char)**p) || **p == '_' || **p == '.') {
+            if (k + 1 < sizeof(ident)) ident[k++] = **p;
+            (*p)++;
+        }
+        ident[k] = '\0';
+        skip_expr_spaces(p);
+        // Handle math functions like math.abs(...), math.floor(...), math.max(...), math.min(...)
+        if (**p == '(') {
+            (*p)++;
+            double arg1 = parse_script_expr_add(p, ctx);
+            double arg2 = 0.0;
+            skip_expr_spaces(p);
+            if (**p == ',') {
+                (*p)++;
+                arg2 = parse_script_expr_add(p, ctx);
+            }
+            skip_expr_spaces(p);
+            if (**p == ')') (*p)++;
+            if (str_contains_nocase(ident, "abs")) return fabs(arg1);
+            if (str_contains_nocase(ident, "floor")) return floor(arg1);
+            if (str_contains_nocase(ident, "ceil")) return ceil(arg1);
+            if (str_contains_nocase(ident, "sqrt")) return (arg1 >= 0.0) ? sqrt(arg1) : 0.0;
+            if (str_contains_nocase(ident, "max")) return fmax(arg1, arg2);
+            if (str_contains_nocase(ident, "min")) return fmin(arg1, arg2);
+            if (str_contains_nocase(ident, "GetCursorPosition")) {
+                double c = 0.0;
+                script_ctx_get_var(ctx, "cursor", &c);
+                return c;
+            }
+            return arg1;
+        }
+        if (str_equals_nocase(ident, "true")) return 1.0;
+        if (str_equals_nocase(ident, "false")) return 0.0;
+        double val = 0.0;
+        if (script_ctx_get_var(ctx, ident, &val)) return val;
+    }
+    return 0.0;
+}
+
+static double parse_script_expr_mul(const char **p, const ScriptEvalContext *ctx) {
+    double left = parse_script_expr_primary(p, ctx);
+    for (;;) {
+        skip_expr_spaces(p);
+        char op = **p;
+        if (op != '*' && op != '/' && op != '%') break;
+        (*p)++;
+        double right = parse_script_expr_primary(p, ctx);
+        if (op == '*') left *= right;
+        else if (op == '/') left = (fabs(right) > 1e-12) ? (left / right) : 0.0;
+        else if (op == '%') left = (fabs(right) > 1e-12) ? fmod(left, right) : 0.0;
+    }
+    return left;
+}
+
+static double parse_script_expr_add(const char **p, const ScriptEvalContext *ctx) {
+    double left = parse_script_expr_mul(p, ctx);
+    for (;;) {
+        skip_expr_spaces(p);
+        char op = **p;
+        if (op != '+' && op != '-') break;
+        // Stop at Lua comment '--'
+        if (op == '-' && *(*p + 1) == '-') break;
+        (*p)++;
+        double right = parse_script_expr_mul(p, ctx);
+        if (op == '+') left += right;
+        else left -= right;
+    }
+    return left;
+}
+
+static double eval_script_math_expr(const char *expr_str, const ScriptEvalContext *ctx) {
+    if (!expr_str || !expr_str[0]) return 0.0;
+    const char *p = expr_str;
+    return parse_script_expr_add(&p, ctx);
+}
+
+// Populates standard per-clip variables into ScriptEvalContext so any formula works out of the box
+static void populate_clip_eval_context(ScriptEvalContext *ctx, ProjectTab *p, int item_idx, int sel_order, int sel_total) {
+    if (!ctx || !p || item_idx < 0 || item_idx >= p->num_items) return;
+    int tab = get_valid_tab_idx();
+    AudioItem *it = &p->items[item_idx];
+    script_ctx_set_var(ctx, "pos", it->start_time);
+    script_ctx_set_var(ctx, "position", it->start_time);
+    script_ctx_set_var(ctx, "start_time", it->start_time);
+    script_ctx_set_var(ctx, "D_POSITION", it->start_time);
+    script_ctx_set_var(ctx, "len", it->duration);
+    script_ctx_set_var(ctx, "length", it->duration);
+    script_ctx_set_var(ctx, "duration", it->duration);
+    script_ctx_set_var(ctx, "D_LENGTH", it->duration);
+    script_ctx_set_var(ctx, "end_pos", it->start_time + it->duration);
+    script_ctx_set_var(ctx, "center", it->start_time + it->duration * 0.5);
+    script_ctx_set_var(ctx, "center_pos", it->start_time + it->duration * 0.5);
+    script_ctx_set_var(ctx, "mid", it->start_time + it->duration * 0.5);
+    script_ctx_set_var(ctx, "offset", it->offset_in_file);
+    script_ctx_set_var(ctx, "D_STARTOFFS", it->offset_in_file);
+    script_ctx_set_var(ctx, "fadein", get_item_fade_in(p, item_idx));
+    script_ctx_set_var(ctx, "D_FADEINLEN", get_item_fade_in(p, item_idx));
+    script_ctx_set_var(ctx, "fadeout", get_item_fade_out(p, item_idx));
+    script_ctx_set_var(ctx, "D_FADEOUTLEN", get_item_fade_out(p, item_idx));
+    script_ctx_set_var(ctx, "vol", (double)g_item_vol_db[tab][item_idx]);
+    script_ctx_set_var(ctx, "D_VOL", (double)g_item_vol_db[tab][item_idx]);
+    script_ctx_set_var(ctx, "mute", g_item_muted[tab][item_idx] ? 1.0 : 0.0);
+    script_ctx_set_var(ctx, "B_MUTE", g_item_muted[tab][item_idx] ? 1.0 : 0.0);
+    script_ctx_set_var(ctx, "color", (double)g_item_color_idx[tab][item_idx]);
+    script_ctx_set_var(ctx, "I_CUSTOMCOLOR", (double)g_item_color_idx[tab][item_idx]);
+    script_ctx_set_var(ctx, "track", (double)it->track_idx);
+    script_ctx_set_var(ctx, "i", (double)sel_order);
+    script_ctx_set_var(ctx, "idx", (double)sel_order);
+    script_ctx_set_var(ctx, "count", (double)sel_total);
+    script_ctx_set_var(ctx, "sel_count", (double)sel_total);
+    script_ctx_set_var(ctx, "cursor", p->playhead_seconds);
+    script_ctx_set_var(ctx, "playhead", p->playhead_seconds);
+    script_ctx_set_var(ctx, "num_tracks", (double)p->num_tracks);
+    script_ctx_set_var(ctx, "num_items", (double)p->num_items);
+}
+
+// Splits a specific clip item_idx at exact timeline position split_t (seconds)
+static bool split_single_item_at_time(ProjectTab *p, int item_idx, double split_t, bool *io_pushed_undo) {
+    if (!p || item_idx < 0 || item_idx >= p->num_items || p->num_items >= MAX_ITEMS) return false;
+    int tab = get_valid_tab_idx();
+    AudioItem *it = &p->items[item_idx];
+    double it_s = it->start_time;
+    double it_e = it->start_time + it->duration;
+    if (split_t <= it_s + 0.02 || split_t >= it_e - 0.02) return false;
+
+    if (io_pushed_undo && !(*io_pushed_undo)) {
+        push_undo_state();
+        *io_pushed_undo = true;
+    }
+
+    int r_idx = p->num_items;
+    double orig_fin = g_item_fade_in[tab][item_idx];
+    double orig_fout = g_item_fade_out[tab][item_idx];
+    double left_dur = split_t - it_s;
+    double right_dur = it_e - split_t;
+
+    AudioItem *r_item = &p->items[r_idx];
+    memcpy(r_item, it, sizeof(AudioItem));
+    if (it->peak_count > 0 && it->peaks) {
+        r_item->peaks = (PeakBin *)calloc((size_t)it->peak_count, sizeof(PeakBin));
+        if (r_item->peaks) {
+            memcpy(r_item->peaks, it->peaks, (size_t)it->peak_count * sizeof(PeakBin));
+        }
+    }
+
+    it->duration = left_dur;
+    r_item->start_time = split_t;
+    r_item->offset_in_file = it->offset_in_file + left_dur;
+    r_item->duration = right_dur;
+    r_item->is_selected = true;
+    it->is_selected = true;
+    r_item->raw_file_handle = r_item->raw_audio_path[0] ? fopen(r_item->raw_audio_path, "rb") : NULL;
+
+    g_item_fade_in[tab][item_idx] = fmin(orig_fin, it->duration);
+    g_item_fade_out[tab][item_idx] = 0.0;
+    g_item_fade_in[tab][r_idx] = 0.0;
+    g_item_fade_out[tab][r_idx] = fmin(orig_fout, r_item->duration);
+    g_item_vol_db[tab][r_idx] = g_item_vol_db[tab][item_idx];
+    g_item_muted[tab][r_idx] = g_item_muted[tab][item_idx];
+    g_item_color_idx[tab][r_idx] = g_item_color_idx[tab][item_idx];
+    g_item_group_id[tab][r_idx] = g_item_group_id[tab][item_idx];
+    p->num_items++;
+    return true;
+}
+
+// Extracts the Nth comma-separated argument (0-indexed) inside a function call `FuncName(arg0, arg1, arg2)`
+static bool extract_func_call_arg(const char *line, const char *func_name, int arg_index, char *out_arg, size_t max_len) {
+    if (!line || !func_name || !out_arg || max_len == 0) return false;
+    out_arg[0] = '\0';
+    const char *hit = strstr(line, func_name);
+    if (!hit) return false;
+    const char *lp = strchr(hit, '(');
+    if (!lp) return false;
+    const char *p = lp + 1;
+    int cur_arg = 0;
+    int depth = 0;
+    const char *arg_s = p;
+
+    while (*p) {
+        if (*p == '(') depth++;
+        else if (*p == ')') {
+            if (depth == 0) {
+                if (cur_arg == arg_index) {
+                    size_t l = (size_t)(p - arg_s);
+                    while (l > 0 && (arg_s[0] == ' ' || arg_s[0] == '\t')) { arg_s++; l--; }
+                    while (l > 0 && (arg_s[l - 1] == ' ' || arg_s[l - 1] == '\t')) l--;
+                    if (l >= max_len) l = max_len - 1;
+                    memcpy(out_arg, arg_s, l);
+                    out_arg[l] = '\0';
+                    return true;
+                }
+                break;
+            }
+            depth--;
+        } else if (*p == ',' && depth == 0) {
+            if (cur_arg == arg_index) {
+                size_t l = (size_t)(p - arg_s);
+                while (l > 0 && (arg_s[0] == ' ' || arg_s[0] == '\t')) { arg_s++; l--; }
+                while (l > 0 && (arg_s[l - 1] == ' ' || arg_s[l - 1] == '\t')) l--;
+                if (l >= max_len) l = max_len - 1;
+                memcpy(out_arg, arg_s, l);
+                out_arg[l] = '\0';
+                return true;
+            }
+            cur_arg++;
+            arg_s = p + 1;
+        }
+        p++;
+    }
+    return false;
+}
+
+// Splits every currently selected clip at its exact midpoint (start_time + duration * 0.5)
+static bool split_selected_items_at_center(ProjectTab *p) {
+    if (!p) return false;
+    int tab = get_valid_tab_idx();
+    int orig_count = p->num_items;
+    bool did_split = false;
+
+    for (int i = 0; i < orig_count; i++) {
+        AudioItem *it = &p->items[i];
+        if (!it->is_selected) continue;
+        if (it->duration <= 0.10 || p->num_items >= MAX_ITEMS) continue;
+
+        if (!did_split) {
+            push_undo_state();
+            did_split = true;
+        }
+
+        int r_idx = p->num_items;
+        double orig_fin = g_item_fade_in[tab][i];
+        double orig_fout = g_item_fade_out[tab][i];
+        double half_dur = it->duration * 0.5;
+        double mid_t = it->start_time + half_dur;
+
+        AudioItem *r_item = &p->items[r_idx];
+        memcpy(r_item, it, sizeof(AudioItem));
+        if (it->peak_count > 0 && it->peaks) {
+            r_item->peaks = (PeakBin *)calloc((size_t)it->peak_count, sizeof(PeakBin));
+            if (r_item->peaks) {
+                memcpy(r_item->peaks, it->peaks, (size_t)it->peak_count * sizeof(PeakBin));
+            }
+        }
+
+        it->duration = half_dur;
+        r_item->start_time = mid_t;
+        r_item->offset_in_file = it->offset_in_file + half_dur;
+        r_item->duration = half_dur;
+        r_item->is_selected = true;
+        it->is_selected = true;
+        r_item->raw_file_handle = r_item->raw_audio_path[0] ? fopen(r_item->raw_audio_path, "rb") : NULL;
+
+        g_item_fade_in[tab][i]      = fmin(orig_fin, it->duration);
+        g_item_fade_out[tab][i]     = 0.0;
+        g_item_fade_in[tab][r_idx]  = 0.0;
+        g_item_fade_out[tab][r_idx] = fmin(orig_fout, r_item->duration);
+        g_item_vol_db[tab][r_idx]   = g_item_vol_db[tab][i];
+        g_item_muted[tab][r_idx]    = g_item_muted[tab][i];
+        g_item_color_idx[tab][r_idx]= g_item_color_idx[tab][i];
+        g_item_group_id[tab][r_idx] = g_item_group_id[tab][i];
+        p->num_items++;
+    }
+    return did_split;
+}
+
 // Built-in C Lua & Python Script Interpreter:
 // Reads a manually created .lua or .py script line-by-line and executes timeline/track/clip/transport commands!
 static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win,
@@ -1340,6 +2182,11 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
     bool did_any_action = false;
     bool pushed_undo = false;
     char line[1024];
+    char g_recorded_var_names[16][48];
+    char g_recorded_var_exprs[16][256];
+    int  g_num_recorded_assigns = 0;
+    memset(g_recorded_var_names, 0, sizeof(g_recorded_var_names));
+    memset(g_recorded_var_exprs, 0, sizeof(g_recorded_var_exprs));
 
     while (fgets(line, sizeof(line), f)) {
         // Trim leading whitespace
@@ -1532,10 +2379,69 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
             did_any_action = true;
         }
 
-        // 7. SplitMediaItem / split_item / split_at_cursor
-        if (str_contains_nocase(s, "SplitMediaItem") ||
-            str_contains_nocase(s, "split_item") ||
-            str_contains_nocase(s, "split_at_cursor")) {
+        // 6B. Track custom local variable assignments in Lua/Python (e.g. `local split_pos = pos + len * 0.5`)
+        if (!str_contains_nocase(s, "GetMediaItem") && !str_contains_nocase(s, "CountSelected") &&
+            !str_contains_nocase(s, "function ") && strchr(s, '=') != NULL &&
+            !str_contains_nocase(s, "==") && !str_contains_nocase(s, "~=") && !str_contains_nocase(s, "!=")) {
+            const char *lhs = s;
+            if (strncmp(lhs, "local ", 6) == 0) {
+                lhs += 6;
+                while (*lhs == ' ' || *lhs == '	') lhs++;
+            }
+            const char *eq = strchr(lhs, '=');
+            if (eq && eq > lhs) {
+                char var_name[48] = {0};
+                size_t vl = (size_t)(eq - lhs);
+                while (vl > 0 && (lhs[vl - 1] == ' ' || lhs[vl - 1] == '	')) vl--;
+                if (vl > 0 && vl < sizeof(var_name)) {
+                    memcpy(var_name, lhs, vl);
+                    var_name[vl] = '\0';
+                    bool valid_id = isalpha((unsigned char)var_name[0]) || var_name[0] == '_';
+                    for (size_t k = 1; k < vl && valid_id; k++) {
+                        if (!isalnum((unsigned char)var_name[k]) && var_name[k] != '_') valid_id = false;
+                    }
+                    if (valid_id && g_num_recorded_assigns < 16) {
+                        strncpy(g_recorded_var_names[g_num_recorded_assigns], var_name, 47);
+                        strncpy(g_recorded_var_exprs[g_num_recorded_assigns], eq + 1, 255);
+                        g_num_recorded_assigns++;
+                    }
+                }
+            }
+        }
+
+        // 7. Dynamic SplitMediaItem(item, <any math/var expression>) or split helpers
+        if (str_contains_nocase(s, "split_selected_clips_center") ||
+            str_contains_nocase(s, "split_clips_center") ||
+            str_contains_nocase(s, "split_center")) {
+            if (split_selected_items_at_center(p)) {
+                did_any_action = true;
+            }
+        } else if (str_contains_nocase(s, "SplitMediaItem")) {
+            char expr_arg[256] = {0};
+            if (extract_func_call_arg(s, "SplitMediaItem", 1, expr_arg, sizeof(expr_arg)) && expr_arg[0]) {
+                int orig_cnt = p->num_items;
+                int sel_tot = 0;
+                for (int i = 0; i < orig_cnt; i++) if (p->items[i].is_selected) sel_tot++;
+                int sel_ord = 0;
+                for (int i = 0; i < orig_cnt; i++) {
+                    if (!p->items[i].is_selected) continue;
+                    ScriptEvalContext ctx;
+                    memset(&ctx, 0, sizeof(ctx));
+                    populate_clip_eval_context(&ctx, p, i, sel_ord, sel_tot);
+                    for (int va = 0; va < g_num_recorded_assigns; va++) {
+                        double vval = eval_script_math_expr(g_recorded_var_exprs[va], &ctx);
+                        script_ctx_set_var(&ctx, g_recorded_var_names[va], vval);
+                    }
+                    double split_t = eval_script_math_expr(expr_arg, &ctx);
+                    if (split_single_item_at_time(p, i, split_t, &pushed_undo)) {
+                        did_any_action = true;
+                    }
+                    sel_ord++;
+                }
+            } else if (split_selected_items_at_center(p)) {
+                did_any_action = true;
+            }
+        } else if (str_contains_nocase(s, "split_item") || str_contains_nocase(s, "split_at_cursor")) {
             for (int a = 0; a < g_num_actions; a++) {
                 if (g_actions[a].id == ACT_ITEM_SPLIT_AT_CURSOR) {
                     execute_daw_action_by_index(p, ren, win, a);
@@ -1556,11 +2462,59 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
             did_any_action = true;
         }
 
-        // 9. SetMediaItemInfo_Value or direct item property helpers
-        if (str_contains_nocase(s, "D_POSITION") || str_contains_nocase(s, "set_item_position")) {
+        // 9. Dynamic SetMediaItemInfo_Value(item, "PROP", <any formula/var>) or direct item property helpers
+        if (str_contains_nocase(s, "SetMediaItemInfo_Value")) {
+            char prop_arg[64] = {0};
+            char val_expr[256] = {0};
+            if (extract_func_call_arg(s, "SetMediaItemInfo_Value", 1, prop_arg, sizeof(prop_arg)) &&
+                extract_func_call_arg(s, "SetMediaItemInfo_Value", 2, val_expr, sizeof(val_expr)) &&
+                val_expr[0]) {
+                if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
+                int sel_tot = 0;
+                for (int i = 0; i < p->num_items; i++) if (p->items[i].is_selected) sel_tot++;
+                int sel_ord = 0;
+                for (int i = 0; i < p->num_items; i++) {
+                    if (!p->items[i].is_selected) continue;
+                    ScriptEvalContext ctx;
+                    memset(&ctx, 0, sizeof(ctx));
+                    populate_clip_eval_context(&ctx, p, i, sel_ord, sel_tot);
+                    for (int va = 0; va < g_num_recorded_assigns; va++) {
+                        double vval = eval_script_math_expr(g_recorded_var_exprs[va], &ctx);
+                        script_ctx_set_var(&ctx, g_recorded_var_names[va], vval);
+                    }
+                    double val = eval_script_math_expr(val_expr, &ctx);
+                    if (str_contains_nocase(prop_arg, "D_POSITION")) {
+                        p->items[i].start_time = fmax(0.0, val);
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_LENGTH")) {
+                        if (val > 0.05) p->items[i].duration = val;
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_STARTOFFS")) {
+                        p->items[i].offset_in_file = fmax(0.0, val);
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_FADEINLEN")) {
+                        set_item_fade_in(p, i, fmax(0.0, val));
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_FADEOUTLEN")) {
+                        set_item_fade_out(p, i, fmax(0.0, val));
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "D_VOL")) {
+                        g_item_vol_db[tab][i] = (float)val;
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "B_MUTE")) {
+                        g_item_muted[tab][i] = (val != 0.0);
+                        did_any_action = true;
+                    } else if (str_contains_nocase(prop_arg, "I_CUSTOMCOLOR")) {
+                        g_item_color_idx[tab][i] = ((int)val) & 7;
+                        did_any_action = true;
+                    }
+                    sel_ord++;
+                }
+            }
+        }
+        if (str_contains_nocase(s, "set_item_position")) {
             double pos = 0.0;
-            const char *tok = str_contains_nocase(s, "D_POSITION") ? "D_POSITION" : "set_item_position";
-            if (parse_number_after_token(s, tok, &pos) && pos >= 0.0) {
+            if (parse_number_after_token(s, "set_item_position", &pos) && pos >= 0.0) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected) p->items[i].start_time = pos;
@@ -1568,10 +2522,9 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
                 did_any_action = true;
             }
         }
-        if (str_contains_nocase(s, "D_LENGTH") || str_contains_nocase(s, "set_item_length")) {
+        if (str_contains_nocase(s, "set_item_length")) {
             double dur = 0.0;
-            const char *tok = str_contains_nocase(s, "D_LENGTH") ? "D_LENGTH" : "set_item_length";
-            if (parse_number_after_token(s, tok, &dur) && dur > 0.05) {
+            if (parse_number_after_token(s, "set_item_length", &dur) && dur > 0.05) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected) p->items[i].duration = dur;
@@ -1579,10 +2532,9 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
                 did_any_action = true;
             }
         }
-        if (str_contains_nocase(s, "D_FADEINLEN") || str_contains_nocase(s, "set_fade_in")) {
+        if (str_contains_nocase(s, "set_fade_in")) {
             double fin = 0.0;
-            const char *tok = str_contains_nocase(s, "D_FADEINLEN") ? "D_FADEINLEN" : "set_fade_in";
-            if (parse_number_after_token(s, tok, &fin) && fin >= 0.0) {
+            if (parse_number_after_token(s, "set_fade_in", &fin) && fin >= 0.0) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected) set_item_fade_in(p, i, fin);
@@ -1590,10 +2542,9 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
                 did_any_action = true;
             }
         }
-        if (str_contains_nocase(s, "D_FADEOUTLEN") || str_contains_nocase(s, "set_fade_out")) {
+        if (str_contains_nocase(s, "set_fade_out")) {
             double fout = 0.0;
-            const char *tok = str_contains_nocase(s, "D_FADEOUTLEN") ? "D_FADEOUTLEN" : "set_fade_out";
-            if (parse_number_after_token(s, tok, &fout) && fout >= 0.0) {
+            if (parse_number_after_token(s, "set_fade_out", &fout) && fout >= 0.0) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected) set_item_fade_out(p, i, fout);
@@ -1958,6 +2909,21 @@ static void execute_script_action_entry(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         record_project_change(desc, true);
         snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
                  "Executed: %s", desc);
+        return;
+    }
+
+    // Script: Split Center (splits selected clips at 50% midpoint)
+    if (str_contains_nocase(desc, "split center") ||
+        str_contains_nocase(desc, "split_center") ||
+        str_contains_nocase(desc, "center split")) {
+        if (split_selected_items_at_center(p)) {
+            record_project_change("Split Selected Clip(s) at Center", true);
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Split selected clip(s) at center");
+        } else {
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Select one or more clips to split at center");
+        }
         return;
     }
 
@@ -3144,11 +4110,12 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
             g_action_win.scroll_y = 0;
             refresh_filtered_actions();
         } else if (mx >= wx + 500 && mx <= wx + 584) {
-            // [Options] -> Rescan scripts folder & save keyboard_shortcuts.json
+            // [Refresh] -> Rescan scripts folder for newly added .lua / .py scripts & save keyboard_shortcuts.json
             scan_scripts_directory_to_actions(&g_daw);
             save_keyboard_shortcuts_json();
+            refresh_filtered_actions();
             snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
-                     "Saved %d actions to keyboard_shortcuts.json", g_num_actions);
+                     "Refreshed scripts folder (%d actions ready)", g_num_actions);
         } else if (mx >= wx + 592 && mx <= wx + 766) {
             // [Find shortcut...]
             g_action_win.capturing_find_shortcut = true;
@@ -3269,7 +4236,7 @@ static void render_action_window(SDL_Renderer *ren) {
     int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
     SDL_Color c_white = { 228, 228, 228, 255 };
     SDL_Color c_muted = { 150, 145, 140, 255 };
-    SDL_Color c_accent = { 235, 175, 95, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
 
     // Drop Shadow
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -3323,7 +4290,7 @@ static void render_action_window(SDL_Renderer *ren) {
     SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
     SDL_RenderFillRect(ren, &btn_opt);
     draw_brown_border_rect(ren, &btn_opt, false, false);
-    draw_text(ren, "Options", wx + 514, wy + 45, c_white);
+    draw_text(ren, "Refresh", wx + 514, wy + 45, c_white);
 
     SDL_Rect btn_find = { wx + 592, wy + 38, 174, 26 };
     SDL_SetRenderDrawColor(ren, 52, 42, 34, 255);
