@@ -19,7 +19,7 @@
 #include <sys/stat.h>
 
 #define MAX_TRACKS 32
-#define MAX_ITEMS 128
+#define MAX_ITEMS 1024
 #define SAMPLE_RATE 48000
 #define PEAK_SAMPLES_PER_BIN 256
 
