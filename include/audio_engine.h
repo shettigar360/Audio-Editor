@@ -23,6 +23,8 @@
 #define MAX_ITEMS 1024
 #define SAMPLE_RATE 48000
 #define PEAK_SAMPLES_PER_BIN 1024
+#ifndef DAW_PEAK_POOL_DEFINED
+#define DAW_PEAK_POOL_DEFINED
 #define MAX_SHARED_PEAK_ENTRIES 256
 
 typedef struct {
@@ -70,7 +72,7 @@ static inline int daw_fseek64(FILE *fp, int64_t offset, int origin) {
     if (!fp) return -1;
     clearerr(fp);
 #ifdef _WIN32
-    return _fseeki64(fp, (__int64)offset, origin);
+    return _fseeki64(fp, (int64_t)offset, origin);
 #else
     return fseeko(fp, (off_t)offset, origin);
 #endif
@@ -149,6 +151,8 @@ static inline PeakBin* daw_register_shared_peaks(const char *raw_path, PeakBin *
     }
     return peaks;
 }
+
+#endif // DAW_PEAK_POOL_DEFINED
 
 // Simple string hash to generate distinct cache filenames
 static inline unsigned int hash_path(const char *str) {
