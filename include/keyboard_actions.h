@@ -202,7 +202,7 @@ static RecordingEngineState g_rec = {
     0, -1, 0.0, 0, 0,
     NULL, NULL,
     "", "",
-    "C:\\Users\\USER\\Documents\\Recordings",
+    "Recordings",
     0.0f, 0.0f, 0, 0, 0,
     false
 };
@@ -210,11 +210,30 @@ static RecordingEngineState g_rec = {
 static inline void init_default_recording_folder(void) {
     if (g_rec.folder_initialized) return;
     g_rec.folder_initialized = true;
-    const char *user_prof = getenv("USERPROFILE");
-    if (user_prof && user_prof[0]) {
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Documents\\Recordings", user_prof);
+    char *base = SDL_GetBasePath();
+    if (base && base[0]) {
+        size_t blen = strlen(base);
+        while (blen > 0 && (base[blen - 1] == '\\' || base[blen - 1] == '/')) {
+            base[--blen] = '\0';
+        }
+#ifdef _WIN32
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Recordings", base);
+        CreateDirectoryA(g_rec.folder_path, NULL);
+        CreateDirectoryA("Recordings", NULL);
+#else
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s/Recordings", base);
+        mkdir(g_rec.folder_path, 0777);
+        mkdir("Recordings", 0777);
+#endif
+        SDL_free(base);
     } else {
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "C:\\Users\\USER\\Documents\\Recordings");
+        if (base) SDL_free(base);
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "Recordings");
+#ifdef _WIN32
+        CreateDirectoryA("Recordings", NULL);
+#else
+        mkdir("Recordings", 0777);
+#endif
     }
 }
 
@@ -1641,11 +1660,6 @@ static bool load_keyboard_shortcuts_json(void) {
     if (app_sec) {
         const char *app_end = json_buf + read_bytes;
         init_default_recording_folder();
-        char loaded_rec_dir[512] = {0};
-        if (json_extract_string_field(app_sec, app_end, "recording_folder", loaded_rec_dir, sizeof(loaded_rec_dir)) && loaded_rec_dir[0]) {
-            strncpy(g_rec.folder_path, loaded_rec_dir, sizeof(g_rec.folder_path) - 1);
-            g_rec.folder_path[sizeof(g_rec.folder_path) - 1] = '\0';
-        }
         g_reposition.mode = json_extract_int_field(app_sec, app_end, "reposition_mode", g_reposition.mode);
         const char *rep_int_hit = strstr(app_sec, "\"reposition_interval_sec\"");
         if (rep_int_hit && rep_int_hit < app_end) {
