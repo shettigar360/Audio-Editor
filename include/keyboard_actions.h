@@ -89,10 +89,13 @@ static int  g_script_filtered_indices[64] = { 0 };
 static int  g_script_num_filtered = 0;
 
 // Anchor indices for standard Shift+Click range selection on tracks and clips
+#ifndef DAW_SHARED_STABILITY_VARS_DEFINED
+#define DAW_SHARED_STABILITY_VARS_DEFINED
 static int g_last_clicked_track_idx = -1;
 static int g_last_clicked_item_idx = -1;
+#endif
 
-// ================= REAPER-STYLE DYNAMIC SPLIT ITEMS POPUP STATE =================
+// ================= STABILIZED BOX-BASED DYNAMIC SPLIT POPUP STATE =================
 typedef struct {
     bool is_open;
     SDL_Rect win_rect;
@@ -100,41 +103,39 @@ typedef struct {
     int drag_off_x;
     int drag_off_y;
 
-    // Split points
+    // Simple Box-Based Parameters (with user-specified defaults)
     bool split_at_transients;
     bool split_when_gate_opens;
     bool split_when_gate_closes;
     bool reduce_splits_enabled;
-    int  reduce_splits_val;      // e.g. 11 (1..100)
-    int  min_slice_ms;           // e.g. 20 ms
-    int  min_silence_ms;         // e.g. 500 ms
-
-    // Gate
-    float gate_threshold_db;     // e.g. -50.0 dB (-90.0 .. 0.0)
-    float gate_hysteresis_db;    // e.g. -6.0 dB (-24.0 .. 0.0)
+    int  reduce_splits_val;
+    int  min_slice_ms;           // Default: 20 ms
+    int  min_silence_ms;         // Default: 500 ms
+    float gate_threshold_db;     // Default: -50.0 dB
+    float gate_hysteresis_db;    // Default: -6.0 dB
     bool  display_gate_threshold;
+    int   action_mode;           // 0 = Selected clip item, 1 = Selected Track
+    bool  set_timebase_to_beats;
+    bool  set_snap_offset_peak;
+    int   snap_offset_first_ms;
+    bool  remove_silent_areas;   // Default: true
+    int   leading_pad_ms;        // Default: 50 ms
+    int   trailing_pad_ms;       // Default: 150 ms
+    bool  fade_pad;
+    bool  create_chromatic_midi;
 
-    // Action to perform
-    int  action_mode;            // 0 = "Split selected items", 1 = "Split selected and grouped items"
-    bool set_timebase_to_beats;
-    bool set_snap_offset_peak;
-    int  snap_offset_first_ms;   // e.g. 50 ms
-    bool remove_silent_areas;    // default true
-    int  leading_pad_ms;         // e.g. 50 ms
-    int  trailing_pad_ms;        // e.g. 150 ms
-    bool fade_pad;
-    bool create_chromatic_midi;
-
-    // Interactive slider & text input state
-    int  dragging_slider_id;     // 0=none, 1=reduce, 2=min_slice, 3=min_silence, 4=threshold, 5=hysteresis
-    int  editing_field_id;       // 0=none, 1=reduce, 2=min_slice, 3=min_silence, 4=threshold, 5=hysteresis, 6=snap, 7=lead, 8=trail
+    // Box editing state:
+    // 1 = min_slice_ms, 2 = min_silence_ms, 3 = gate_threshold_db, 4 = gate_hysteresis_db,
+    // 5 = leading_pad_ms, 6 = trailing_pad_ms
+    int  dragging_slider_id;
+    int  editing_field_id;
     char edit_buf[32];
     char status_msg[128];
 } DynamicSplitState;
 
 static DynamicSplitState g_dyn_split = {
     false,
-    { 390, 58, 500, 566 },
+    { 410, 96, 460, 392 },
     false, 0, 0,
     false, false, true,
     false, 11,
@@ -147,7 +148,7 @@ static DynamicSplitState g_dyn_split = {
     false,
     false, 50,
     true,
-    50, 150, false,
+    50, 150, true,
     false,
     0, 0, "", ""
 };
@@ -217,6 +218,31 @@ static inline void init_default_recording_folder(void) {
     }
 }
 
+#ifndef DAW_SHARED_STABILITY_VARS_DEFINED
+#define DAW_SHARED_STABILITY_VARS_DEFINED
+static int g_last_clicked_track_idx = -1;
+static int g_last_clicked_item_idx = -1;
+// ================= APP STABILITY & PROCESSING WAIT MODAL STATE =================
+static volatile bool g_engine_processing = false;
+static bool   g_processing_popup_open = false;
+static char   g_processing_title[128] = "Processing, please wait...";
+static char   g_processing_detail[160] = "Stabilizing audio timeline...";
+static int    g_processing_pct = 100;
+static Uint32 g_processing_close_at_ticks = 0;
+
+// Track Delete Confirmation Modal State (when deleting a track that contains clips)
+static bool g_track_delete_prompt_open = false;
+
+// Open Project on Dirty Tab Save Confirmation Flag
+static bool g_save_prompt_open_project_after = false;
+
+// Tools -> Record Submenu State (Rec | Browse [with folder symbol])
+static bool g_submenu_tools_record_open = false;
+
+// Track vs Clip Copy/Paste Mode Flag
+static bool g_last_copied_is_track = false;
+#endif
+
 // ================= LUA & PYTHON CUSTOM SCRIPT POPUP WINDOW STATE =================
 #define MAX_SCRIPT_POPUP_CONTROLS 8
 typedef enum {
@@ -268,21 +294,62 @@ static ScriptPopupWindowState g_script_popup = {
 // Draws a crisp Pushpin symbol at (cx, cy) for pinned Actions and Scripts
 static inline void draw_pin_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool is_pinned, SDL_Color col) {
     SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
-    // Top flat head of pushpin
     SDL_RenderDrawLine(ren, cx + 2, cy + 1, cx + 8, cy + 1);
     SDL_RenderDrawLine(ren, cx + 3, cy + 2, cx + 7, cy + 2);
-    // Body of pushpin
     SDL_Rect body = { cx + 3, cy + 3, 5, 4 };
     if (is_pinned) {
         SDL_RenderFillRect(ren, &body);
     } else {
         SDL_RenderDrawRect(ren, &body);
     }
-    // Wide flange
     SDL_RenderDrawLine(ren, cx + 1, cy + 7, cx + 9, cy + 7);
     SDL_RenderDrawLine(ren, cx + 2, cy + 8, cx + 8, cy + 8);
-    // Needle tip pointing down
     SDL_RenderDrawLine(ren, cx + 5, cy + 9, cx + 5, cy + 12);
+}
+
+// Draws a crisp curved Undo arrow symbol (counter-clockwise arrow) at (cx, cy)
+static inline void draw_undo_symbol_icon(SDL_Renderer *ren, int cx, int cy, SDL_Color col) {
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
+    // Left-pointing arrowhead at (cx + 2, cy + 6)
+    SDL_RenderDrawLine(ren, cx + 2, cy + 6, cx + 7, cy + 2);
+    SDL_RenderDrawLine(ren, cx + 2, cy + 6, cx + 7, cy + 10);
+    SDL_RenderDrawLine(ren, cx + 3, cy + 6, cx + 7, cy + 3);
+    SDL_RenderDrawLine(ren, cx + 3, cy + 6, cx + 7, cy + 9);
+    // Top horizontal & curved right arch
+    SDL_RenderDrawLine(ren, cx + 3, cy + 6, cx + 14, cy + 6);
+    SDL_RenderDrawLine(ren, cx + 4, cy + 7, cx + 15, cy + 7);
+    SDL_RenderDrawLine(ren, cx + 14, cy + 7, cx + 16, cy + 9);
+    SDL_RenderDrawLine(ren, cx + 16, cy + 9, cx + 16, cy + 12);
+    SDL_RenderDrawLine(ren, cx + 15, cy + 9, cx + 15, cy + 12);
+    SDL_RenderDrawLine(ren, cx + 8, cy + 13, cx + 15, cy + 13);
+}
+
+// Draws a crisp curved Redo arrow symbol (clockwise arrow) at (cx, cy)
+static inline void draw_redo_symbol_icon(SDL_Renderer *ren, int cx, int cy, SDL_Color col) {
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
+    // Right-pointing arrowhead at (cx + 16, cy + 6)
+    SDL_RenderDrawLine(ren, cx + 16, cy + 6, cx + 11, cy + 2);
+    SDL_RenderDrawLine(ren, cx + 16, cy + 6, cx + 11, cy + 10);
+    SDL_RenderDrawLine(ren, cx + 15, cy + 6, cx + 11, cy + 3);
+    SDL_RenderDrawLine(ren, cx + 15, cy + 6, cx + 11, cy + 9);
+    // Top horizontal & curved left arch
+    SDL_RenderDrawLine(ren, cx + 4, cy + 6, cx + 15, cy + 6);
+    SDL_RenderDrawLine(ren, cx + 3, cy + 7, cx + 14, cy + 7);
+    SDL_RenderDrawLine(ren, cx + 2, cy + 9, cx + 4, cy + 7);
+    SDL_RenderDrawLine(ren, cx + 2, cy + 9, cx + 2, cy + 12);
+    SDL_RenderDrawLine(ren, cx + 3, cy + 9, cx + 3, cy + 12);
+    SDL_RenderDrawLine(ren, cx + 3, cy + 13, cx + 10, cy + 13);
+}
+
+// Draws a crisp Folder symbol icon at (cx, cy) for Tools -> Record -> Browse
+static inline void draw_folder_symbol_icon(SDL_Renderer *ren, int cx, int cy, SDL_Color col) {
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
+    SDL_Rect tab_r = { cx + 1, cy + 1, 6, 3 };
+    SDL_Rect body_r = { cx + 1, cy + 3, 14, 9 };
+    SDL_RenderFillRect(ren, &tab_r);
+    SDL_RenderDrawRect(ren, &body_r);
+    SDL_Rect inner_fill = { cx + 2, cy + 5, 12, 6 };
+    SDL_RenderFillRect(ren, &inner_fill);
 }
 
 // Draws a filled circle at center (cx, cy) with radius r (used for the red recording dot near the time clock)
@@ -502,6 +569,7 @@ typedef enum {
     ACT_ITEM_MOVE_UP_TRACK,
     ACT_ITEM_MOVE_DOWN_TRACK,
     ACT_ITEM_DYNAMIC_SPLIT,
+    ACT_ITEM_JOIN_GLUE,
 
     // Track Controls & Tab Management (matching Basic Shortcut.pdf)
     ACT_TRACK_TOGGLE_SOLO_SELECTED,
@@ -656,6 +724,14 @@ static void save_keyboard_shortcuts_json(void);
 static bool load_keyboard_shortcuts_json(void);
 static bool parse_number_after_token(const char *line, const char *token, double *out_val);
 static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
+static void ensure_playhead_visible_in_viewport(ProjectTab *p, int view_w);
+static bool request_delete_selected_tracks_with_prompt(ProjectTab *p);
+static void copy_selected_tracks_to_clipboard(ProjectTab *p);
+static void paste_tracks_at_bottom_of_selected(ProjectTab *p);
+static void show_processing_wait_modal(SDL_Renderer *ren, SDL_Window *win, const char *title, const char *detail, int pct);
+static void finish_processing_wait_modal(Uint32 hold_ms);
+static void execute_join_glue_selected_items(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
+static void request_open_project_with_save_prompt(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
 static void scan_scripts_directory_to_actions(DawEngine *daw);
 static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win, int act_idx);
 
@@ -2052,6 +2128,9 @@ static void init_keyboard_actions_system(void) {
     register_builtin_action(ACT_ITEM_DYNAMIC_SPLIT,
         "Item: Dynamic split items...",
         "Ctrl+D", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_JOIN_GLUE,
+        "Item: Join (glue) selected items",
+        "J", "Ctrl+J", NULL, NULL, false, false);
 
     // ---- TRACK CONTROLS & TAB MANAGEMENT (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_TRACK_TOGGLE_SOLO_SELECTED,
@@ -2103,6 +2182,12 @@ static void init_keyboard_actions_system(void) {
     register_builtin_action(ACT_TRANSPORT_RECORD,
         "Transport: Record",
         "R", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRANSPORT_GO_TO_START,
+        "Transport: Go to start of project",
+        "Home", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRANSPORT_GO_TO_END,
+        "Transport: Go to end of project",
+        "End", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_ITEM_SPLIT_AT_CURSOR,
         "Item: Split items at edit or play cursor",
         "S", NULL, NULL, NULL, false, false);
@@ -2706,138 +2791,249 @@ static void execute_reposition_items_dialog(ProjectTab *p) {
     record_project_change("Repositioned Selected Items", true);
 }
 
-// Executes REAPER-style Dynamic Split Items on all selected clips based on g_dyn_split settings
-static void execute_dynamic_split_items(ProjectTab *p) {
+// Executes Stabilized Simple Box-Based Dynamic Split on Selected Clip Item(s) or Selected Track(s)
+// Shows the "Processing, please wait..." modal during analysis & splitting and locks the audio device so it never crashes.
+static void execute_dynamic_split_items(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win) {
     if (!p) return;
     save_themes_settings_json();
 
     float open_lin  = db_to_linear(g_dyn_split.gate_threshold_db);
     float close_lin = db_to_linear(g_dyn_split.gate_threshold_db + g_dyn_split.gate_hysteresis_db);
-    double min_slice_sec   = fmax(0.015, (double)g_dyn_split.min_slice_ms / 1000.0);
+    if (close_lin > open_lin) close_lin = open_lin * 0.8f;
+
+    double min_slice_sec   = fmax(0.010, (double)g_dyn_split.min_slice_ms / 1000.0);
     double min_silence_sec = fmax(0.020, (double)g_dyn_split.min_silence_ms / 1000.0);
     double lead_pad_sec    = fmax(0.0, (double)g_dyn_split.leading_pad_ms / 1000.0);
     double trail_pad_sec   = fmax(0.0, (double)g_dyn_split.trailing_pad_ms / 1000.0);
     double bin_dur_sec     = (double)PEAK_SAMPLES_PER_BIN / (double)SAMPLE_RATE;
 
-    bool any_sel = false;
-    for (int i = 0; i < p->num_items; i++) {
-        if (p->items[i].is_selected) { any_sel = true; break; }
+    // Collect target item indices according to Action to perform:
+    // 0 = Selected clip item, 1 = Selected Track
+    int target_items[MAX_ITEMS];
+    int num_targets = 0;
+
+    if (g_dyn_split.action_mode == 1) {
+        // Selected Track: select all clips on currently selected track(s)
+        for (int i = 0; i < p->num_items; i++) {
+            int tr = p->items[i].track_idx;
+            if (tr >= 0 && tr < p->num_tracks && p->track_selected[tr] && !is_track_hidden(tr)) {
+                p->items[i].is_selected = true;
+                target_items[num_targets++] = i;
+            }
+        }
+    } else {
+        // Selected clip item (fallback to selected track's clips if no clip is explicitly selected)
+        for (int i = 0; i < p->num_items; i++) {
+            if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx)) {
+                target_items[num_targets++] = i;
+            }
+        }
+        if (num_targets == 0) {
+            for (int i = 0; i < p->num_items; i++) {
+                int tr = p->items[i].track_idx;
+                if (tr >= 0 && tr < p->num_tracks && p->track_selected[tr] && !is_track_hidden(tr)) {
+                    p->items[i].is_selected = true;
+                    target_items[num_targets++] = i;
+                }
+            }
+        }
     }
-    if (!any_sel) {
-        snprintf(g_dyn_split.status_msg, sizeof(g_dyn_split.status_msg), "Select one or more clips on the timeline first.");
+
+    if (num_targets == 0) {
+        snprintf(g_dyn_split.status_msg, sizeof(g_dyn_split.status_msg),
+                 (g_dyn_split.action_mode == 1) ? "Select a track with clips first." : "Select a clip item first.");
         return;
     }
 
-    bool pushed_undo = false;
-    int total_splits_made = 0;
-    int orig_count = p->num_items;
+    g_dyn_split.is_open = false;
+    show_processing_wait_modal(ren, win, "Dynamic Split - Processing...", "Analyzing audio gate & silence thresholds...", 10);
 
-    for (int idx = orig_count - 1; idx >= 0; idx--) {
-        if (!p->items[idx].is_selected) continue;
-        AudioItem *it = &p->items[idx];
-        if (it->duration <= min_slice_sec * 1.5) continue;
+    push_undo_state();
+    int tab = get_valid_tab_idx();
+    int total_created_slices = 0;
 
-        double split_times[64];
-        bool   region_silent[65];
-        int    num_splits = 0;
-        memset(region_silent, 0, sizeof(region_silent));
+    typedef struct {
+        double s;
+        double e;
+        bool is_voice;
+    } DynSeg;
 
-        if (it->peaks && it->peak_count > 4) {
-            int start_bin = (int)((it->offset_in_file * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
-            int end_bin   = (int)(((it->offset_in_file + it->duration) * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
+    // Process from highest index to lowest so replacing item `idx` never invalidates earlier target indices
+    for (int ti = num_targets - 1; ti >= 0; ti--) {
+        int idx = target_items[ti];
+        if (idx < 0 || idx >= p->num_items) continue;
+        AudioItem src_copy = p->items[idx];
+        double clip_s = src_copy.start_time;
+        double clip_e = src_copy.start_time + src_copy.duration;
+        if (src_copy.duration <= min_slice_sec * 1.2) continue;
+
+        int pct = 15 + ((num_targets - 1 - ti) * 75) / (num_targets > 0 ? num_targets : 1);
+        show_processing_wait_modal(ren, win, "Dynamic Split - Processing...", src_copy.label, pct);
+
+        DynSeg voice_segs[512];
+        int num_voice = 0;
+
+        if (src_copy.peaks && src_copy.peak_count > 2) {
+            int start_bin = (int)((src_copy.offset_in_file * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
+            int end_bin   = (int)(((src_copy.offset_in_file + src_copy.duration) * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
             if (start_bin < 0) start_bin = 0;
-            if (end_bin > it->peak_count) end_bin = it->peak_count;
+            if (end_bin > src_copy.peak_count) end_bin = src_copy.peak_count;
 
-            bool gate_is_open = true;
-            double last_split_t = it->start_time;
-            int silent_bins = 0;
             int min_silence_bins = (int)(min_silence_sec / bin_dur_sec);
-            if (min_silence_bins < 2) min_silence_bins = 2;
-            float prev_amp = 0.0f;
+            if (min_silence_bins < 1) min_silence_bins = 1;
 
-            for (int b = start_bin; b < end_bin && num_splits < 48; b++) {
-                float a1 = fabsf(it->peaks[b].min_val);
-                float a2 = fabsf(it->peaks[b].max_val);
+            bool in_voice = false;
+            double cur_voice_s = clip_s;
+            double last_loud_t = clip_s;
+            int quiet_bins = 0;
+
+            for (int b = start_bin; b < end_bin; b++) {
+                float a1 = fabsf(src_copy.peaks[b].min_val);
+                float a2 = fabsf(src_copy.peaks[b].max_val);
                 float amp = (a1 > a2) ? a1 : a2;
-                double cur_t = it->start_time + (double)(b - start_bin) * bin_dur_sec;
+                double t_cur = clip_s + (double)(b - start_bin) * bin_dur_sec;
 
-                // Transient detection
-                if (g_dyn_split.split_at_transients && amp > open_lin * 2.2f && amp > prev_amp * 2.8f) {
-                    if (cur_t - last_split_t >= min_slice_sec && (it->start_time + it->duration) - cur_t >= min_slice_sec) {
-                        split_times[num_splits] = cur_t;
-                        region_silent[num_splits] = false;
-                        num_splits++;
-                        last_split_t = cur_t;
-                    }
-                }
-
-                if (gate_is_open) {
-                    if (amp < close_lin) {
-                        silent_bins++;
-                        if (silent_bins >= min_silence_bins && g_dyn_split.split_when_gate_closes) {
-                            double close_t = cur_t - (double)silent_bins * bin_dur_sec + trail_pad_sec;
-                            if (close_t > last_split_t + min_slice_sec && close_t < it->start_time + it->duration - min_slice_sec) {
-                                split_times[num_splits] = close_t;
-                                region_silent[num_splits] = false;
-                                num_splits++;
-                                last_split_t = close_t;
-                                gate_is_open = false;
-                            }
-                        }
-                    } else {
-                        silent_bins = 0;
+                if (!in_voice) {
+                    if (amp >= open_lin) {
+                        in_voice = true;
+                        cur_voice_s = fmax(clip_s, t_cur - lead_pad_sec);
+                        last_loud_t = t_cur + bin_dur_sec;
+                        quiet_bins = 0;
                     }
                 } else {
-                    if (amp >= open_lin) {
-                        silent_bins = 0;
-                        if (g_dyn_split.split_when_gate_opens || g_dyn_split.remove_silent_areas) {
-                            double open_t = cur_t - lead_pad_sec;
-                            if (open_t > last_split_t + min_slice_sec && open_t < it->start_time + it->duration - min_slice_sec) {
-                                split_times[num_splits] = open_t;
-                                region_silent[num_splits] = true; // The region ending at open_t was silent!
-                                num_splits++;
-                                last_split_t = open_t;
+                    if (amp >= close_lin) {
+                        last_loud_t = t_cur + bin_dur_sec;
+                        quiet_bins = 0;
+                    } else {
+                        quiet_bins++;
+                        if (quiet_bins >= min_silence_bins) {
+                            double seg_e = fmin(clip_e, last_loud_t + trail_pad_sec);
+                            if (seg_e - cur_voice_s >= min_slice_sec && num_voice < 512) {
+                                // Merge with previous voice segment if pads overlap
+                                if (num_voice > 0 && cur_voice_s <= voice_segs[num_voice - 1].e + 0.005) {
+                                    if (seg_e > voice_segs[num_voice - 1].e) {
+                                        voice_segs[num_voice - 1].e = seg_e;
+                                    }
+                                } else {
+                                    voice_segs[num_voice].s = cur_voice_s;
+                                    voice_segs[num_voice].e = seg_e;
+                                    voice_segs[num_voice].is_voice = true;
+                                    num_voice++;
+                                }
                             }
+                            in_voice = false;
+                            quiet_bins = 0;
                         }
-                        gate_is_open = true;
                     }
                 }
-                prev_amp = amp;
             }
-        }
 
-        // Fallback if uniform synthetic peaks or no gate transitions crossed threshold: split into clean slices
-        if (num_splits == 0 && it->duration >= 0.4) {
-            int slices = g_dyn_split.reduce_splits_enabled ? (g_dyn_split.reduce_splits_val > 1 ? g_dyn_split.reduce_splits_val : 2) : 2;
-            if (slices > 8) slices = 8;
-            double step = it->duration / (double)slices;
-            for (int s = 1; s < slices && num_splits < 48; s++) {
-                split_times[num_splits] = it->start_time + step * (double)s;
-                region_silent[num_splits] = false;
-                num_splits++;
-            }
-        }
-
-        // Apply splits from right to left on item idx so child pieces are created cleanly
-        for (int s = num_splits - 1; s >= 0; s--) {
-            if (p->num_items >= MAX_ITEMS) break;
-            int before_cnt = p->num_items;
-            if (split_single_item_at_time(p, idx, split_times[s], &pushed_undo)) {
-                total_splits_made++;
-                int new_r_idx = before_cnt;
-                if (g_dyn_split.fade_pad) {
-                    set_item_fade_in(p, new_r_idx, fmin(0.015, p->items[new_r_idx].duration * 0.25));
-                    set_item_fade_out(p, idx, fmin(0.015, p->items[idx].duration * 0.25));
-                }
-                if (g_dyn_split.remove_silent_areas && region_silent[s]) {
-                    delete_item_at_index(p, idx);
+            if (in_voice && num_voice < 512) {
+                double seg_e = fmin(clip_e, last_loud_t + trail_pad_sec);
+                if (seg_e > clip_e) seg_e = clip_e;
+                if (seg_e - cur_voice_s >= min_slice_sec) {
+                    if (num_voice > 0 && cur_voice_s <= voice_segs[num_voice - 1].e + 0.005) {
+                        if (seg_e > voice_segs[num_voice - 1].e) voice_segs[num_voice - 1].e = seg_e;
+                    } else {
+                        voice_segs[num_voice].s = cur_voice_s;
+                        voice_segs[num_voice].e = seg_e;
+                        voice_segs[num_voice].is_voice = true;
+                        num_voice++;
+                    }
                 }
             }
         }
+
+        // Fallback if uniform synthetic signal had no silence gaps: split at midpoint so user still sees a clean split
+        if (num_voice == 0 || (num_voice == 1 && fabs(voice_segs[0].s - clip_s) < 0.02 && fabs(voice_segs[0].e - clip_e) < 0.02)) {
+            if (src_copy.duration >= min_slice_sec * 2.5) {
+                double mid = clip_s + src_copy.duration * 0.5;
+                voice_segs[0] = (DynSeg){ clip_s, mid, true };
+                voice_segs[1] = (DynSeg){ mid, clip_e, true };
+                num_voice = 2;
+            } else {
+                continue;
+            }
+        }
+
+        // Build final output segments for this clip
+        DynSeg final_segs[512];
+        int num_final = 0;
+        if (g_dyn_split.remove_silent_areas) {
+            for (int v = 0; v < num_voice && num_final < 512; v++) {
+                if (voice_segs[v].e - voice_segs[v].s >= min_slice_sec) {
+                    final_segs[num_final++] = voice_segs[v];
+                }
+            }
+        } else {
+            // Keep both active and silent intervals as split clips
+            double cur_p = clip_s;
+            for (int v = 0; v < num_voice && num_final < 510; v++) {
+                if (voice_segs[v].s > cur_p + min_slice_sec) {
+                    final_segs[num_final++] = (DynSeg){ cur_p, voice_segs[v].s, false };
+                }
+                final_segs[num_final++] = voice_segs[v];
+                cur_p = voice_segs[v].e;
+            }
+            if (clip_e > cur_p + min_slice_sec && num_final < 512) {
+                final_segs[num_final++] = (DynSeg){ cur_p, clip_e, false };
+            }
+        }
+
+        if (num_final == 0) continue;
+
+        // Commit slices under audio device lock so audio thread never reads mid-mutation items
+        g_engine_processing = true;
+        if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
+
+        float orig_vol   = g_item_vol_db[tab][idx];
+        bool  orig_mute  = g_item_muted[tab][idx];
+        int   orig_color = g_item_color_idx[tab][idx];
+        int   orig_grp   = g_item_group_id[tab][idx];
+
+        // Update first slice in-place at `idx`
+        p->items[idx].start_time     = final_segs[0].s;
+        p->items[idx].offset_in_file = src_copy.offset_in_file + (final_segs[0].s - clip_s);
+        p->items[idx].duration       = final_segs[0].e - final_segs[0].s;
+        p->items[idx].is_selected    = true;
+        g_item_fade_in[tab][idx]     = fmin(0.010, p->items[idx].duration * 0.2);
+        g_item_fade_out[tab][idx]    = fmin(0.010, p->items[idx].duration * 0.2);
+        total_created_slices++;
+
+        // Append remaining slices (1 .. num_final - 1)
+        for (int s = 1; s < num_final && p->num_items < MAX_ITEMS; s++) {
+            int ni = p->num_items++;
+            AudioItem *dst = &p->items[ni];
+            memcpy(dst, &src_copy, sizeof(AudioItem));
+            dst->start_time     = final_segs[s].s;
+            dst->offset_in_file = src_copy.offset_in_file + (final_segs[s].s - clip_s);
+            dst->duration       = final_segs[s].e - final_segs[s].s;
+            dst->is_selected    = true;
+            dst->peaks          = NULL;
+            if (src_copy.peak_count > 0 && src_copy.peaks) {
+                dst->peaks = (PeakBin *)calloc((size_t)src_copy.peak_count, sizeof(PeakBin));
+                if (dst->peaks) {
+                    memcpy(dst->peaks, src_copy.peaks, (size_t)src_copy.peak_count * sizeof(PeakBin));
+                }
+            }
+            dst->raw_file_handle = dst->raw_audio_path[0] ? fopen(dst->raw_audio_path, "rb") : NULL;
+            g_item_fade_in[tab][ni]   = fmin(0.010, dst->duration * 0.2);
+            g_item_fade_out[tab][ni]  = fmin(0.010, dst->duration * 0.2);
+            g_item_vol_db[tab][ni]    = orig_vol;
+            g_item_muted[tab][ni]     = orig_mute;
+            g_item_color_idx[tab][ni] = orig_color;
+            g_item_group_id[tab][ni]  = orig_grp;
+            total_created_slices++;
+        }
+
+        if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
+        g_engine_processing = false;
     }
 
-    g_dyn_split.is_open = false;
-    if (total_splits_made > 0) {
+    show_processing_wait_modal(ren, win, "Dynamic Split Complete", "Stabilized timeline clips.", 100);
+    finish_processing_wait_modal(220);
+
+    if (total_created_slices > 0) {
         record_project_change("Dynamic Split Items", true);
     }
 }
@@ -4070,6 +4266,10 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             g_dyn_split.status_msg[0] = '\0';
             break;
         }
+        case ACT_ITEM_JOIN_GLUE: {
+            execute_join_glue_selected_items(p, ren, win);
+            break;
+        }
         case ACT_ITEM_MOVE_UP_TRACK: {
             bool moved = false;
             for (int i = 0; i < p->num_items; i++) {
@@ -4322,17 +4522,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                 }
                 record_project_change("Removed Selected Media Item(s)", true);
             } else {
-                bool removed_trk = false;
-                push_undo_state();
-                for (int t = p->num_tracks - 1; t >= 0; t--) {
-                    if (p->track_selected[t] && p->num_tracks > 1) {
-                        delete_track_at_index(p, t);
-                        removed_trk = true;
-                    }
-                }
-                if (removed_trk) {
-                    record_project_change("Removed Selected Track(s)", true);
-                }
+                request_delete_selected_tracks_with_prompt(p);
             }
             break;
         }
@@ -4629,13 +4819,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_TRACK_REMOVE_SELECTED: {
-            push_undo_state();
-            for (int t = p->num_tracks - 1; t >= 0; t--) {
-                if (p->track_selected[t] && p->num_tracks > 1) {
-                    delete_track_at_index(p, t);
-                }
-            }
-            record_project_change("Removed Selected Track(s)", true);
+            request_delete_selected_tracks_with_prompt(p);
             break;
         }
         case ACT_TRACK_SELECT_ALL: {
@@ -4731,6 +4915,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_TRANSPORT_GO_TO_START: {
             p->playhead_seconds = 0.0;
             p->scroll_x_sec = 0.0;
+            ensure_playhead_visible_in_viewport(p, view_w);
             break;
         }
         case ACT_TRANSPORT_GO_TO_END: {
@@ -4740,6 +4925,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                 if (ie > max_e) max_e = ie;
             }
             p->playhead_seconds = max_e;
+            ensure_playhead_visible_in_viewport(p, view_w);
             break;
         }
         case ACT_TRANSPORT_TOGGLE_REPEAT_RANGE: {
@@ -4747,12 +4933,24 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_EDIT_COPY: {
-            copy_selected_items_to_clipboard(p);
-            record_project_change("Edit: Copy", false);
+            bool any_clip_sel = false;
+            for (int i = 0; i < p->num_items; i++) {
+                if (p->items[i].is_selected) { any_clip_sel = true; break; }
+            }
+            if (any_clip_sel) {
+                copy_selected_items_to_clipboard(p);
+                g_last_copied_is_track = false;
+                record_project_change("Copied Selected Clip(s)", false);
+            } else {
+                copy_selected_tracks_to_clipboard(p);
+                g_last_copied_is_track = true;
+                record_project_change("Copied Selected Track(s)", false);
+            }
             break;
         }
         case ACT_EDIT_CUT: {
             copy_selected_items_to_clipboard(p);
+            g_last_copied_is_track = false;
             if (g_clipboard_count > 0) {
                 push_undo_state();
                 for (int i = p->num_items - 1; i >= 0; i--) {
@@ -4765,7 +4963,14 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_EDIT_PASTE: {
-            paste_clipboard_items_at_playhead(p);
+            if (g_last_copied_is_track) {
+                paste_tracks_at_bottom_of_selected(p);
+            } else if (g_clipboard_count > 0) {
+                paste_clipboard_items_at_playhead(p);
+                ensure_playhead_visible_in_viewport(p, view_w);
+            } else {
+                paste_tracks_at_bottom_of_selected(p);
+            }
             break;
         }
         case ACT_EDIT_UNDO: {
@@ -4857,7 +5062,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_FILE_OPEN_PROJECT: {
-            daw_load_project_dialog(p, ren, win);
+            request_open_project_with_save_prompt(p, ren, win);
             break;
         }
         case ACT_FILE_SAVE_PROJECT: {
