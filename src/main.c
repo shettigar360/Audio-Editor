@@ -796,7 +796,7 @@ static ThemeManagerState g_theme = {
     ""
 };
 
-// Script Manager window scrolling, edge-resize, and status state
+// Script Manager window scrolling, edge-resize, search filter, pin & row move state
 static int  g_script_scroll_y = 0;
 static bool g_script_sb_dragging = false;
 static int  g_script_sb_start_my = 0;
@@ -804,8 +804,219 @@ static int  g_script_sb_orig_scroll = 0;
 static int  g_script_resize_edge = 0;
 static int  g_script_resize_start_mx = 0;
 static int  g_script_resize_start_my = 0;
-static SDL_Rect g_script_resize_orig_rect = { 390, 140, 480, 320 };
+static SDL_Rect g_script_resize_orig_rect = { 360, 120, 560, 380 };
 static char g_script_status_msg[128] = "";
+static char g_script_filter_text[128] = "";
+static bool g_script_filter_focused = false;
+static bool g_script_pinned[64] = { false };
+static int  g_script_filtered_indices[64] = { 0 };
+static int  g_script_num_filtered = 0;
+
+// Anchor indices for standard Shift+Click range selection on tracks and clips
+static int g_last_clicked_track_idx = -1;
+static int g_last_clicked_item_idx = -1;
+
+// ================= REAPER-STYLE DYNAMIC SPLIT ITEMS POPUP STATE =================
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+
+    // Split points
+    bool split_at_transients;
+    bool split_when_gate_opens;
+    bool split_when_gate_closes;
+    bool reduce_splits_enabled;
+    int  reduce_splits_val;      // e.g. 11 (1..100)
+    int  min_slice_ms;           // e.g. 20 ms
+    int  min_silence_ms;         // e.g. 500 ms
+
+    // Gate
+    float gate_threshold_db;     // e.g. -50.0 dB (-90.0 .. 0.0)
+    float gate_hysteresis_db;    // e.g. -6.0 dB (-24.0 .. 0.0)
+    bool  display_gate_threshold;
+
+    // Action to perform
+    int  action_mode;            // 0 = "Split selected items", 1 = "Split selected and grouped items"
+    bool set_timebase_to_beats;
+    bool set_snap_offset_peak;
+    int  snap_offset_first_ms;   // e.g. 50 ms
+    bool remove_silent_areas;    // default true
+    int  leading_pad_ms;         // e.g. 50 ms
+    int  trailing_pad_ms;        // e.g. 150 ms
+    bool fade_pad;
+    bool create_chromatic_midi;
+
+    // Interactive slider & text input state
+    int  dragging_slider_id;     // 0=none, 1=reduce, 2=min_slice, 3=min_silence, 4=threshold, 5=hysteresis
+    int  editing_field_id;       // 0=none, 1=reduce, 2=min_slice, 3=min_silence, 4=threshold, 5=hysteresis, 6=snap, 7=lead, 8=trail
+    char edit_buf[32];
+    char status_msg[128];
+} DynamicSplitState;
+
+static DynamicSplitState g_dyn_split = {
+    false,
+    { 390, 58, 500, 566 },
+    false, 0, 0,
+    false, false, true,
+    false, 11,
+    20,
+    500,
+    -50.0f,
+    -6.0f,
+    false,
+    0,
+    false,
+    false, 50,
+    true,
+    50, 150, false,
+    false,
+    0, 0, "", ""
+};
+
+// ================= REPOSITION ITEMS POPUP STATE =================
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    int mode;                // 0 = Item start, 1 = Item end (default 1 matching screenshot)
+    double interval_sec;     // default 1.00 seconds
+    char interval_str[32];   // "1.00"
+    bool interval_focused;
+} RepositionDialogState;
+
+static RepositionDialogState g_reposition = {
+    false,
+    { 450, 210, 380, 220 },
+    false, 0, 0,
+    1,
+    1.00,
+    "1.00",
+    false
+};
+
+// ================= AUDIO RECORDING ENGINE STATE =================
+typedef struct {
+    bool is_recording;
+    int rec_track_idx;
+    int rec_item_idx;
+    double rec_start_time_sec;
+    uint32_t rec_frames_written;
+    SDL_AudioDeviceID capture_dev;
+    FILE *wav_file;
+    FILE *raw_cache_file;
+    char current_wav_path[512];
+    char current_raw_path[512];
+    char folder_path[512];
+    float cur_bin_min;
+    float cur_bin_max;
+    int samples_in_bin;
+    int allocated_bins;
+    Uint32 start_ticks;
+    bool folder_initialized;
+} RecordingEngineState;
+
+static RecordingEngineState g_rec = {
+    false,
+    0, -1, 0.0, 0, 0,
+    NULL, NULL,
+    "", "",
+    "C:\\Users\\USER\\Documents\\Recordings",
+    0.0f, 0.0f, 0, 0, 0,
+    false
+};
+
+static inline void init_default_recording_folder(void) {
+    if (g_rec.folder_initialized) return;
+    g_rec.folder_initialized = true;
+    const char *user_prof = getenv("USERPROFILE");
+    if (user_prof && user_prof[0]) {
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Documents\\Recordings", user_prof);
+    } else {
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "C:\\Users\\USER\\Documents\\Recordings");
+    }
+}
+
+// ================= LUA & PYTHON CUSTOM SCRIPT POPUP WINDOW STATE =================
+#define MAX_SCRIPT_POPUP_CONTROLS 8
+typedef enum {
+    SCP_CTRL_INPUT = 0,
+    SCP_CTRL_SLIDER = 1,
+    SCP_CTRL_CHECKBOX = 2,
+    SCP_CTRL_LABEL = 3
+} ScriptPopupControlType;
+
+typedef struct {
+    ScriptPopupControlType type;
+    char label[64];
+    char var_name[48];
+    char str_val[128];
+    double num_val;
+    double min_val;
+    double max_val;
+    bool bool_val;
+} ScriptPopupControl;
+
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    char title[128];
+    char script_filepath[512];
+    bool is_python;
+    int num_controls;
+    ScriptPopupControl controls[MAX_SCRIPT_POPUP_CONTROLS];
+    int focused_ctrl_idx;
+    int dragging_slider_idx;
+    char status_msg[128];
+} ScriptPopupWindowState;
+
+static ScriptPopupWindowState g_script_popup = {
+    false,
+    { 400, 140, 480, 340 },
+    false, 0, 0,
+    "Script Popup Window",
+    "",
+    false,
+    0,
+    {{SCP_CTRL_INPUT, "", "", "", 0.0, 0.0, 100.0, false}},
+    -1, -1, ""
+};
+
+// Draws a crisp Pushpin symbol at (cx, cy) for pinned Actions and Scripts
+static inline void draw_pin_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool is_pinned, SDL_Color col) {
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
+    // Top flat head of pushpin
+    SDL_RenderDrawLine(ren, cx + 2, cy + 1, cx + 8, cy + 1);
+    SDL_RenderDrawLine(ren, cx + 3, cy + 2, cx + 7, cy + 2);
+    // Body of pushpin
+    SDL_Rect body = { cx + 3, cy + 3, 5, 4 };
+    if (is_pinned) {
+        SDL_RenderFillRect(ren, &body);
+    } else {
+        SDL_RenderDrawRect(ren, &body);
+    }
+    // Wide flange
+    SDL_RenderDrawLine(ren, cx + 1, cy + 7, cx + 9, cy + 7);
+    SDL_RenderDrawLine(ren, cx + 2, cy + 8, cx + 8, cy + 8);
+    // Needle tip pointing down
+    SDL_RenderDrawLine(ren, cx + 5, cy + 9, cx + 5, cy + 12);
+}
+
+// Draws a filled circle at center (cx, cy) with radius r (used for the red recording dot near the time clock)
+static inline void draw_filled_circle_sdl(SDL_Renderer *ren, int cx, int cy, int r, Uint8 cr, Uint8 cg, Uint8 cb, Uint8 ca) {
+    SDL_SetRenderDrawColor(ren, cr, cg, cb, ca);
+    for (int dy = -r; dy <= r; dy++) {
+        int dx = (int)sqrtf((float)(r * r - dy * dy));
+        SDL_RenderDrawLine(ren, cx - dx, cy + dy, cx + dx, cy + dy);
+    }
+}
 
 static inline void theme_hsv_to_rgb(float h, float s, float v, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
     if (s < 0.0f) s = 0.0f;
@@ -932,6 +1143,7 @@ static void init_default_saved_themes(void) {
         st->a = defs[i].a;
     }
 }
+static void save_themes_settings_json(void);
 #endif // DAW_THEME_STATE_DEFINED
 
 // Helper to draw a 1px or 2px THEME-COLORED border rectangle across all UI elements (default Orange)
@@ -1201,6 +1413,593 @@ static void render_themes_popup_window(SDL_Renderer *ren) {
         : "Saved permanently to themes_settings.json & keyboard_shortcuts.json";
     SDL_Rect st_clip = { wx + 18, wy + wh - 28, ww - 36, 20 };
     draw_text_clipped(ren, st_txt, wx + 18, wy + wh - 24, c_muted, &st_clip, NULL);
+}
+
+// Generates a 64x64 studio audio-editing app icon surface (dark studio console, glowing orange waveform, red REC badge)
+// and attaches it to the SDL window.
+static void set_daw_window_thumbnail_icon(SDL_Window *win) {
+    if (!win) return;
+    static uint32_t icon_px[64 * 64];
+    for (int y = 0; y < 64; y++) {
+        for (int x = 0; x < 64; x++) {
+            uint8_t r = 22, g = 20, b = 18, a = 255;
+            // Rounded corner mask
+            int dx = (x < 8) ? (8 - x) : ((x > 55) ? (x - 55) : 0);
+            int dy = (y < 8) ? (8 - y) : ((y > 55) ? (y - 55) : 0);
+            if (dx * dx + dy * dy > 64) {
+                icon_px[y * 64 + x] = 0x00000000;
+                continue;
+            }
+            // Outer copper-orange border
+            if (x <= 2 || x >= 61 || y <= 2 || y >= 61 || (dx * dx + dy * dy >= 42)) {
+                r = 215; g = 138; b = 62;
+            } else {
+                // Subtle center horizontal axis line
+                if (y == 34) { r = 90; g = 62; b = 38; }
+                // Synthesized audio waveform bars across x = 8..55
+                if (x >= 8 && x <= 55) {
+                    float u = (float)(x - 8) / 47.0f;
+                    float env = sinf(u * 3.14159265f);
+                    float wave = fabsf(sinf(u * 18.84955f) * 0.7f + cosf(u * 9.42477f) * 0.3f);
+                    int half_h = (int)(env * wave * 20.0f) + 2;
+                    if (abs(y - 34) <= half_h) {
+                        if (abs(y - 34) <= half_h / 2) {
+                            r = 255; g = 185; b = 75;
+                        } else {
+                            r = 215; g = 125; b = 45;
+                        }
+                    }
+                }
+                // Red round REC dot in top-right corner of the app icon (center 50, 14, radius 5)
+                int rdx = x - 50, rdy = y - 14;
+                if (rdx * rdx + rdy * rdy <= 25) {
+                    r = 240; g = 42; b = 42;
+                }
+            }
+            icon_px[y * 64 + x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+    SDL_Surface *surf = SDL_CreateRGBSurfaceFrom(
+        icon_px, 64, 64, 32, 64 * 4,
+        0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000
+    );
+    if (surf) {
+        SDL_SetWindowIcon(win, surf);
+        SDL_FreeSurface(surf);
+    }
+}
+
+// Renders the REAPER-style "Dynamic split items" popup window (matching Screenshot 2026-10-21 072355.png)
+static void render_dynamic_split_window(SDL_Renderer *ren) {
+    if (!g_dyn_split.is_open) return;
+
+    SDL_Rect *wr = &g_dyn_split.win_rect;
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    // Shadow
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    // Window Body
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    // Title Bar
+    SDL_Rect hdr = { wx, wy, ww, 30 };
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Dynamic split items", wx + 14, wy + 9, c_white);
+    draw_pin_symbol_icon(ren, wx + ww - 46, wy + 9, true, c_accent);
+    draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
+
+    // ---- Group 1: Split points ----
+    SDL_Rect grp1 = { wx + 14, wy + 40, ww - 28, 174 };
+    SDL_SetRenderDrawColor(ren, 21, 20, 19, 255);
+    SDL_RenderFillRect(ren, &grp1);
+    draw_brown_border_rect(ren, &grp1, false, true);
+    draw_text(ren, "Split points", wx + 22, wy + 46, c_accent);
+
+    // Row of 3 checkboxes: [ ] At transients   [ ] When gate opens   [x] When gate closes
+    int cb_y = wy + 68;
+    struct { int x; bool val; const char *lbl; } sp_cbs[3] = {
+        { wx + 36,  g_dyn_split.split_at_transients,   "At transients" },
+        { wx + 168, g_dyn_split.split_when_gate_opens, "When gate opens" },
+        { wx + 324, g_dyn_split.split_when_gate_closes,"When gate closes" }
+    };
+    for (int i = 0; i < 3; i++) {
+        SDL_Rect cb = { sp_cbs[i].x, cb_y, 16, 16 };
+        SDL_SetRenderDrawColor(ren, sp_cbs[i].val ? hr + 20 : 14, sp_cbs[i].val ? hg + 15 : 14, sp_cbs[i].val ? hb + 10 : 14, 255);
+        SDL_RenderFillRect(ren, &cb);
+        draw_brown_border_rect(ren, &cb, sp_cbs[i].val, false);
+        if (sp_cbs[i].val) draw_text(ren, "x", cb.x + 4, cb.y + 1, c_white);
+        draw_text(ren, sp_cbs[i].lbl, cb.x + 22, cb_y + 1, c_white);
+    }
+
+    // Slider helper lambda-style macro for consistent REAPER slider track + round knob + numeric input box
+    int sl_x = wx + 162, sl_w = 232;
+    int box_x = wx + 404, box_w = 54;
+
+    // 1A. [ ] Reduce splits: slider + box
+    int r_red_y = wy + 100;
+    SDL_Rect cb_red = { wx + 24, r_red_y + 2, 16, 16 };
+    SDL_SetRenderDrawColor(ren, g_dyn_split.reduce_splits_enabled ? hr + 20 : 14,
+                                g_dyn_split.reduce_splits_enabled ? hg + 15 : 14,
+                                g_dyn_split.reduce_splits_enabled ? hb + 10 : 14, 255);
+    SDL_RenderFillRect(ren, &cb_red);
+    draw_brown_border_rect(ren, &cb_red, g_dyn_split.reduce_splits_enabled, false);
+    if (g_dyn_split.reduce_splits_enabled) draw_text(ren, "x", cb_red.x + 4, cb_red.y + 1, c_white);
+    draw_text(ren, "Reduce splits:", wx + 46, r_red_y + 3, c_white);
+
+    SDL_Rect trk_red = { sl_x, r_red_y + 7, sl_w, 6 };
+    SDL_SetRenderDrawColor(ren, 14, 14, 14, 255);
+    SDL_RenderFillRect(ren, &trk_red);
+    draw_brown_border_rect(ren, &trk_red, false, true);
+    float u_red = (float)(g_dyn_split.reduce_splits_val - 1) / 99.0f;
+    if (u_red < 0.0f) u_red = 0.0f; else if (u_red > 1.0f) u_red = 1.0f;
+    int kx_red = sl_x + (int)(u_red * (float)(sl_w - 12));
+    SDL_Rect knob_red = { kx_red, r_red_y + 1, 12, 18 };
+    SDL_SetRenderDrawColor(ren, hr + 35, hg + 25, hb + 15, 255);
+    SDL_RenderFillRect(ren, &knob_red);
+    draw_brown_border_rect(ren, &knob_red, true, false);
+
+    SDL_Rect bx_red = { box_x, r_red_y - 1, box_w, 22 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &bx_red);
+    draw_brown_border_rect(ren, &bx_red, g_dyn_split.editing_field_id == 1, false);
+    char buf_red[32];
+    snprintf(buf_red, sizeof(buf_red), "%d", g_dyn_split.reduce_splits_val);
+    draw_text(ren, (g_dyn_split.editing_field_id == 1) ? g_dyn_split.edit_buf : buf_red, bx_red.x + 6, r_red_y + 3, c_white);
+
+    // 1B. Min slice length: slider + box + ms
+    int r_slc_y = wy + 136;
+    draw_text(ren, "Min slice length:", wx + 24, r_slc_y + 3, c_white);
+    SDL_Rect trk_slc = { sl_x, r_slc_y + 7, sl_w, 6 };
+    SDL_SetRenderDrawColor(ren, 14, 14, 14, 255);
+    SDL_RenderFillRect(ren, &trk_slc);
+    draw_brown_border_rect(ren, &trk_slc, false, true);
+    float u_slc = (float)(g_dyn_split.min_slice_ms - 1) / 999.0f;
+    if (u_slc < 0.0f) u_slc = 0.0f; else if (u_slc > 1.0f) u_slc = 1.0f;
+    int kx_slc = sl_x + (int)(u_slc * (float)(sl_w - 12));
+    SDL_Rect knob_slc = { kx_slc, r_slc_y + 1, 12, 18 };
+    SDL_SetRenderDrawColor(ren, hr + 35, hg + 25, hb + 15, 255);
+    SDL_RenderFillRect(ren, &knob_slc);
+    draw_brown_border_rect(ren, &knob_slc, true, false);
+
+    SDL_Rect bx_slc = { box_x, r_slc_y - 1, box_w, 22 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &bx_slc);
+    draw_brown_border_rect(ren, &bx_slc, g_dyn_split.editing_field_id == 2, false);
+    char buf_slc[32];
+    snprintf(buf_slc, sizeof(buf_slc), "%d", g_dyn_split.min_slice_ms);
+    draw_text(ren, (g_dyn_split.editing_field_id == 2) ? g_dyn_split.edit_buf : buf_slc, bx_slc.x + 6, r_slc_y + 3, c_white);
+    draw_text(ren, "ms", box_x + box_w + 6, r_slc_y + 3, c_muted);
+
+    // 1C. Min silence length: slider + box + ms
+    int r_sil_y = wy + 172;
+    draw_text(ren, "Min silence length:", wx + 24, r_sil_y + 3, c_white);
+    SDL_Rect trk_sil = { sl_x, r_sil_y + 7, sl_w, 6 };
+    SDL_SetRenderDrawColor(ren, 14, 14, 14, 255);
+    SDL_RenderFillRect(ren, &trk_sil);
+    draw_brown_border_rect(ren, &trk_sil, false, true);
+    float u_sil = (float)(g_dyn_split.min_silence_ms - 10) / 1990.0f;
+    if (u_sil < 0.0f) u_sil = 0.0f; else if (u_sil > 1.0f) u_sil = 1.0f;
+    int kx_sil = sl_x + (int)(u_sil * (float)(sl_w - 12));
+    SDL_Rect knob_sil = { kx_sil, r_sil_y + 1, 12, 18 };
+    SDL_SetRenderDrawColor(ren, hr + 35, hg + 25, hb + 15, 255);
+    SDL_RenderFillRect(ren, &knob_sil);
+    draw_brown_border_rect(ren, &knob_sil, true, false);
+
+    SDL_Rect bx_sil = { box_x, r_sil_y - 1, box_w, 22 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &bx_sil);
+    draw_brown_border_rect(ren, &bx_sil, g_dyn_split.editing_field_id == 3, false);
+    char buf_sil[32];
+    snprintf(buf_sil, sizeof(buf_sil), "%d", g_dyn_split.min_silence_ms);
+    draw_text(ren, (g_dyn_split.editing_field_id == 3) ? g_dyn_split.edit_buf : buf_sil, bx_sil.x + 6, r_sil_y + 3, c_white);
+    draw_text(ren, "ms", box_x + box_w + 6, r_sil_y + 3, c_muted);
+
+    // ---- Group 2: Gate ----
+    SDL_Rect grp2 = { wx + 14, wy + 222, ww - 28, 126 };
+    SDL_SetRenderDrawColor(ren, 21, 20, 19, 255);
+    SDL_RenderFillRect(ren, &grp2);
+    draw_brown_border_rect(ren, &grp2, false, true);
+    draw_text(ren, "Gate", wx + 22, wy + 228, c_accent);
+
+    // 2A. Threshold: slider + box + dB
+    int r_thr_y = wy + 252;
+    draw_text(ren, "Threshold:", wx + 72, r_thr_y + 3, c_white);
+    SDL_Rect trk_thr = { sl_x, r_thr_y + 7, sl_w, 6 };
+    SDL_SetRenderDrawColor(ren, 14, 14, 14, 255);
+    SDL_RenderFillRect(ren, &trk_thr);
+    draw_brown_border_rect(ren, &trk_thr, false, true);
+    float u_thr = (g_dyn_split.gate_threshold_db + 90.0f) / 90.0f;
+    if (u_thr < 0.0f) u_thr = 0.0f; else if (u_thr > 1.0f) u_thr = 1.0f;
+    int kx_thr = sl_x + (int)(u_thr * (float)(sl_w - 12));
+    SDL_Rect knob_thr = { kx_thr, r_thr_y + 1, 12, 18 };
+    SDL_SetRenderDrawColor(ren, hr + 35, hg + 25, hb + 15, 255);
+    SDL_RenderFillRect(ren, &knob_thr);
+    draw_brown_border_rect(ren, &knob_thr, true, false);
+
+    SDL_Rect bx_thr = { box_x, r_thr_y - 1, box_w, 22 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &bx_thr);
+    draw_brown_border_rect(ren, &bx_thr, g_dyn_split.editing_field_id == 4, false);
+    char buf_thr[32];
+    snprintf(buf_thr, sizeof(buf_thr), "%.1f", g_dyn_split.gate_threshold_db);
+    draw_text(ren, (g_dyn_split.editing_field_id == 4) ? g_dyn_split.edit_buf : buf_thr, bx_thr.x + 4, r_thr_y + 3, c_white);
+    draw_text(ren, "dB", box_x + box_w + 6, r_thr_y + 3, c_muted);
+
+    // 2B. Hysteresis: slider + box + dB
+    int r_hys_y = wy + 286;
+    draw_text(ren, "Hysteresis:", wx + 64, r_hys_y + 3, c_white);
+    SDL_Rect trk_hys = { sl_x, r_hys_y + 7, sl_w, 6 };
+    SDL_SetRenderDrawColor(ren, 14, 14, 14, 255);
+    SDL_RenderFillRect(ren, &trk_hys);
+    draw_brown_border_rect(ren, &trk_hys, false, true);
+    float u_hys = (g_dyn_split.gate_hysteresis_db + 24.0f) / 24.0f;
+    if (u_hys < 0.0f) u_hys = 0.0f; else if (u_hys > 1.0f) u_hys = 1.0f;
+    int kx_hys = sl_x + (int)(u_hys * (float)(sl_w - 12));
+    SDL_Rect knob_hys = { kx_hys, r_hys_y + 1, 12, 18 };
+    SDL_SetRenderDrawColor(ren, hr + 35, hg + 25, hb + 15, 255);
+    SDL_RenderFillRect(ren, &knob_hys);
+    draw_brown_border_rect(ren, &knob_hys, true, false);
+
+    SDL_Rect bx_hys = { box_x, r_hys_y - 1, box_w, 22 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &bx_hys);
+    draw_brown_border_rect(ren, &bx_hys, g_dyn_split.editing_field_id == 5, false);
+    char buf_hys[32];
+    snprintf(buf_hys, sizeof(buf_hys), "%.1f", g_dyn_split.gate_hysteresis_db);
+    draw_text(ren, (g_dyn_split.editing_field_id == 5) ? g_dyn_split.edit_buf : buf_hys, bx_hys.x + 4, r_hys_y + 3, c_white);
+    draw_text(ren, "dB", box_x + box_w + 6, r_hys_y + 3, c_muted);
+
+    // 2C. [ ] Display gate threshold in media items
+    int r_dgt_y = wy + 318;
+    SDL_Rect cb_dgt = { wx + 28, r_dgt_y, 16, 16 };
+    SDL_SetRenderDrawColor(ren, g_dyn_split.display_gate_threshold ? hr + 20 : 14,
+                                g_dyn_split.display_gate_threshold ? hg + 15 : 14,
+                                g_dyn_split.display_gate_threshold ? hb + 10 : 14, 255);
+    SDL_RenderFillRect(ren, &cb_dgt);
+    draw_brown_border_rect(ren, &cb_dgt, g_dyn_split.display_gate_threshold, false);
+    if (g_dyn_split.display_gate_threshold) draw_text(ren, "x", cb_dgt.x + 4, cb_dgt.y + 1, c_white);
+    draw_text(ren, "Display gate threshold in media items", wx + 52, r_dgt_y + 1, c_white);
+
+    // ---- Group 3: Action to perform ----
+    SDL_Rect grp3 = { wx + 14, wy + 356, ww - 28, 156 };
+    SDL_SetRenderDrawColor(ren, 21, 20, 19, 255);
+    SDL_RenderFillRect(ren, &grp3);
+    draw_brown_border_rect(ren, &grp3, false, true);
+    draw_text(ren, "Action to perform", wx + 22, wy + 362, c_accent);
+
+    SDL_Rect act_dd = { wx + 28, wy + 382, ww - 56, 24 };
+    SDL_SetRenderDrawColor(ren, 32, 28, 25, 255);
+    SDL_RenderFillRect(ren, &act_dd);
+    draw_brown_border_rect(ren, &act_dd, false, false);
+    const char *act_modes[2] = { "Split selected items", "Split selected and grouped items" };
+    draw_text(ren, act_modes[g_dyn_split.action_mode & 1], act_dd.x + 8, act_dd.y + 5, c_white);
+    draw_text(ren, "v", act_dd.x + act_dd.w - 18, act_dd.y + 5, c_muted);
+
+    // [ ] Set new item timebase to beats
+    int r_tb_y = wy + 412;
+    SDL_Rect cb_tb = { wx + 28, r_tb_y, 16, 16 };
+    SDL_SetRenderDrawColor(ren, g_dyn_split.set_timebase_to_beats ? hr + 20 : 14,
+                                g_dyn_split.set_timebase_to_beats ? hg + 15 : 14,
+                                g_dyn_split.set_timebase_to_beats ? hb + 10 : 14, 255);
+    SDL_RenderFillRect(ren, &cb_tb);
+    draw_brown_border_rect(ren, &cb_tb, g_dyn_split.set_timebase_to_beats, false);
+    if (g_dyn_split.set_timebase_to_beats) draw_text(ren, "x", cb_tb.x + 4, cb_tb.y + 1, c_white);
+    draw_text(ren, "Set new item timebase to beats", wx + 52, r_tb_y + 1, c_white);
+
+    // [ ] Set snap offset to peak value within first: [ 50 ] ms
+    int r_so_y = wy + 434;
+    SDL_Rect cb_so = { wx + 28, r_so_y, 16, 16 };
+    SDL_SetRenderDrawColor(ren, g_dyn_split.set_snap_offset_peak ? hr + 20 : 14,
+                                g_dyn_split.set_snap_offset_peak ? hg + 15 : 14,
+                                g_dyn_split.set_snap_offset_peak ? hb + 10 : 14, 255);
+    SDL_RenderFillRect(ren, &cb_so);
+    draw_brown_border_rect(ren, &cb_so, g_dyn_split.set_snap_offset_peak, false);
+    if (g_dyn_split.set_snap_offset_peak) draw_text(ren, "x", cb_so.x + 4, cb_so.y + 1, c_white);
+    draw_text(ren, "Set snap offset to peak value within first:", wx + 52, r_so_y + 1, c_white);
+
+    SDL_Rect bx_so = { wx + 372, r_so_y - 2, 48, 20 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &bx_so);
+    draw_brown_border_rect(ren, &bx_so, g_dyn_split.editing_field_id == 6, false);
+    char buf_so[32];
+    snprintf(buf_so, sizeof(buf_so), "%d", g_dyn_split.snap_offset_first_ms);
+    draw_text(ren, (g_dyn_split.editing_field_id == 6) ? g_dyn_split.edit_buf : buf_so, bx_so.x + 6, r_so_y + 1, c_white);
+    draw_text(ren, "ms", wx + 426, r_so_y + 1, c_muted);
+
+    // [x] Remove silent areas (requires splitting on gate close)
+    int r_rm_y = wy + 456;
+    SDL_Rect cb_rm = { wx + 28, r_rm_y, 16, 16 };
+    SDL_SetRenderDrawColor(ren, g_dyn_split.remove_silent_areas ? hr + 20 : 14,
+                                g_dyn_split.remove_silent_areas ? hg + 15 : 14,
+                                g_dyn_split.remove_silent_areas ? hb + 10 : 14, 255);
+    SDL_RenderFillRect(ren, &cb_rm);
+    draw_brown_border_rect(ren, &cb_rm, g_dyn_split.remove_silent_areas, false);
+    if (g_dyn_split.remove_silent_areas) draw_text(ren, "x", cb_rm.x + 4, cb_rm.y + 1, c_white);
+    draw_text(ren, "Remove silent areas (requires splitting on gate close)", wx + 52, r_rm_y + 1, c_white);
+
+    // Leading pad: [ 50 ] ms   Trailing pad: [ 150 ] ms   [ ] Fade pad
+    int r_pad_y = wy + 480;
+    draw_text(ren, "Leading pad:", wx + 28, r_pad_y + 2, c_white);
+    SDL_Rect bx_lp = { wx + 128, r_pad_y - 1, 46, 20 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &bx_lp);
+    draw_brown_border_rect(ren, &bx_lp, g_dyn_split.editing_field_id == 7, false);
+    char buf_lp[32];
+    snprintf(buf_lp, sizeof(buf_lp), "%d", g_dyn_split.leading_pad_ms);
+    draw_text(ren, (g_dyn_split.editing_field_id == 7) ? g_dyn_split.edit_buf : buf_lp, bx_lp.x + 6, r_pad_y + 2, c_white);
+    draw_text(ren, "ms", wx + 178, r_pad_y + 2, c_muted);
+
+    draw_text(ren, "Trailing pad:", wx + 206, r_pad_y + 2, c_white);
+    SDL_Rect bx_tp = { wx + 306, r_pad_y - 1, 46, 20 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &bx_tp);
+    draw_brown_border_rect(ren, &bx_tp, g_dyn_split.editing_field_id == 8, false);
+    char buf_tp[32];
+    snprintf(buf_tp, sizeof(buf_tp), "%d", g_dyn_split.trailing_pad_ms);
+    draw_text(ren, (g_dyn_split.editing_field_id == 8) ? g_dyn_split.edit_buf : buf_tp, bx_tp.x + 6, r_pad_y + 2, c_white);
+    draw_text(ren, "ms", wx + 356, r_pad_y + 2, c_muted);
+
+    SDL_Rect cb_fp = { wx + 384, r_pad_y + 1, 16, 16 };
+    SDL_SetRenderDrawColor(ren, g_dyn_split.fade_pad ? hr + 20 : 14,
+                                g_dyn_split.fade_pad ? hg + 15 : 14,
+                                g_dyn_split.fade_pad ? hb + 10 : 14, 255);
+    SDL_RenderFillRect(ren, &cb_fp);
+    draw_brown_border_rect(ren, &cb_fp, g_dyn_split.fade_pad, false);
+    if (g_dyn_split.fade_pad) draw_text(ren, "x", cb_fp.x + 4, cb_fp.y + 1, c_white);
+    draw_text(ren, "Fade pad", wx + 406, r_pad_y + 2, c_white);
+
+    // ---- Bottom Buttons: [Set transient sensitivity] [Presets] [Split] [Cancel] ----
+    int btn_y = wy + wh - 42;
+    SDL_Rect b_sens = { wx + 14, btn_y, 174, 28 };
+    SDL_SetRenderDrawColor(ren, 42, 38, 34, 255);
+    SDL_RenderFillRect(ren, &b_sens);
+    draw_brown_border_rect(ren, &b_sens, false, false);
+    draw_text(ren, "Set transient sensitivity", wx + 22, btn_y + 8, c_white);
+
+    SDL_Rect b_pres = { wx + 196, btn_y, 82, 28 };
+    SDL_SetRenderDrawColor(ren, 42, 38, 34, 255);
+    SDL_RenderFillRect(ren, &b_pres);
+    draw_brown_border_rect(ren, &b_pres, false, false);
+    draw_text(ren, "Presets", wx + 210, btn_y + 8, c_white);
+
+    SDL_Rect b_split = { wx + 286, btn_y, 104, 28 };
+    SDL_SetRenderDrawColor(ren, hr + 22, hg + 14, hb + 8, 255);
+    SDL_RenderFillRect(ren, &b_split);
+    draw_brown_border_rect(ren, &b_split, true, false);
+    draw_text(ren, "Split", wx + 320, btn_y + 8, c_white);
+
+    SDL_Rect b_cancel = { wx + 398, btn_y, 88, 28 };
+    SDL_SetRenderDrawColor(ren, 44, 40, 38, 255);
+    SDL_RenderFillRect(ren, &b_cancel);
+    draw_brown_border_rect(ren, &b_cancel, false, false);
+    draw_text(ren, "Cancel", wx + 418, btn_y + 8, c_white);
+}
+
+// Commits any active numeric text box edit in Dynamic Split window
+static void commit_dyn_split_field_edit(void) {
+    if (g_dyn_split.editing_field_id <= 0) return;
+    double v = atof(g_dyn_split.edit_buf);
+    switch (g_dyn_split.editing_field_id) {
+        case 1: g_dyn_split.reduce_splits_val = (int)(v < 1 ? 1 : (v > 100 ? 100 : v)); break;
+        case 2: g_dyn_split.min_slice_ms = (int)(v < 1 ? 1 : (v > 2000 ? 2000 : v)); break;
+        case 3: g_dyn_split.min_silence_ms = (int)(v < 10 ? 10 : (v > 5000 ? 5000 : v)); break;
+        case 4: g_dyn_split.gate_threshold_db = (float)(v < -90.0 ? -90.0 : (v > 0.0 ? 0.0 : v)); break;
+        case 5: g_dyn_split.gate_hysteresis_db = (float)(v < -24.0 ? -24.0 : (v > 0.0 ? 0.0 : v)); break;
+        case 6: g_dyn_split.snap_offset_first_ms = (int)(v < 0 ? 0 : (v > 1000 ? 1000 : v)); break;
+        case 7: g_dyn_split.leading_pad_ms = (int)(v < 0 ? 0 : (v > 1000 ? 1000 : v)); break;
+        case 8: g_dyn_split.trailing_pad_ms = (int)(v < 0 ? 0 : (v > 1000 ? 1000 : v)); break;
+        default: break;
+    }
+    g_dyn_split.editing_field_id = 0;
+    SDL_StopTextInput();
+    save_themes_settings_json();
+}
+
+// Renders the "Reposition Items" popup window (matching image_4f535d.png)
+static void render_reposition_window(SDL_Renderer *ren) {
+    if (!g_reposition.is_open) return;
+
+    SDL_Rect *wr = &g_reposition.win_rect;
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_Rect hdr = { wx, wy, ww, 30 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Reposition Items", wx + 14, wy + 9, c_white);
+    draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
+
+    // Group Box: "Add time interval to"
+    SDL_Rect grp = { wx + 18, wy + 42, 210, 76 };
+    SDL_SetRenderDrawColor(ren, 20, 19, 18, 255);
+    SDL_RenderFillRect(ren, &grp);
+    draw_brown_border_rect(ren, &grp, false, true);
+    draw_text(ren, "Add time interval to", wx + 26, wy + 48, c_accent);
+
+    // Radio 0: ( ) Item start
+    bool r0 = (g_reposition.mode == 0);
+    SDL_Rect rad0 = { wx + 32, wy + 68, 14, 14 };
+    SDL_SetRenderDrawColor(ren, 14, 14, 14, 255);
+    SDL_RenderFillRect(ren, &rad0);
+    draw_brown_border_rect(ren, &rad0, r0, false);
+    if (r0) {
+        SDL_Rect dot0 = { rad0.x + 3, rad0.y + 3, 8, 8 };
+        SDL_SetRenderDrawColor(ren, c_accent.r, c_accent.g, c_accent.b, 255);
+        SDL_RenderFillRect(ren, &dot0);
+    }
+    draw_text(ren, "Item start", wx + 54, wy + 68, c_white);
+
+    // Radio 1: (*) Item end
+    bool r1 = (g_reposition.mode == 1);
+    SDL_Rect rad1 = { wx + 32, wy + 92, 14, 14 };
+    SDL_SetRenderDrawColor(ren, 14, 14, 14, 255);
+    SDL_RenderFillRect(ren, &rad1);
+    draw_brown_border_rect(ren, &rad1, r1, false);
+    if (r1) {
+        SDL_Rect dot1 = { rad1.x + 3, rad1.y + 3, 8, 8 };
+        SDL_SetRenderDrawColor(ren, c_accent.r, c_accent.g, c_accent.b, 255);
+        SDL_RenderFillRect(ren, &dot1);
+    }
+    draw_text(ren, "Item end", wx + 54, wy + 92, c_white);
+
+    // Time interval [ 1.00 ] seconds
+    int ti_y = wy + 134;
+    draw_text(ren, "Time interval", wx + 18, ti_y + 5, c_white);
+    SDL_Rect ti_box = { wx + 132, ti_y, 86, 24 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &ti_box);
+    draw_brown_border_rect(ren, &ti_box, g_reposition.interval_focused, false);
+    draw_text(ren, g_reposition.interval_str, ti_box.x + 8, ti_y + 5, c_white);
+    if (g_reposition.interval_focused && ((SDL_GetTicks() / 450) % 2 == 0)) {
+        int cx = ti_box.x + 8 + (int)strlen(g_reposition.interval_str) * 8;
+        if (cx < ti_box.x + ti_box.w - 4) {
+            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+            SDL_RenderDrawLine(ren, cx, ti_y + 4, cx, ti_y + 20);
+        }
+    }
+    draw_text(ren, "seconds", wx + 226, ti_y + 5, c_muted);
+
+    // Bottom Buttons: [ OK ]  [ Cancel ]
+    int by = wy + wh - 42;
+    SDL_Rect b_ok = { wx + ww - 204, by, 88, 28 };
+    SDL_SetRenderDrawColor(ren, hr + 22, hg + 14, hb + 8, 255);
+    SDL_RenderFillRect(ren, &b_ok);
+    draw_brown_border_rect(ren, &b_ok, true, false);
+    draw_text(ren, "OK", b_ok.x + 34, by + 8, c_white);
+
+    SDL_Rect b_cancel = { wx + ww - 104, by, 88, 28 };
+    SDL_SetRenderDrawColor(ren, 44, 40, 38, 255);
+    SDL_RenderFillRect(ren, &b_cancel);
+    draw_brown_border_rect(ren, &b_cancel, false, false);
+    draw_text(ren, "Cancel", b_cancel.x + 20, by + 8, c_white);
+}
+
+// Renders the Lua & Python Custom Script Popup Window (when a user script creates a GUI or input dialog)
+static void render_script_popup_window(SDL_Renderer *ren) {
+    if (!g_script_popup.is_open) return;
+
+    SDL_Rect *wr = &g_script_popup.win_rect;
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_Rect hdr = { wx, wy, ww, 30 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+
+    char full_title[160];
+    snprintf(full_title, sizeof(full_title), "%s [%s]",
+             g_script_popup.title, g_script_popup.is_python ? "Python" : "Lua");
+    draw_text(ren, full_title, wx + 14, wy + 9, c_white);
+    draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
+
+    for (int i = 0; i < g_script_popup.num_controls; i++) {
+        ScriptPopupControl *ctrl = &g_script_popup.controls[i];
+        int cy = wy + 46 + i * 38;
+        if (cy + 30 > wy + wh - 48) break;
+
+        if (ctrl->type == SCP_CTRL_LABEL) {
+            draw_text(ren, ctrl->str_val, wx + 20, cy + 6, c_accent);
+        } else if (ctrl->type == SCP_CTRL_CHECKBOX) {
+            SDL_Rect cb = { wx + 20, cy + 4, 18, 18 };
+            SDL_SetRenderDrawColor(ren, ctrl->bool_val ? hr + 20 : 14, ctrl->bool_val ? hg + 15 : 14, ctrl->bool_val ? hb + 10 : 14, 255);
+            SDL_RenderFillRect(ren, &cb);
+            draw_brown_border_rect(ren, &cb, ctrl->bool_val, false);
+            if (ctrl->bool_val) draw_text(ren, "x", cb.x + 5, cb.y + 2, c_white);
+            draw_text(ren, ctrl->label, wx + 46, cy + 6, c_white);
+        } else if (ctrl->type == SCP_CTRL_SLIDER) {
+            draw_text(ren, ctrl->label, wx + 20, cy + 6, c_white);
+            int sl_x = wx + 180, sl_w = ww - 270;
+            if (sl_w < 80) sl_w = 80;
+            SDL_Rect trk = { sl_x, cy + 10, sl_w, 6 };
+            SDL_SetRenderDrawColor(ren, 14, 14, 14, 255);
+            SDL_RenderFillRect(ren, &trk);
+            draw_brown_border_rect(ren, &trk, false, true);
+            double span = ctrl->max_val - ctrl->min_val;
+            float u = (span > 1e-9) ? (float)((ctrl->num_val - ctrl->min_val) / span) : 0.0f;
+            if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+            int kx = sl_x + (int)(u * (float)(sl_w - 12));
+            SDL_Rect knob = { kx, cy + 4, 12, 18 };
+            SDL_SetRenderDrawColor(ren, hr + 35, hg + 25, hb + 15, 255);
+            SDL_RenderFillRect(ren, &knob);
+            draw_brown_border_rect(ren, &knob, true, false);
+            snprintf(ctrl->str_val, sizeof(ctrl->str_val), "%.2f", ctrl->num_val);
+            draw_text(ren, ctrl->str_val, sl_x + sl_w + 10, cy + 6, c_accent);
+        } else {
+            // SCP_CTRL_INPUT
+            draw_text(ren, ctrl->label, wx + 20, cy + 6, c_white);
+            SDL_Rect ibox = { wx + 180, cy + 1, ww - 200, 24 };
+            bool is_foc = (g_script_popup.focused_ctrl_idx == i);
+            SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+            SDL_RenderFillRect(ren, &ibox);
+            draw_brown_border_rect(ren, &ibox, is_foc, false);
+            draw_text(ren, ctrl->str_val, ibox.x + 8, cy + 6, c_white);
+            if (is_foc && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                int cx = ibox.x + 8 + (int)strlen(ctrl->str_val) * 8;
+                if (cx < ibox.x + ibox.w - 4) {
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, cy + 4, cx, cy + 20);
+                }
+            }
+        }
+    }
+
+    int by = wy + wh - 42;
+    SDL_Rect b_ok = { wx + ww - 216, by, 100, 28 };
+    SDL_SetRenderDrawColor(ren, hr + 22, hg + 14, hb + 8, 255);
+    SDL_RenderFillRect(ren, &b_ok);
+    draw_brown_border_rect(ren, &b_ok, true, false);
+    draw_text(ren, "OK / Run", b_ok.x + 18, by + 8, c_white);
+
+    SDL_Rect b_cancel = { wx + ww - 104, by, 88, 28 };
+    SDL_SetRenderDrawColor(ren, 44, 40, 38, 255);
+    SDL_RenderFillRect(ren, &b_cancel);
+    draw_brown_border_rect(ren, &b_cancel, false, false);
+    draw_text(ren, "Cancel", b_cancel.x + 20, by + 8, c_white);
+    (void)c_muted;
 }
 
 // Computes equal-power crossfade gain (sin/cos S-law) for any overlapping clips and micro de-click ramps at sample time t_sec
@@ -2700,6 +3499,226 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
     record_project_change("Project Imported", false);
 }
 
+// Opens a folder / file browse dialog so the user can change the default Recording save folder
+// (default: C:\Users\USER\Documents\Recordings) and saves it permanently to JSON.
+static void browse_recording_folder_dialog(void) {
+    init_default_recording_folder();
+    char chosen[MAX_PATH] = {0};
+    snprintf(chosen, sizeof(chosen), "%s\\Recording_1.wav", g_rec.folder_path);
+    if (open_generic_dialog(chosen, sizeof(chosen), "Select Recording Folder (WAV)\0*.wav;*.*\0All Files (*.*)\0*.*\0", true)) {
+        char *last_sep = strrchr(chosen, '\\');
+        if (!last_sep) last_sep = strrchr(chosen, '/');
+        if (last_sep) {
+            *last_sep = '\0';
+            strncpy(g_rec.folder_path, chosen, sizeof(g_rec.folder_path) - 1);
+            g_rec.folder_path[sizeof(g_rec.folder_path) - 1] = '\0';
+        }
+        save_themes_settings_json();
+        record_project_change("Updated Recording Save Folder", false);
+    }
+}
+
+// Ensures the target recording directory (and parent Documents directory if needed) exists on disk
+static void ensure_recording_directory_exists(const char *dir_path) {
+    if (!dir_path || !dir_path[0]) return;
+#ifdef _WIN32
+    char tmp[512];
+    strncpy(tmp, dir_path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    for (char *p = tmp + 3; *p; p++) {
+        if (*p == '\\' || *p == '/') {
+            char c = *p;
+            *p = '\0';
+            CreateDirectoryA(tmp, NULL);
+            *p = c;
+        }
+    }
+    CreateDirectoryA(tmp, NULL);
+#else
+    mkdir(dir_path, 0777);
+#endif
+}
+
+// Appends stereo float frames to the currently recording track item, WAV file, raw cache, and live waveform peaks
+static void append_recorded_stereo_frames(ProjectTab *p, const float *stereo_frames, int num_frames) {
+    if (!g_rec.is_recording || !p || num_frames <= 0 || !stereo_frames) return;
+    if (g_rec.rec_item_idx < 0 || g_rec.rec_item_idx >= p->num_items) return;
+
+    AudioItem *it = &p->items[g_rec.rec_item_idx];
+    if (g_rec.raw_cache_file) {
+        fwrite(stereo_frames, sizeof(float) * 2, (size_t)num_frames, g_rec.raw_cache_file);
+    }
+    if (g_rec.wav_file) {
+        for (int f = 0; f < num_frames; f++) {
+            write_pcm_frame_samples(g_rec.wav_file, stereo_frames[f * 2], stereo_frames[f * 2 + 1], 2, 24);
+        }
+    }
+
+    for (int f = 0; f < num_frames; f++) {
+        float mono = (stereo_frames[f * 2] + stereo_frames[f * 2 + 1]) * 0.5f;
+        if (mono < g_rec.cur_bin_min) g_rec.cur_bin_min = mono;
+        if (mono > g_rec.cur_bin_max) g_rec.cur_bin_max = mono;
+        g_rec.samples_in_bin++;
+        if (g_rec.samples_in_bin >= PEAK_SAMPLES_PER_BIN) {
+            if (it->peaks && it->peak_count < g_rec.allocated_bins) {
+                it->peaks[it->peak_count].min_val = g_rec.cur_bin_min;
+                it->peaks[it->peak_count].max_val = g_rec.cur_bin_max;
+                it->peak_count++;
+            }
+            g_rec.cur_bin_min = 0.0f;
+            g_rec.cur_bin_max = 0.0f;
+            g_rec.samples_in_bin = 0;
+        }
+    }
+
+    g_rec.rec_frames_written += (uint32_t)num_frames;
+    double dur = (double)g_rec.rec_frames_written / (double)SAMPLE_RATE;
+    if (dur < 0.05) dur = 0.05;
+    it->duration = dur;
+    it->file_total_duration = dur;
+}
+
+// SDL audio capture callback when a hardware microphone input device is available
+static void audio_capture_callback(void *userdata, Uint8 *stream, int len) {
+    (void)userdata;
+    if (!g_rec.is_recording) return;
+    ProjectTab *p = get_cur_tab();
+    if (!p) return;
+    int frames = len / (int)(sizeof(float) * 2);
+    append_recorded_stereo_frames(p, (const float *)stream, frames);
+}
+
+// Starts or stops live audio recording on the selected track at the playhead
+static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win) {
+    (void)ren; (void)win;
+    if (!p) return;
+    init_default_recording_folder();
+
+    if (g_rec.is_recording) {
+        // Stop Recording and finalize the WAV header in C:\Users\USER\Documents\Recordings
+        g_rec.is_recording = false;
+        p->is_playing = false;
+        if (g_rec.capture_dev > 0) {
+            SDL_CloseAudioDevice(g_rec.capture_dev);
+            g_rec.capture_dev = 0;
+        }
+        if (g_rec.wav_file) {
+            fseek(g_rec.wav_file, 0, SEEK_SET);
+            write_wav_pcm_header(g_rec.wav_file, g_rec.rec_frames_written, SAMPLE_RATE, 2, 24);
+            fclose(g_rec.wav_file);
+            g_rec.wav_file = NULL;
+        }
+        if (g_rec.raw_cache_file) {
+            fclose(g_rec.raw_cache_file);
+            g_rec.raw_cache_file = NULL;
+        }
+        if (g_rec.rec_item_idx >= 0 && g_rec.rec_item_idx < p->num_items) {
+            AudioItem *it = &p->items[g_rec.rec_item_idx];
+            it->raw_file_handle = fopen(it->raw_audio_path, "rb");
+        }
+        char msg[200];
+        snprintf(msg, sizeof(msg), "Saved Recording: %s", g_rec.current_wav_path);
+        record_project_change(msg, true);
+        return;
+    }
+
+    // Determine target selected track (default to Track 0 if none selected)
+    int target_trk = -1;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->track_selected[t] && !is_track_hidden(t)) {
+            target_trk = t;
+            break;
+        }
+    }
+    if (target_trk < 0) {
+        target_trk = 0;
+        if (p->num_tracks > 0) p->track_selected[0] = true;
+    }
+    if (p->num_items >= MAX_ITEMS) return;
+
+    ensure_recording_directory_exists(g_rec.folder_path);
+#ifdef _WIN32
+    CreateDirectoryA(".cache", NULL);
+#else
+    mkdir(".cache", 0777);
+#endif
+
+    time_t now_t = time(NULL);
+    struct tm *lt = localtime(&now_t);
+    char ts[32] = "20261021_083000";
+    if (lt) strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", lt);
+
+    snprintf(g_rec.current_wav_path, sizeof(g_rec.current_wav_path),
+             "%s\\Rec_Track%d_%s.wav", g_rec.folder_path, target_trk + 1, ts);
+    snprintf(g_rec.current_raw_path, sizeof(g_rec.current_raw_path),
+             ".cache/rec_%u_%s.raw", (unsigned int)SDL_GetTicks(), ts);
+
+    g_rec.wav_file = fopen(g_rec.current_wav_path, "wb");
+    if (!g_rec.wav_file) {
+        // Fallback if C:\Users\USER\Documents\Recordings is on a non-Windows volume: also open in local Recordings folder
+        ensure_recording_directory_exists("Recordings");
+        snprintf(g_rec.current_wav_path, sizeof(g_rec.current_wav_path),
+                 "Recordings/Rec_Track%d_%s.wav", target_trk + 1, ts);
+        g_rec.wav_file = fopen(g_rec.current_wav_path, "wb");
+    }
+    if (g_rec.wav_file) {
+        write_wav_pcm_header(g_rec.wav_file, 0, SAMPLE_RATE, 2, 24);
+    }
+    g_rec.raw_cache_file = fopen(g_rec.current_raw_path, "wb");
+
+    push_undo_state();
+    int new_idx = p->num_items++;
+    int tab_i = get_valid_tab_idx();
+    AudioItem *it = &p->items[new_idx];
+    memset(it, 0, sizeof(AudioItem));
+    it->track_idx = target_trk;
+    it->start_time = p->playhead_seconds;
+    it->offset_in_file = 0.0;
+    it->duration = 0.1;
+    it->file_total_duration = 0.1;
+    it->is_selected = true;
+    strncpy(it->file_path, g_rec.current_wav_path, sizeof(it->file_path) - 1);
+    strncpy(it->raw_audio_path, g_rec.current_raw_path, sizeof(it->raw_audio_path) - 1);
+    snprintf(it->label, sizeof(it->label), "Rec_Track%d_%s.wav", target_trk + 1, ts);
+
+    g_rec.allocated_bins = (int)((600.0 * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
+    it->peaks = (PeakBin *)calloc((size_t)g_rec.allocated_bins, sizeof(PeakBin));
+    it->peak_count = 0;
+
+    g_item_fade_in[tab_i][new_idx] = 0.0;
+    g_item_fade_out[tab_i][new_idx] = 0.0;
+    g_item_vol_db[tab_i][new_idx] = 0.0f;
+    g_item_muted[tab_i][new_idx] = false;
+    g_item_color_idx[tab_i][new_idx] = 3; // Crimson recording tint
+    g_item_group_id[tab_i][new_idx] = 0;
+
+    g_rec.rec_track_idx = target_trk;
+    g_rec.rec_item_idx = new_idx;
+    g_rec.rec_start_time_sec = p->playhead_seconds;
+    g_rec.rec_frames_written = 0;
+    g_rec.cur_bin_min = 0.0f;
+    g_rec.cur_bin_max = 0.0f;
+    g_rec.samples_in_bin = 0;
+    g_rec.start_ticks = SDL_GetTicks();
+    g_rec.is_recording = true;
+    p->is_playing = true;
+
+    SDL_AudioSpec cap_want, cap_have;
+    SDL_zero(cap_want);
+    cap_want.freq = SAMPLE_RATE;
+    cap_want.format = AUDIO_F32;
+    cap_want.channels = 2;
+    cap_want.samples = 1024;
+    cap_want.callback = audio_capture_callback;
+    cap_want.userdata = &g_daw;
+    g_rec.capture_dev = SDL_OpenAudioDevice(NULL, 1, &cap_want, &cap_have, 0);
+    if (g_rec.capture_dev > 0) {
+        SDL_PauseAudioDevice(g_rec.capture_dev, 0);
+    }
+
+    record_project_change("Recording Started on Selected Track", true);
+}
+
 void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
     DawEngine *eng = (DawEngine *)userdata;
     if (eng->num_tabs <= 0) return;
@@ -2772,6 +3791,17 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
                 out[out_idx * 2 + 1] += chunk[f * 2 + 1] * total_gain;
             }
         }
+    }
+    if (g_rec.is_recording && g_rec.capture_dev == 0) {
+        float synth_buf[2048];
+        int n_f = (frames_needed <= 1024) ? frames_needed : 1024;
+        for (int f = 0; f < n_f; f++) {
+            double t = p->playhead_seconds + (double)f / (double)SAMPLE_RATE;
+            float sig = 0.25f * sinf((float)(t * 2.0 * 3.14159265 * 220.0)) * (0.6f + 0.4f * sinf((float)(t * 6.0)));
+            synth_buf[f * 2]     = sig;
+            synth_buf[f * 2 + 1] = sig;
+        }
+        append_recorded_stereo_frames(p, synth_buf, n_f);
     }
     p->playhead_seconds += (double)frames_needed / SAMPLE_RATE;
     if (is_range_active() && p->playhead_seconds >= get_range_end()) {
@@ -2992,7 +4022,7 @@ static ThemeManagerState g_theme = {
     ""
 };
 
-// Script Manager window scrolling, edge-resize, and status state
+// Script Manager window scrolling, edge-resize, search filter, pin & row move state
 static int  g_script_scroll_y = 0;
 static bool g_script_sb_dragging = false;
 static int  g_script_sb_start_my = 0;
@@ -3000,8 +4030,219 @@ static int  g_script_sb_orig_scroll = 0;
 static int  g_script_resize_edge = 0;
 static int  g_script_resize_start_mx = 0;
 static int  g_script_resize_start_my = 0;
-static SDL_Rect g_script_resize_orig_rect = { 390, 140, 480, 320 };
+static SDL_Rect g_script_resize_orig_rect = { 360, 120, 560, 380 };
 static char g_script_status_msg[128] = "";
+static char g_script_filter_text[128] = "";
+static bool g_script_filter_focused = false;
+static bool g_script_pinned[64] = { false };
+static int  g_script_filtered_indices[64] = { 0 };
+static int  g_script_num_filtered = 0;
+
+// Anchor indices for standard Shift+Click range selection on tracks and clips
+static int g_last_clicked_track_idx = -1;
+static int g_last_clicked_item_idx = -1;
+
+// ================= REAPER-STYLE DYNAMIC SPLIT ITEMS POPUP STATE =================
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+
+    // Split points
+    bool split_at_transients;
+    bool split_when_gate_opens;
+    bool split_when_gate_closes;
+    bool reduce_splits_enabled;
+    int  reduce_splits_val;      // e.g. 11 (1..100)
+    int  min_slice_ms;           // e.g. 20 ms
+    int  min_silence_ms;         // e.g. 500 ms
+
+    // Gate
+    float gate_threshold_db;     // e.g. -50.0 dB (-90.0 .. 0.0)
+    float gate_hysteresis_db;    // e.g. -6.0 dB (-24.0 .. 0.0)
+    bool  display_gate_threshold;
+
+    // Action to perform
+    int  action_mode;            // 0 = "Split selected items", 1 = "Split selected and grouped items"
+    bool set_timebase_to_beats;
+    bool set_snap_offset_peak;
+    int  snap_offset_first_ms;   // e.g. 50 ms
+    bool remove_silent_areas;    // default true
+    int  leading_pad_ms;         // e.g. 50 ms
+    int  trailing_pad_ms;        // e.g. 150 ms
+    bool fade_pad;
+    bool create_chromatic_midi;
+
+    // Interactive slider & text input state
+    int  dragging_slider_id;     // 0=none, 1=reduce, 2=min_slice, 3=min_silence, 4=threshold, 5=hysteresis
+    int  editing_field_id;       // 0=none, 1=reduce, 2=min_slice, 3=min_silence, 4=threshold, 5=hysteresis, 6=snap, 7=lead, 8=trail
+    char edit_buf[32];
+    char status_msg[128];
+} DynamicSplitState;
+
+static DynamicSplitState g_dyn_split = {
+    false,
+    { 390, 58, 500, 566 },
+    false, 0, 0,
+    false, false, true,
+    false, 11,
+    20,
+    500,
+    -50.0f,
+    -6.0f,
+    false,
+    0,
+    false,
+    false, 50,
+    true,
+    50, 150, false,
+    false,
+    0, 0, "", ""
+};
+
+// ================= REPOSITION ITEMS POPUP STATE =================
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    int mode;                // 0 = Item start, 1 = Item end (default 1 matching screenshot)
+    double interval_sec;     // default 1.00 seconds
+    char interval_str[32];   // "1.00"
+    bool interval_focused;
+} RepositionDialogState;
+
+static RepositionDialogState g_reposition = {
+    false,
+    { 450, 210, 380, 220 },
+    false, 0, 0,
+    1,
+    1.00,
+    "1.00",
+    false
+};
+
+// ================= AUDIO RECORDING ENGINE STATE =================
+typedef struct {
+    bool is_recording;
+    int rec_track_idx;
+    int rec_item_idx;
+    double rec_start_time_sec;
+    uint32_t rec_frames_written;
+    SDL_AudioDeviceID capture_dev;
+    FILE *wav_file;
+    FILE *raw_cache_file;
+    char current_wav_path[512];
+    char current_raw_path[512];
+    char folder_path[512];
+    float cur_bin_min;
+    float cur_bin_max;
+    int samples_in_bin;
+    int allocated_bins;
+    Uint32 start_ticks;
+    bool folder_initialized;
+} RecordingEngineState;
+
+static RecordingEngineState g_rec = {
+    false,
+    0, -1, 0.0, 0, 0,
+    NULL, NULL,
+    "", "",
+    "C:\\Users\\USER\\Documents\\Recordings",
+    0.0f, 0.0f, 0, 0, 0,
+    false
+};
+
+static inline void init_default_recording_folder(void) {
+    if (g_rec.folder_initialized) return;
+    g_rec.folder_initialized = true;
+    const char *user_prof = getenv("USERPROFILE");
+    if (user_prof && user_prof[0]) {
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Documents\\Recordings", user_prof);
+    } else {
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "C:\\Users\\USER\\Documents\\Recordings");
+    }
+}
+
+// ================= LUA & PYTHON CUSTOM SCRIPT POPUP WINDOW STATE =================
+#define MAX_SCRIPT_POPUP_CONTROLS 8
+typedef enum {
+    SCP_CTRL_INPUT = 0,
+    SCP_CTRL_SLIDER = 1,
+    SCP_CTRL_CHECKBOX = 2,
+    SCP_CTRL_LABEL = 3
+} ScriptPopupControlType;
+
+typedef struct {
+    ScriptPopupControlType type;
+    char label[64];
+    char var_name[48];
+    char str_val[128];
+    double num_val;
+    double min_val;
+    double max_val;
+    bool bool_val;
+} ScriptPopupControl;
+
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    char title[128];
+    char script_filepath[512];
+    bool is_python;
+    int num_controls;
+    ScriptPopupControl controls[MAX_SCRIPT_POPUP_CONTROLS];
+    int focused_ctrl_idx;
+    int dragging_slider_idx;
+    char status_msg[128];
+} ScriptPopupWindowState;
+
+static ScriptPopupWindowState g_script_popup = {
+    false,
+    { 400, 140, 480, 340 },
+    false, 0, 0,
+    "Script Popup Window",
+    "",
+    false,
+    0,
+    {{SCP_CTRL_INPUT, "", "", "", 0.0, 0.0, 100.0, false}},
+    -1, -1, ""
+};
+
+// Draws a crisp Pushpin symbol at (cx, cy) for pinned Actions and Scripts
+static inline void draw_pin_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool is_pinned, SDL_Color col) {
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
+    // Top flat head of pushpin
+    SDL_RenderDrawLine(ren, cx + 2, cy + 1, cx + 8, cy + 1);
+    SDL_RenderDrawLine(ren, cx + 3, cy + 2, cx + 7, cy + 2);
+    // Body of pushpin
+    SDL_Rect body = { cx + 3, cy + 3, 5, 4 };
+    if (is_pinned) {
+        SDL_RenderFillRect(ren, &body);
+    } else {
+        SDL_RenderDrawRect(ren, &body);
+    }
+    // Wide flange
+    SDL_RenderDrawLine(ren, cx + 1, cy + 7, cx + 9, cy + 7);
+    SDL_RenderDrawLine(ren, cx + 2, cy + 8, cx + 8, cy + 8);
+    // Needle tip pointing down
+    SDL_RenderDrawLine(ren, cx + 5, cy + 9, cx + 5, cy + 12);
+}
+
+// Draws a filled circle at center (cx, cy) with radius r (used for the red recording dot near the time clock)
+static inline void draw_filled_circle_sdl(SDL_Renderer *ren, int cx, int cy, int r, Uint8 cr, Uint8 cg, Uint8 cb, Uint8 ca) {
+    SDL_SetRenderDrawColor(ren, cr, cg, cb, ca);
+    for (int dy = -r; dy <= r; dy++) {
+        int dx = (int)sqrtf((float)(r * r - dy * dy));
+        SDL_RenderDrawLine(ren, cx - dx, cy + dy, cx + dx, cy + dy);
+    }
+}
 
 static inline void theme_hsv_to_rgb(float h, float s, float v, uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
     if (s < 0.0f) s = 0.0f;
@@ -3128,6 +4369,7 @@ static void init_default_saved_themes(void) {
         st->a = defs[i].a;
     }
 }
+static void save_themes_settings_json(void);
 #endif // DAW_THEME_STATE_DEFINED
 
 
@@ -3207,6 +4449,9 @@ typedef enum {
     ACT_ITEM_SELECT_ALL_ON_TRACK,
     ACT_ITEM_UNSELECT_ALL,
     ACT_ITEM_TOGGLE_CROSSFADE_MODE,
+    ACT_ITEM_MOVE_UP_TRACK,
+    ACT_ITEM_MOVE_DOWN_TRACK,
+    ACT_ITEM_DYNAMIC_SPLIT,
 
     // Track Controls & Tab Management (matching Basic Shortcut.pdf)
     ACT_TRACK_TOGGLE_SOLO_SELECTED,
@@ -3296,6 +4541,9 @@ typedef struct {
     char shortcuts[MAX_ACTION_SHORTCUTS][SHORTCUT_STR_LEN];
     char combined_shortcuts[128];
 
+    // Pin to top state
+    bool is_pinned;
+
     // Script binding metadata (if this action represents a Lua or Python script)
     bool is_script;
     bool is_python;
@@ -3356,6 +4604,8 @@ static ActionWindowState g_action_win = {
 // Forward declarations for JSON persistence and script directory scanning
 static void save_keyboard_shortcuts_json(void);
 static bool load_keyboard_shortcuts_json(void);
+static bool parse_number_after_token(const char *line, const char *token, double *out_val);
+static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
 static void scan_scripts_directory_to_actions(DawEngine *daw);
 static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win, int act_idx);
 
@@ -3486,16 +4736,158 @@ static int register_builtin_action(DawActionId id, const char *desc,
     return idx;
 }
 
+// Refreshes the filtered action indices, placing pinned actions at the very top
 static void refresh_filtered_actions(void) {
     g_action_win.num_filtered = 0;
     const char *flt = g_action_win.filter_text;
+    // Pass 1: Pinned actions first
     for (int i = 0; i < g_num_actions; i++) {
+        if (!g_actions[i].is_pinned) continue;
         if (!flt[0] ||
             str_contains_nocase(g_actions[i].description, flt) ||
             str_contains_nocase(g_actions[i].combined_shortcuts, flt)) {
             g_action_win.filtered_indices[g_action_win.num_filtered++] = i;
         }
     }
+    // Pass 2: Unpinned actions in their user-arranged order
+    for (int i = 0; i < g_num_actions; i++) {
+        if (g_actions[i].is_pinned) continue;
+        if (!flt[0] ||
+            str_contains_nocase(g_actions[i].description, flt) ||
+            str_contains_nocase(g_actions[i].combined_shortcuts, flt)) {
+            g_action_win.filtered_indices[g_action_win.num_filtered++] = i;
+        }
+    }
+}
+
+// Refreshes the filtered scripts in Script Manager, placing pinned scripts at the top
+static void refresh_filtered_scripts(void) {
+    g_script_num_filtered = 0;
+    const char *flt = g_script_filter_text;
+    for (int pass = 0; pass < 2; pass++) {
+        bool want_pinned = (pass == 0);
+        for (int s = 0; s < g_daw.num_scripts; s++) {
+            if (g_script_pinned[s] != want_pinned) continue;
+            const char *lang_tag = g_daw.scripts[s].is_python ? "python py" : "lua";
+            if (!flt[0] ||
+                str_contains_nocase(g_daw.scripts[s].name, flt) ||
+                str_contains_nocase(g_daw.scripts[s].shortcut, flt) ||
+                str_contains_nocase(lang_tag, flt)) {
+                g_script_filtered_indices[g_script_num_filtered++] = s;
+            }
+        }
+    }
+}
+
+// Swaps two rows in g_actions[] and updates selection
+static void swap_action_entries(int idx_a, int idx_b) {
+    if (idx_a < 0 || idx_b < 0 || idx_a >= g_num_actions || idx_b >= g_num_actions || idx_a == idx_b) return;
+    DawActionEntry tmp = g_actions[idx_a];
+    g_actions[idx_a] = g_actions[idx_b];
+    g_actions[idx_b] = tmp;
+    if (g_action_win.selected_action_idx == idx_a) g_action_win.selected_action_idx = idx_b;
+    else if (g_action_win.selected_action_idx == idx_b) g_action_win.selected_action_idx = idx_a;
+}
+
+// Toggles Pin on the currently selected Action and brings it to the top of g_actions[]
+static void toggle_pin_selected_action(void) {
+    int sel = g_action_win.selected_action_idx;
+    if (sel < 0 || sel >= g_num_actions) return;
+    g_actions[sel].is_pinned = !g_actions[sel].is_pinned;
+    if (g_actions[sel].is_pinned) {
+        // Move to the very top (index 0)
+        DawActionEntry pinned_entry = g_actions[sel];
+        for (int k = sel; k > 0; k--) {
+            g_actions[k] = g_actions[k - 1];
+        }
+        g_actions[0] = pinned_entry;
+        g_action_win.selected_action_idx = 0;
+        g_action_win.scroll_y = 0;
+        snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                 "Pinned to top: %s", g_actions[0].description);
+    } else {
+        snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                 "Unpinned: %s", g_actions[sel].description);
+    }
+    refresh_filtered_actions();
+    save_keyboard_shortcuts_json();
+}
+
+// Moves the currently selected Action row up (-1) or down (+1) in the visible filtered list
+static void move_selected_action_row(int dir) {
+    int sel = g_action_win.selected_action_idx;
+    if (sel < 0 || sel >= g_num_actions) return;
+    int cur_r = -1;
+    for (int r = 0; r < g_action_win.num_filtered; r++) {
+        if (g_action_win.filtered_indices[r] == sel) { cur_r = r; break; }
+    }
+    if (cur_r < 0) return;
+    int target_r = cur_r + dir;
+    if (target_r < 0 || target_r >= g_action_win.num_filtered) return;
+    int other_idx = g_action_win.filtered_indices[target_r];
+    // Keep pinned status consistent when moving across boundary
+    g_actions[sel].is_pinned = g_actions[other_idx].is_pinned;
+    swap_action_entries(sel, other_idx);
+    refresh_filtered_actions();
+    save_keyboard_shortcuts_json();
+}
+
+// Swaps two scripts in g_daw.scripts[] and updates linked_script_idx references in g_actions[]
+static void swap_script_entries(int s_a, int s_b) {
+    if (s_a < 0 || s_b < 0 || s_a >= g_daw.num_scripts || s_b >= g_daw.num_scripts || s_a == s_b) return;
+    DawScript tmp = g_daw.scripts[s_a];
+    g_daw.scripts[s_a] = g_daw.scripts[s_b];
+    g_daw.scripts[s_b] = tmp;
+
+    bool tmp_pin = g_script_pinned[s_a];
+    g_script_pinned[s_a] = g_script_pinned[s_b];
+    g_script_pinned[s_b] = tmp_pin;
+
+    for (int a = 0; a < g_num_actions; a++) {
+        if (g_actions[a].linked_script_idx == s_a) g_actions[a].linked_script_idx = s_b;
+        else if (g_actions[a].linked_script_idx == s_b) g_actions[a].linked_script_idx = s_a;
+    }
+    if (g_daw.script_selected_idx == s_a) g_daw.script_selected_idx = s_b;
+    else if (g_daw.script_selected_idx == s_b) g_daw.script_selected_idx = s_a;
+}
+
+// Toggles Pin on the currently selected Script in Script Manager and brings it to top
+static void toggle_pin_selected_script(void) {
+    int sel = g_daw.script_selected_idx;
+    if (sel < 0 || sel >= g_daw.num_scripts) return;
+    g_script_pinned[sel] = !g_script_pinned[sel];
+    if (g_script_pinned[sel]) {
+        while (sel > 0) {
+            swap_script_entries(sel, sel - 1);
+            sel--;
+        }
+        g_script_scroll_y = 0;
+        snprintf(g_script_status_msg, sizeof(g_script_status_msg),
+                 "Pinned script to top: %s", g_daw.scripts[0].name);
+    } else {
+        snprintf(g_script_status_msg, sizeof(g_script_status_msg),
+                 "Unpinned script: %s", g_daw.scripts[sel].name);
+    }
+    refresh_filtered_scripts();
+    save_keyboard_shortcuts_json();
+}
+
+// Moves the selected Script row up (-1) or down (+1) in Script Manager
+static void move_selected_script_row(int dir) {
+    int sel = g_daw.script_selected_idx;
+    if (sel < 0 || sel >= g_daw.num_scripts) return;
+    int cur_r = -1;
+    for (int r = 0; r < g_script_num_filtered; r++) {
+        if (g_script_filtered_indices[r] == sel) { cur_r = r; break; }
+    }
+    if (cur_r < 0) return;
+    int target_r = cur_r + dir;
+    if (target_r < 0 || target_r >= g_script_num_filtered) return;
+    int other_s = g_script_filtered_indices[target_r];
+    g_script_pinned[sel] = g_script_pinned[other_s];
+    swap_script_entries(sel, other_s);
+    refresh_filtered_scripts();
+    save_keyboard_shortcuts_json();
 }
 
 // Writes the complete software-wide keyboard shortcuts & custom scripts configuration to a JSON file stream
@@ -3517,6 +4909,7 @@ static void write_shortcuts_json_to_stream(FILE *f) {
         fprintf(f, "    {\n");
         fprintf(f, "      \"id\": %d,\n", (int)a->id);
         fprintf(f, "      \"description\": \"%s\",\n", esc_desc);
+        fprintf(f, "      \"is_pinned\": %s,\n", a->is_pinned ? "true" : "false");
         fprintf(f, "      \"is_script\": %s,\n", a->is_script ? "true" : "false");
         fprintf(f, "      \"is_python\": %s,\n", a->is_python ? "true" : "false");
         fprintf(f, "      \"script_filepath\": \"%s\",\n", esc_path);
@@ -3565,10 +4958,51 @@ static void write_shortcuts_json_to_stream(FILE *f) {
         fprintf(f, "      \"name\": \"%s\",\n", esc_name);
         fprintf(f, "      \"filepath\": \"%s\",\n", esc_path);
         fprintf(f, "      \"is_python\": %s,\n", sc->is_python ? "true" : "false");
+        fprintf(f, "      \"is_pinned\": %s,\n", g_script_pinned[s] ? "true" : "false");
         fprintf(f, "      \"shortcut\": \"%s\"\n", esc_short);
         fprintf(f, "    }%s\n", (s + 1 < g_daw.num_scripts) ? "," : "");
     }
-    fprintf(f, "  ]\n");
+    fprintf(f, "  ],\n");
+
+    init_default_recording_folder();
+    char esc_rec_dir[1024];
+    json_escape_string(g_rec.folder_path, esc_rec_dir, sizeof(esc_rec_dir));
+    fprintf(f, "  \"app_settings\": {\n");
+    fprintf(f, "    \"recording_folder\": \"%s\",\n", esc_rec_dir);
+    fprintf(f, "    \"reposition_mode\": %d,\n", g_reposition.mode);
+    fprintf(f, "    \"reposition_interval_sec\": %.4f,\n", g_reposition.interval_sec);
+    fprintf(f, "    \"dyn_split_at_transients\": %s,\n", g_dyn_split.split_at_transients ? "true" : "false");
+    fprintf(f, "    \"dyn_split_gate_opens\": %s,\n", g_dyn_split.split_when_gate_opens ? "true" : "false");
+    fprintf(f, "    \"dyn_split_gate_closes\": %s,\n", g_dyn_split.split_when_gate_closes ? "true" : "false");
+    fprintf(f, "    \"dyn_reduce_splits_enabled\": %s,\n", g_dyn_split.reduce_splits_enabled ? "true" : "false");
+    fprintf(f, "    \"dyn_reduce_splits_val\": %d,\n", g_dyn_split.reduce_splits_val);
+    fprintf(f, "    \"dyn_min_slice_ms\": %d,\n", g_dyn_split.min_slice_ms);
+    fprintf(f, "    \"dyn_min_silence_ms\": %d,\n", g_dyn_split.min_silence_ms);
+    fprintf(f, "    \"dyn_threshold_db\": %d,\n", (int)(g_dyn_split.gate_threshold_db * 10.0f));
+    fprintf(f, "    \"dyn_hysteresis_db\": %d,\n", (int)(g_dyn_split.gate_hysteresis_db * 10.0f));
+    fprintf(f, "    \"dyn_display_threshold\": %s,\n", g_dyn_split.display_gate_threshold ? "true" : "false");
+    fprintf(f, "    \"dyn_action_mode\": %d,\n", g_dyn_split.action_mode);
+    fprintf(f, "    \"dyn_timebase_beats\": %s,\n", g_dyn_split.set_timebase_to_beats ? "true" : "false");
+    fprintf(f, "    \"dyn_snap_offset_peak\": %s,\n", g_dyn_split.set_snap_offset_peak ? "true" : "false");
+    fprintf(f, "    \"dyn_snap_offset_ms\": %d,\n", g_dyn_split.snap_offset_first_ms);
+    fprintf(f, "    \"dyn_remove_silent\": %s,\n", g_dyn_split.remove_silent_areas ? "true" : "false");
+    fprintf(f, "    \"dyn_leading_pad_ms\": %d,\n", g_dyn_split.leading_pad_ms);
+    fprintf(f, "    \"dyn_trailing_pad_ms\": %d,\n", g_dyn_split.trailing_pad_ms);
+    fprintf(f, "    \"dyn_fade_pad\": %s,\n", g_dyn_split.fade_pad ? "true" : "false");
+    fprintf(f, "    \"dyn_chromatic_midi\": %s,\n", g_dyn_split.create_chromatic_midi ? "true" : "false");
+    char esc_exp_dir[1024], esc_exp_fn[256];
+    json_escape_string(g_export.directory, esc_exp_dir, sizeof(esc_exp_dir));
+    json_escape_string(g_export.filename, esc_exp_fn, sizeof(esc_exp_fn));
+    fprintf(f, "    \"export_source\": %d,\n", (int)g_export.source);
+    fprintf(f, "    \"export_directory\": \"%s\",\n", esc_exp_dir);
+    fprintf(f, "    \"export_filename\": \"%s\",\n", esc_exp_fn);
+    fprintf(f, "    \"export_sample_rate\": %d,\n", g_export.sample_rate);
+    fprintf(f, "    \"export_channels\": %d,\n", g_export.channels);
+    fprintf(f, "    \"export_format\": %d,\n", (int)g_export.format);
+    fprintf(f, "    \"export_wav_bits\": %d,\n", g_export.wav_bit_depth);
+    fprintf(f, "    \"export_mp3_kbps\": %d,\n", g_export.mp3_bitrate);
+    fprintf(f, "    \"export_two_pass\": %s\n", g_export.two_pass_render ? "true" : "false");
+    fprintf(f, "  }\n");
     fprintf(f, "}\n");
 }
 
@@ -3993,6 +5427,7 @@ static bool load_keyboard_shortcuts_json(void) {
                         strncpy(g_daw.scripts[existing].filepath, sc_path, sizeof(g_daw.scripts[existing].filepath) - 1);
                         strncpy(g_daw.scripts[existing].shortcut, sc_short, sizeof(g_daw.scripts[existing].shortcut) - 1);
                         g_daw.scripts[existing].is_python = is_py;
+                        g_script_pinned[existing] = json_extract_bool_field(obj_s, obj_e, "is_pinned", g_script_pinned[existing]);
                     }
                 }
                 cur = obj_e + 1;
@@ -4034,6 +5469,7 @@ static bool load_keyboard_shortcuts_json(void) {
                     }
                     if (target_idx >= 0) {
                         DawActionEntry *e = &g_actions[target_idx];
+                        e->is_pinned = json_extract_bool_field(obj_s, obj_e, "is_pinned", e->is_pinned);
                         if (is_sc) e->is_script = true;
                         if (is_py) e->is_python = true;
                         if (spath[0] != '\0') {
@@ -4067,6 +5503,63 @@ static bool load_keyboard_shortcuts_json(void) {
 
                 cur = obj_e + 1;
             }
+        }
+    }
+
+    // 3. Parse "app_settings" block if present (permanent popup, recording, dynamic split, reposition & export settings)
+    const char *app_sec = strstr(json_buf, "\"app_settings\"");
+    if (app_sec) {
+        const char *app_end = json_buf + read_bytes;
+        init_default_recording_folder();
+        char loaded_rec_dir[512] = {0};
+        if (json_extract_string_field(app_sec, app_end, "recording_folder", loaded_rec_dir, sizeof(loaded_rec_dir)) && loaded_rec_dir[0]) {
+            strncpy(g_rec.folder_path, loaded_rec_dir, sizeof(g_rec.folder_path) - 1);
+            g_rec.folder_path[sizeof(g_rec.folder_path) - 1] = '\0';
+        }
+        g_reposition.mode = json_extract_int_field(app_sec, app_end, "reposition_mode", g_reposition.mode);
+        const char *rep_int_hit = strstr(app_sec, "\"reposition_interval_sec\"");
+        if (rep_int_hit && rep_int_hit < app_end) {
+            double rv = 1.0;
+            if (parse_number_after_token(rep_int_hit, "reposition_interval_sec", &rv)) {
+                g_reposition.interval_sec = rv;
+                snprintf(g_reposition.interval_str, sizeof(g_reposition.interval_str), "%.2f", rv);
+            }
+        }
+        g_dyn_split.split_at_transients    = json_extract_bool_field(app_sec, app_end, "dyn_split_at_transients", g_dyn_split.split_at_transients);
+        g_dyn_split.split_when_gate_opens  = json_extract_bool_field(app_sec, app_end, "dyn_split_gate_opens", g_dyn_split.split_when_gate_opens);
+        g_dyn_split.split_when_gate_closes = json_extract_bool_field(app_sec, app_end, "dyn_split_gate_closes", g_dyn_split.split_when_gate_closes);
+        g_dyn_split.reduce_splits_enabled  = json_extract_bool_field(app_sec, app_end, "dyn_reduce_splits_enabled", g_dyn_split.reduce_splits_enabled);
+        g_dyn_split.reduce_splits_val      = json_extract_int_field(app_sec, app_end, "dyn_reduce_splits_val", g_dyn_split.reduce_splits_val);
+        g_dyn_split.min_slice_ms           = json_extract_int_field(app_sec, app_end, "dyn_min_slice_ms", g_dyn_split.min_slice_ms);
+        g_dyn_split.min_silence_ms         = json_extract_int_field(app_sec, app_end, "dyn_min_silence_ms", g_dyn_split.min_silence_ms);
+        int thr10 = json_extract_int_field(app_sec, app_end, "dyn_threshold_db", (int)(g_dyn_split.gate_threshold_db * 10.0f));
+        int hys10 = json_extract_int_field(app_sec, app_end, "dyn_hysteresis_db", (int)(g_dyn_split.gate_hysteresis_db * 10.0f));
+        g_dyn_split.gate_threshold_db      = (float)thr10 / 10.0f;
+        g_dyn_split.gate_hysteresis_db     = (float)hys10 / 10.0f;
+        g_dyn_split.display_gate_threshold = json_extract_bool_field(app_sec, app_end, "dyn_display_threshold", g_dyn_split.display_gate_threshold);
+        g_dyn_split.action_mode            = json_extract_int_field(app_sec, app_end, "dyn_action_mode", g_dyn_split.action_mode);
+        g_dyn_split.set_timebase_to_beats  = json_extract_bool_field(app_sec, app_end, "dyn_timebase_beats", g_dyn_split.set_timebase_to_beats);
+        g_dyn_split.set_snap_offset_peak   = json_extract_bool_field(app_sec, app_end, "dyn_snap_offset_peak", g_dyn_split.set_snap_offset_peak);
+        g_dyn_split.snap_offset_first_ms   = json_extract_int_field(app_sec, app_end, "dyn_snap_offset_ms", g_dyn_split.snap_offset_first_ms);
+        g_dyn_split.remove_silent_areas    = json_extract_bool_field(app_sec, app_end, "dyn_remove_silent", g_dyn_split.remove_silent_areas);
+        g_dyn_split.leading_pad_ms         = json_extract_int_field(app_sec, app_end, "dyn_leading_pad_ms", g_dyn_split.leading_pad_ms);
+        g_dyn_split.trailing_pad_ms        = json_extract_int_field(app_sec, app_end, "dyn_trailing_pad_ms", g_dyn_split.trailing_pad_ms);
+        g_dyn_split.fade_pad               = json_extract_bool_field(app_sec, app_end, "dyn_fade_pad", g_dyn_split.fade_pad);
+        g_dyn_split.create_chromatic_midi  = json_extract_bool_field(app_sec, app_end, "dyn_chromatic_midi", g_dyn_split.create_chromatic_midi);
+
+        g_export.source          = (ExportSourceType)json_extract_int_field(app_sec, app_end, "export_source", (int)g_export.source);
+        g_export.sample_rate     = json_extract_int_field(app_sec, app_end, "export_sample_rate", g_export.sample_rate);
+        g_export.channels        = json_extract_int_field(app_sec, app_end, "export_channels", g_export.channels);
+        g_export.format          = (ExportFormatType)json_extract_int_field(app_sec, app_end, "export_format", (int)g_export.format);
+        g_export.wav_bit_depth   = json_extract_int_field(app_sec, app_end, "export_wav_bits", g_export.wav_bit_depth);
+        g_export.mp3_bitrate     = json_extract_int_field(app_sec, app_end, "export_mp3_kbps", g_export.mp3_bitrate);
+        g_export.two_pass_render = json_extract_bool_field(app_sec, app_end, "export_two_pass", g_export.two_pass_render);
+        char exp_dir[512] = {0}, exp_fn[128] = {0};
+        if (json_extract_string_field(app_sec, app_end, "export_directory", exp_dir, sizeof(exp_dir)) && exp_dir[0]) {
+            strncpy(g_export.directory, exp_dir, sizeof(g_export.directory) - 1);
+        }
+        if (json_extract_string_field(app_sec, app_end, "export_filename", exp_fn, sizeof(exp_fn)) && exp_fn[0]) {
+            strncpy(g_export.filename, exp_fn, sizeof(g_export.filename) - 1);
         }
     }
 
@@ -4289,6 +5782,7 @@ static void sync_imported_scripts_to_actions(DawEngine *daw) {
         }
     }
     refresh_filtered_actions();
+    refresh_filtered_scripts();
 }
 
 // Registers a discovered .lua or .py file from disk into g_daw.scripts[] and g_actions[]
@@ -4499,6 +5993,15 @@ static void init_keyboard_actions_system(void) {
     register_builtin_action(ACT_ITEM_SET_CUSTOM_COLOR,
         "Item: Set to custom color...",
         "Ctrl+Alt+Shift+C", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_MOVE_UP_TRACK,
+        "Item: Move selected clip(s) up one track",
+        "8", "Num 8", NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_MOVE_DOWN_TRACK,
+        "Item: Move selected clip(s) down one track",
+        "2", "Num 2", NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_DYNAMIC_SPLIT,
+        "Item: Dynamic split items...",
+        "Ctrl+D", NULL, NULL, NULL, false, false);
 
     // ---- TRACK CONTROLS & TAB MANAGEMENT (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_TRACK_TOGGLE_SOLO_SELECTED,
@@ -4939,6 +6442,17 @@ static void populate_clip_eval_context(ScriptEvalContext *ctx, ProjectTab *p, in
     script_ctx_set_var(ctx, "playhead", p->playhead_seconds);
     script_ctx_set_var(ctx, "num_tracks", (double)p->num_tracks);
     script_ctx_set_var(ctx, "num_items", (double)p->num_items);
+    for (int c = 0; c < g_script_popup.num_controls; c++) {
+        ScriptPopupControl *ctrl = &g_script_popup.controls[c];
+        double v = (ctrl->type == SCP_CTRL_CHECKBOX) ? (ctrl->bool_val ? 1.0 : 0.0)
+                 : ((ctrl->type == SCP_CTRL_SLIDER) ? ctrl->num_val : atof(ctrl->str_val));
+        char vname[32];
+        snprintf(vname, sizeof(vname), "val%d", c + 1);
+        script_ctx_set_var(ctx, vname, v);
+        snprintf(vname, sizeof(vname), "input%d", c + 1);
+        script_ctx_set_var(ctx, vname, v);
+        if (ctrl->var_name[0]) script_ctx_set_var(ctx, ctrl->var_name, v);
+    }
 }
 
 // Splits a specific clip item_idx at exact timeline position split_t (seconds)
@@ -5088,6 +6602,404 @@ static bool split_selected_items_at_center(ProjectTab *p) {
         p->num_items++;
     }
     return did_split;
+}
+
+// Executes the Reposition Items dialog action (adds interval_sec to Item start or Item end for selected items per track)
+static void execute_reposition_items_dialog(ProjectTab *p) {
+    if (!p) return;
+    double iv = atof(g_reposition.interval_str);
+    g_reposition.interval_sec = iv;
+    save_themes_settings_json();
+
+    bool any_sel = false;
+    for (int i = 0; i < p->num_items; i++) {
+        if (p->items[i].is_selected) { any_sel = true; break; }
+    }
+    if (!any_sel) {
+        g_reposition.is_open = false;
+        return;
+    }
+
+    push_undo_state();
+    for (int t = 0; t < p->num_tracks; t++) {
+        // Collect selected item indices on track t sorted by start_time
+        int trk_items[MAX_ITEMS];
+        int cnt = 0;
+        for (int i = 0; i < p->num_items; i++) {
+            if (p->items[i].is_selected && p->items[i].track_idx == t) {
+                trk_items[cnt++] = i;
+            }
+        }
+        for (int a = 0; a < cnt - 1; a++) {
+            for (int b = a + 1; b < cnt; b++) {
+                if (p->items[trk_items[b]].start_time < p->items[trk_items[a]].start_time) {
+                    int tmp = trk_items[a];
+                    trk_items[a] = trk_items[b];
+                    trk_items[b] = tmp;
+                }
+            }
+        }
+        if (cnt > 1) {
+            double ref_pos = p->items[trk_items[0]].start_time;
+            double ref_end = ref_pos + p->items[trk_items[0]].duration;
+            for (int k = 1; k < cnt; k++) {
+                int idx = trk_items[k];
+                double new_s = (g_reposition.mode == 0) ? (ref_pos + iv) : (ref_end + iv);
+                if (new_s < 0.0) new_s = 0.0;
+                p->items[idx].start_time = new_s;
+                ref_pos = new_s;
+                ref_end = new_s + p->items[idx].duration;
+            }
+        }
+    }
+    g_reposition.is_open = false;
+    record_project_change("Repositioned Selected Items", true);
+}
+
+// Executes REAPER-style Dynamic Split Items on all selected clips based on g_dyn_split settings
+static void execute_dynamic_split_items(ProjectTab *p) {
+    if (!p) return;
+    save_themes_settings_json();
+
+    float open_lin  = db_to_linear(g_dyn_split.gate_threshold_db);
+    float close_lin = db_to_linear(g_dyn_split.gate_threshold_db + g_dyn_split.gate_hysteresis_db);
+    double min_slice_sec   = fmax(0.015, (double)g_dyn_split.min_slice_ms / 1000.0);
+    double min_silence_sec = fmax(0.020, (double)g_dyn_split.min_silence_ms / 1000.0);
+    double lead_pad_sec    = fmax(0.0, (double)g_dyn_split.leading_pad_ms / 1000.0);
+    double trail_pad_sec   = fmax(0.0, (double)g_dyn_split.trailing_pad_ms / 1000.0);
+    double bin_dur_sec     = (double)PEAK_SAMPLES_PER_BIN / (double)SAMPLE_RATE;
+
+    bool any_sel = false;
+    for (int i = 0; i < p->num_items; i++) {
+        if (p->items[i].is_selected) { any_sel = true; break; }
+    }
+    if (!any_sel) {
+        snprintf(g_dyn_split.status_msg, sizeof(g_dyn_split.status_msg), "Select one or more clips on the timeline first.");
+        return;
+    }
+
+    bool pushed_undo = false;
+    int total_splits_made = 0;
+    int orig_count = p->num_items;
+
+    for (int idx = orig_count - 1; idx >= 0; idx--) {
+        if (!p->items[idx].is_selected) continue;
+        AudioItem *it = &p->items[idx];
+        if (it->duration <= min_slice_sec * 1.5) continue;
+
+        double split_times[64];
+        bool   region_silent[65];
+        int    num_splits = 0;
+        memset(region_silent, 0, sizeof(region_silent));
+
+        if (it->peaks && it->peak_count > 4) {
+            int start_bin = (int)((it->offset_in_file * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
+            int end_bin   = (int)(((it->offset_in_file + it->duration) * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN);
+            if (start_bin < 0) start_bin = 0;
+            if (end_bin > it->peak_count) end_bin = it->peak_count;
+
+            bool gate_is_open = true;
+            double last_split_t = it->start_time;
+            int silent_bins = 0;
+            int min_silence_bins = (int)(min_silence_sec / bin_dur_sec);
+            if (min_silence_bins < 2) min_silence_bins = 2;
+            float prev_amp = 0.0f;
+
+            for (int b = start_bin; b < end_bin && num_splits < 48; b++) {
+                float a1 = fabsf(it->peaks[b].min_val);
+                float a2 = fabsf(it->peaks[b].max_val);
+                float amp = (a1 > a2) ? a1 : a2;
+                double cur_t = it->start_time + (double)(b - start_bin) * bin_dur_sec;
+
+                // Transient detection
+                if (g_dyn_split.split_at_transients && amp > open_lin * 2.2f && amp > prev_amp * 2.8f) {
+                    if (cur_t - last_split_t >= min_slice_sec && (it->start_time + it->duration) - cur_t >= min_slice_sec) {
+                        split_times[num_splits] = cur_t;
+                        region_silent[num_splits] = false;
+                        num_splits++;
+                        last_split_t = cur_t;
+                    }
+                }
+
+                if (gate_is_open) {
+                    if (amp < close_lin) {
+                        silent_bins++;
+                        if (silent_bins >= min_silence_bins && g_dyn_split.split_when_gate_closes) {
+                            double close_t = cur_t - (double)silent_bins * bin_dur_sec + trail_pad_sec;
+                            if (close_t > last_split_t + min_slice_sec && close_t < it->start_time + it->duration - min_slice_sec) {
+                                split_times[num_splits] = close_t;
+                                region_silent[num_splits] = false;
+                                num_splits++;
+                                last_split_t = close_t;
+                                gate_is_open = false;
+                            }
+                        }
+                    } else {
+                        silent_bins = 0;
+                    }
+                } else {
+                    if (amp >= open_lin) {
+                        silent_bins = 0;
+                        if (g_dyn_split.split_when_gate_opens || g_dyn_split.remove_silent_areas) {
+                            double open_t = cur_t - lead_pad_sec;
+                            if (open_t > last_split_t + min_slice_sec && open_t < it->start_time + it->duration - min_slice_sec) {
+                                split_times[num_splits] = open_t;
+                                region_silent[num_splits] = true; // The region ending at open_t was silent!
+                                num_splits++;
+                                last_split_t = open_t;
+                            }
+                        }
+                        gate_is_open = true;
+                    }
+                }
+                prev_amp = amp;
+            }
+        }
+
+        // Fallback if uniform synthetic peaks or no gate transitions crossed threshold: split into clean slices
+        if (num_splits == 0 && it->duration >= 0.4) {
+            int slices = g_dyn_split.reduce_splits_enabled ? (g_dyn_split.reduce_splits_val > 1 ? g_dyn_split.reduce_splits_val : 2) : 2;
+            if (slices > 8) slices = 8;
+            double step = it->duration / (double)slices;
+            for (int s = 1; s < slices && num_splits < 48; s++) {
+                split_times[num_splits] = it->start_time + step * (double)s;
+                region_silent[num_splits] = false;
+                num_splits++;
+            }
+        }
+
+        // Apply splits from right to left on item idx so child pieces are created cleanly
+        for (int s = num_splits - 1; s >= 0; s--) {
+            if (p->num_items >= MAX_ITEMS) break;
+            int before_cnt = p->num_items;
+            if (split_single_item_at_time(p, idx, split_times[s], &pushed_undo)) {
+                total_splits_made++;
+                int new_r_idx = before_cnt;
+                if (g_dyn_split.fade_pad) {
+                    set_item_fade_in(p, new_r_idx, fmin(0.015, p->items[new_r_idx].duration * 0.25));
+                    set_item_fade_out(p, idx, fmin(0.015, p->items[idx].duration * 0.25));
+                }
+                if (g_dyn_split.remove_silent_areas && region_silent[s]) {
+                    delete_item_at_index(p, idx);
+                }
+            }
+        }
+    }
+
+    g_dyn_split.is_open = false;
+    if (total_splits_made > 0) {
+        record_project_change("Dynamic Split Items", true);
+    }
+}
+
+// Helper to parse comma-separated tokens into an array of strings
+static int split_csv_tokens(const char *csv, char out_tokens[][128], int max_tokens) {
+    if (!csv || !out_tokens || max_tokens <= 0) return 0;
+    int cnt = 0;
+    const char *p = csv;
+    while (*p && cnt < max_tokens) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        while (len > 0 && (*p == ' ' || *p == '\t')) { p++; len--; }
+        if (len >= 128) len = 127;
+        memcpy(out_tokens[cnt], p, len);
+        out_tokens[cnt][len] = '\0';
+        cnt++;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return cnt;
+}
+
+// Strips surrounding quotes from a function argument string
+static void unquote_arg_string(const char *in, char *out, size_t max_len) {
+    if (!in || !out || max_len == 0) return;
+    const char *s = in;
+    while (*s == ' ' || *s == '\t') s++;
+    size_t l = strlen(s);
+    while (l > 0 && (s[l - 1] == ' ' || s[l - 1] == '\t' || s[l - 1] == '\r' || s[l - 1] == '\n')) l--;
+    if (l >= 2 && ((s[0] == '\"' && s[l - 1] == '\"') || (s[0] == '\'' && s[l - 1] == '\''))) {
+        s++;
+        l -= 2;
+    }
+    if (l >= max_len) l = max_len - 1;
+    memcpy(out, s, l);
+    out[l] = '\0';
+}
+
+// Scans a Lua (.lua) or Python (.py) script for popup window / dialog creation calls.
+// Returns true and opens g_script_popup if the script requests a popup window before running.
+static bool inspect_and_open_script_popup_if_needed(const char *filepath, bool is_python, SDL_Window *win) {
+    if (!filepath || !filepath[0]) return false;
+    FILE *f = fopen(filepath, "rb");
+    if (!f) return false;
+
+    bool wants_popup = false;
+    memset(&g_script_popup, 0, sizeof(g_script_popup));
+    g_script_popup.win_rect = (SDL_Rect){ 390, 130, 480, 320 };
+    g_script_popup.focused_ctrl_idx = -1;
+    g_script_popup.dragging_slider_idx = -1;
+    g_script_popup.is_python = is_python;
+    strncpy(g_script_popup.script_filepath, filepath, sizeof(g_script_popup.script_filepath) - 1);
+    snprintf(g_script_popup.title, sizeof(g_script_popup.title), "%s Script Window", is_python ? "Python" : "Lua");
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (s[0] == '\0' || s[0] == '\r' || s[0] == '\n') continue;
+        if (s[0] == '#' || (s[0] == '-' && s[1] == '-')) continue;
+
+        // 1. REAPER GetUserInputs("Title", num_inputs, "Caption1,Caption2", "Def1,Def2") or RPR_GetUserInputs
+        if (str_contains_nocase(s, "GetUserInputs")) {
+            const char *fn_tok = str_contains_nocase(s, "RPR_GetUserInputs") ? "RPR_GetUserInputs" : "GetUserInputs";
+            char a_title[128] = {0}, a_num[32] = {0}, a_caps[256] = {0}, a_defs[256] = {0};
+            extract_func_call_arg(s, fn_tok, 0, a_title, sizeof(a_title));
+            extract_func_call_arg(s, fn_tok, 1, a_num, sizeof(a_num));
+            extract_func_call_arg(s, fn_tok, 2, a_caps, sizeof(a_caps));
+            extract_func_call_arg(s, fn_tok, 3, a_defs, sizeof(a_defs));
+
+            char clean_title[128] = {0}, clean_caps[256] = {0}, clean_defs[256] = {0};
+            unquote_arg_string(a_title, clean_title, sizeof(clean_title));
+            unquote_arg_string(a_caps, clean_caps, sizeof(clean_caps));
+            unquote_arg_string(a_defs, clean_defs, sizeof(clean_defs));
+            if (clean_title[0]) strncpy(g_script_popup.title, clean_title, sizeof(g_script_popup.title) - 1);
+
+            char caps_arr[MAX_SCRIPT_POPUP_CONTROLS][128];
+            char defs_arr[MAX_SCRIPT_POPUP_CONTROLS][128];
+            memset(caps_arr, 0, sizeof(caps_arr));
+            memset(defs_arr, 0, sizeof(defs_arr));
+            int n_caps = split_csv_tokens(clean_caps, caps_arr, MAX_SCRIPT_POPUP_CONTROLS);
+            int n_defs = split_csv_tokens(clean_defs, defs_arr, MAX_SCRIPT_POPUP_CONTROLS);
+            int n_req = atoi(a_num);
+            if (n_req <= 0 || n_req > MAX_SCRIPT_POPUP_CONTROLS) n_req = (n_caps > 0) ? n_caps : 1;
+
+            for (int k = 0; k < n_req && g_script_popup.num_controls < MAX_SCRIPT_POPUP_CONTROLS; k++) {
+                ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.num_controls++];
+                ctrl->type = SCP_CTRL_INPUT;
+                snprintf(ctrl->label, sizeof(ctrl->label), "%s", (k < n_caps && caps_arr[k][0]) ? caps_arr[k] : "Value:");
+                snprintf(ctrl->var_name, sizeof(ctrl->var_name), "val%d", k + 1);
+                snprintf(ctrl->str_val, sizeof(ctrl->str_val), "%s", (k < n_defs) ? defs_arr[k] : "0");
+                ctrl->num_val = atof(ctrl->str_val);
+            }
+            wants_popup = true;
+        }
+
+        // 2. Custom Window creation: gfx.init("Title", w, h) / daw.create_window("Title", w, h) / create_popup_window("Title", w, h) / tk.Tk()
+        if (str_contains_nocase(s, "gfx.init") || str_contains_nocase(s, "create_window") ||
+            str_contains_nocase(s, "create_popup_window") || str_contains_nocase(s, "daw_window") ||
+            str_contains_nocase(s, "tk.Tk(") || str_contains_nocase(s, "tkinter")) {
+            const char *fn_tok = str_contains_nocase(s, "gfx.init") ? "gfx.init"
+                               : (str_contains_nocase(s, "create_popup_window") ? "create_popup_window"
+                               : (str_contains_nocase(s, "create_window") ? "create_window" : "daw_window"));
+            char a_title[128] = {0}, a_w[32] = {0}, a_h[32] = {0};
+            if (extract_func_call_arg(s, fn_tok, 0, a_title, sizeof(a_title))) {
+                char clean_title[128] = {0};
+                unquote_arg_string(a_title, clean_title, sizeof(clean_title));
+                if (clean_title[0]) strncpy(g_script_popup.title, clean_title, sizeof(g_script_popup.title) - 1);
+            }
+            if (extract_func_call_arg(s, fn_tok, 1, a_w, sizeof(a_w))) {
+                int w = atoi(a_w);
+                if (w >= 300 && w <= 860) g_script_popup.win_rect.w = w;
+            }
+            if (extract_func_call_arg(s, fn_tok, 2, a_h, sizeof(a_h))) {
+                int h = atoi(a_h);
+                if (h >= 180 && h <= 640) g_script_popup.win_rect.h = h;
+            }
+            wants_popup = true;
+        }
+
+        // 3. Explicit Slider control in Lua/Python: add_slider("Label", min, max, default)
+        if (str_contains_nocase(s, "add_slider") && g_script_popup.num_controls < MAX_SCRIPT_POPUP_CONTROLS) {
+            char a_lbl[128] = {0}, a_min[32] = {0}, a_max[32] = {0}, a_def[32] = {0};
+            extract_func_call_arg(s, "add_slider", 0, a_lbl, sizeof(a_lbl));
+            extract_func_call_arg(s, "add_slider", 1, a_min, sizeof(a_min));
+            extract_func_call_arg(s, "add_slider", 2, a_max, sizeof(a_max));
+            extract_func_call_arg(s, "add_slider", 3, a_def, sizeof(a_def));
+            ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.num_controls++];
+            ctrl->type = SCP_CTRL_SLIDER;
+            unquote_arg_string(a_lbl, ctrl->label, sizeof(ctrl->label));
+            snprintf(ctrl->var_name, sizeof(ctrl->var_name), "val%d", g_script_popup.num_controls);
+            ctrl->min_val = a_min[0] ? atof(a_min) : 0.0;
+            ctrl->max_val = a_max[0] ? atof(a_max) : 100.0;
+            if (ctrl->max_val <= ctrl->min_val) ctrl->max_val = ctrl->min_val + 100.0;
+            ctrl->num_val = a_def[0] ? atof(a_def) : ctrl->min_val;
+            snprintf(ctrl->str_val, sizeof(ctrl->str_val), "%.2f", ctrl->num_val);
+            wants_popup = true;
+        }
+
+        // 4. Explicit Input box control in Lua/Python: add_input("Label", "default")
+        if ((str_contains_nocase(s, "add_input") || str_contains_nocase(s, "input_dialog")) &&
+            g_script_popup.num_controls < MAX_SCRIPT_POPUP_CONTROLS) {
+            const char *tok = str_contains_nocase(s, "add_input") ? "add_input" : "input_dialog";
+            char a_lbl[128] = {0}, a_def[128] = {0};
+            extract_func_call_arg(s, tok, 0, a_lbl, sizeof(a_lbl));
+            extract_func_call_arg(s, tok, 1, a_def, sizeof(a_def));
+            ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.num_controls++];
+            ctrl->type = SCP_CTRL_INPUT;
+            unquote_arg_string(a_lbl, ctrl->label, sizeof(ctrl->label));
+            unquote_arg_string(a_def, ctrl->str_val, sizeof(ctrl->str_val));
+            if (!ctrl->str_val[0]) strcpy(ctrl->str_val, "0.0");
+            ctrl->num_val = atof(ctrl->str_val);
+            snprintf(ctrl->var_name, sizeof(ctrl->var_name), "val%d", g_script_popup.num_controls);
+            wants_popup = true;
+        }
+
+        // 5. Explicit Checkbox control in Lua/Python: add_checkbox("Label", true/false)
+        if (str_contains_nocase(s, "add_checkbox") && g_script_popup.num_controls < MAX_SCRIPT_POPUP_CONTROLS) {
+            char a_lbl[128] = {0}, a_def[32] = {0};
+            extract_func_call_arg(s, "add_checkbox", 0, a_lbl, sizeof(a_lbl));
+            extract_func_call_arg(s, "add_checkbox", 1, a_def, sizeof(a_def));
+            ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.num_controls++];
+            ctrl->type = SCP_CTRL_CHECKBOX;
+            unquote_arg_string(a_lbl, ctrl->label, sizeof(ctrl->label));
+            ctrl->bool_val = str_contains_nocase(a_def, "true") || str_contains_nocase(a_def, "1");
+            ctrl->num_val = ctrl->bool_val ? 1.0 : 0.0;
+            snprintf(ctrl->var_name, sizeof(ctrl->var_name), "val%d", g_script_popup.num_controls);
+            wants_popup = true;
+        }
+
+        // 6. ShowMessageBox("Message", "Title", type)
+        if (str_contains_nocase(s, "ShowMessageBox") && g_script_popup.num_controls < MAX_SCRIPT_POPUP_CONTROLS) {
+            char a_msg[256] = {0}, a_title[128] = {0};
+            extract_func_call_arg(s, "ShowMessageBox", 0, a_msg, sizeof(a_msg));
+            extract_func_call_arg(s, "ShowMessageBox", 1, a_title, sizeof(a_title));
+            char clean_title[128] = {0};
+            unquote_arg_string(a_title, clean_title, sizeof(clean_title));
+            if (clean_title[0]) strncpy(g_script_popup.title, clean_title, sizeof(g_script_popup.title) - 1);
+            ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.num_controls++];
+            ctrl->type = SCP_CTRL_LABEL;
+            unquote_arg_string(a_msg, ctrl->str_val, sizeof(ctrl->str_val));
+            snprintf(ctrl->label, sizeof(ctrl->label), "Message:");
+            wants_popup = true;
+        }
+    }
+    fclose(f);
+
+    if (!wants_popup) return false;
+
+    // Ensure at least one interactive parameter control if gfx.init/create_window was called without explicit add_*
+    if (g_script_popup.num_controls == 0) {
+        ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.num_controls++];
+        ctrl->type = SCP_CTRL_INPUT;
+        snprintf(ctrl->label, sizeof(ctrl->label), "Parameter Value:");
+        snprintf(ctrl->var_name, sizeof(ctrl->var_name), "val1");
+        snprintf(ctrl->str_val, sizeof(ctrl->str_val), "1.00");
+        ctrl->num_val = 1.0;
+    }
+
+    int needed_h = 110 + g_script_popup.num_controls * 42;
+    if (needed_h > g_script_popup.win_rect.h) g_script_popup.win_rect.h = needed_h;
+    if (g_script_popup.win_rect.h > 540) g_script_popup.win_rect.h = 540;
+
+    int win_w = 1280, win_h = 720;
+    if (win) SDL_GetWindowSize(win, &win_w, &win_h);
+    g_script_popup.win_rect.x = (win_w - g_script_popup.win_rect.w) / 2;
+    g_script_popup.win_rect.y = (win_h - g_script_popup.win_rect.h) / 2;
+    g_script_popup.focused_ctrl_idx = (g_script_popup.controls[0].type == SCP_CTRL_INPUT) ? 0 : -1;
+    if (g_script_popup.focused_ctrl_idx >= 0) SDL_StartTextInput();
+    g_script_popup.is_open = true;
+    return true;
 }
 
 // Built-in C Lua & Python Script Interpreter:
@@ -5623,6 +7535,11 @@ static void execute_script_action_entry(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
     char resolved_path[1024] = {0};
     char custom_msg[160] = {0};
     if (resolve_script_filepath(act, resolved_path, sizeof(resolved_path))) {
+        if (inspect_and_open_script_popup_if_needed(resolved_path, act->is_python, win)) {
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Opened script popup window: %s", g_script_popup.title);
+            return;
+        }
         if (interpret_custom_script_file(p, ren, win, resolved_path, custom_msg, sizeof(custom_msg))) {
             const char *msg_to_show = custom_msg[0] ? custom_msg : act->description;
             record_project_change(msg_to_show, true);
@@ -6087,21 +8004,62 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_SWS_REPOSITION_ITEMS: {
-            push_undo_state();
-            for (int t = 0; t < p->num_tracks; t++) {
-                double cur_end = -1.0;
-                for (int i = 0; i < p->num_items; i++) {
-                    if (p->items[i].is_selected && p->items[i].track_idx == t) {
-                        if (cur_end < 0.0) {
-                            cur_end = p->items[i].start_time + p->items[i].duration;
-                        } else {
-                            p->items[i].start_time = cur_end;
-                            cur_end += p->items[i].duration;
-                        }
+            g_reposition.is_open = true;
+            g_reposition.win_rect.x = (win_w - g_reposition.win_rect.w) / 2;
+            g_reposition.win_rect.y = (win_h - g_reposition.win_rect.h) / 2;
+            g_reposition.interval_focused = true;
+            SDL_StartTextInput();
+            break;
+        }
+        case ACT_ITEM_DYNAMIC_SPLIT: {
+            g_dyn_split.is_open = true;
+            g_dyn_split.win_rect.x = (win_w - g_dyn_split.win_rect.w) / 2;
+            g_dyn_split.win_rect.y = (win_h - g_dyn_split.win_rect.h) / 2;
+            g_dyn_split.editing_field_id = 0;
+            g_dyn_split.dragging_slider_id = 0;
+            g_dyn_split.status_msg[0] = '\0';
+            break;
+        }
+        case ACT_ITEM_MOVE_UP_TRACK: {
+            bool moved = false;
+            for (int i = 0; i < p->num_items; i++) {
+                if (!p->items[i].is_selected) continue;
+                int cur_t = p->items[i].track_idx;
+                int prev_t = -1;
+                for (int t = cur_t - 1; t >= 0; t--) {
+                    if (!is_track_hidden(t)) { prev_t = t; break; }
+                }
+                if (prev_t >= 0) {
+                    if (!moved) { push_undo_state(); moved = true; }
+                    p->items[i].track_idx = prev_t;
+                    if (!is_crossfade_active()) {
+                        p->items[i].start_time = clamp_non_overlapping_start(
+                            p, i, prev_t, p->items[i].start_time, p->items[i].duration);
                     }
                 }
             }
-            record_project_change("Xenakios/SWS: Reposition selected items", true);
+            if (moved) record_project_change("Moved Selected Clip(s) Up (8)", true);
+            break;
+        }
+        case ACT_ITEM_MOVE_DOWN_TRACK: {
+            bool moved = false;
+            for (int i = 0; i < p->num_items; i++) {
+                if (!p->items[i].is_selected) continue;
+                int cur_t = p->items[i].track_idx;
+                int next_t = -1;
+                for (int t = cur_t + 1; t < p->num_tracks; t++) {
+                    if (!is_track_hidden(t)) { next_t = t; break; }
+                }
+                if (next_t >= 0) {
+                    if (!moved) { push_undo_state(); moved = true; }
+                    p->items[i].track_idx = next_t;
+                    if (!is_crossfade_active()) {
+                        p->items[i].start_time = clamp_non_overlapping_start(
+                            p, i, next_t, p->items[i].start_time, p->items[i].duration);
+                    }
+                }
+            }
+            if (moved) record_project_change("Moved Selected Clip(s) Down (2)", true);
             break;
         }
         case ACT_SWS_SCROLL_TRACK_VIEW_DOWN_PAGE: {
@@ -6143,22 +8101,39 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
 
-        // ---- ITEM SELECTION & NAVIGATION ----
+        // ---- ITEM SELECTION & NAVIGATION (ONLY FOR SELECTED TRACK) ----
         case ACT_ITEM_NAV_PREV_ITEM: {
+            bool any_trk_sel = false;
+            for (int t = 0; t < p->num_tracks; t++) {
+                if (p->track_selected[t] && !is_track_hidden(t)) { any_trk_sel = true; break; }
+            }
+            if (!any_trk_sel) {
+                for (int i = 0; i < p->num_items; i++) {
+                    if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx)) {
+                        p->track_selected[p->items[i].track_idx] = true;
+                        any_trk_sel = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_trk_sel) break;
+
             int best_idx = -1;
             double best_t = -1.0;
             for (int i = 0; i < p->num_items; i++) {
-                if (is_track_hidden(p->items[i].track_idx)) continue;
+                int tr = p->items[i].track_idx;
+                if (tr < 0 || tr >= p->num_tracks || !p->track_selected[tr] || is_track_hidden(tr)) continue;
                 double st = p->items[i].start_time;
                 if (st < p->playhead_seconds - 0.001 && st > best_t) {
                     best_t = st;
                     best_idx = i;
                 }
             }
-            if (best_idx < 0 && p->num_items > 0) {
+            if (best_idx < 0) {
                 double earliest = 1e18;
                 for (int i = 0; i < p->num_items; i++) {
-                    if (is_track_hidden(p->items[i].track_idx)) continue;
+                    int tr = p->items[i].track_idx;
+                    if (tr < 0 || tr >= p->num_tracks || !p->track_selected[tr] || is_track_hidden(tr)) continue;
                     if (p->items[i].start_time < earliest) {
                         earliest = p->items[i].start_time;
                         best_idx = i;
@@ -6167,15 +8142,32 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             }
             if (best_idx >= 0) {
                 for (int i = 0; i < p->num_items; i++) p->items[i].is_selected = (i == best_idx);
+                g_last_clicked_item_idx = best_idx;
                 p->playhead_seconds = p->items[best_idx].start_time;
             }
             break;
         }
         case ACT_ITEM_NAV_NEXT_ITEM: {
+            bool any_trk_sel = false;
+            for (int t = 0; t < p->num_tracks; t++) {
+                if (p->track_selected[t] && !is_track_hidden(t)) { any_trk_sel = true; break; }
+            }
+            if (!any_trk_sel) {
+                for (int i = 0; i < p->num_items; i++) {
+                    if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx)) {
+                        p->track_selected[p->items[i].track_idx] = true;
+                        any_trk_sel = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_trk_sel) break;
+
             int best_idx = -1;
             double best_t = 1e18;
             for (int i = 0; i < p->num_items; i++) {
-                if (is_track_hidden(p->items[i].track_idx)) continue;
+                int tr = p->items[i].track_idx;
+                if (tr < 0 || tr >= p->num_tracks || !p->track_selected[tr] || is_track_hidden(tr)) continue;
                 double st = p->items[i].start_time;
                 if (st > p->playhead_seconds + 0.001 && st < best_t) {
                     best_t = st;
@@ -6184,6 +8176,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             }
             if (best_idx >= 0) {
                 for (int i = 0; i < p->num_items; i++) p->items[i].is_selected = (i == best_idx);
+                g_last_clicked_item_idx = best_idx;
                 p->playhead_seconds = p->items[best_idx].start_time;
             }
             break;
@@ -6674,12 +8667,15 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         // ---- TRANSPORT, EDIT, MARKERS, LOOP & FILE ----
         case ACT_TRANSPORT_PLAY_STOP:
         case ACT_TRANSPORT_PAUSE: {
-            p->is_playing = !p->is_playing;
+            if (g_rec.is_recording) {
+                start_or_stop_recording(p, ren, win);
+            } else {
+                p->is_playing = !p->is_playing;
+            }
             break;
         }
         case ACT_TRANSPORT_RECORD: {
-            p->is_playing = !p->is_playing;
-            record_project_change("Transport: Record toggled", false);
+            start_or_stop_recording(p, ren, win);
             break;
         }
         case ACT_TRANSPORT_GO_TO_START: {
@@ -7019,24 +9015,35 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
         return true;
     }
 
-    // 2. Top Filter Row (wy + 38 .. wy + 64)
+    // 2. Top Filter & Pin / Move Row (wy + 38 .. wy + 64)
     if (my >= wy + 38 && my <= wy + 64) {
-        if (mx >= wx + 62 && mx <= wx + 412) {
+        if (mx >= wx + 58 && mx <= wx + 286) {
             g_action_win.filter_focused = true;
             SDL_StartTextInput();
-        } else if (mx >= wx + 420 && mx <= wx + 492) {
+        } else if (mx >= wx + 292 && mx <= wx + 350) {
             // [Clear]
             g_action_win.filter_text[0] = '\0';
             g_action_win.scroll_y = 0;
             refresh_filtered_actions();
-        } else if (mx >= wx + 500 && mx <= wx + 584) {
+        } else if (mx >= wx + 356 && mx <= wx + 420) {
+            // [Pin] -> Toggle Pin on selected action (brings to top & saves permanently)
+            toggle_pin_selected_action();
+        } else if (mx >= wx + 426 && mx <= wx + 464) {
+            // [Up ^] -> Move selected action row up
+            move_selected_action_row(-1);
+            scroll_action_list_to_selected(g_action_win.win_rect.h - 244);
+        } else if (mx >= wx + 470 && mx <= wx + 510) {
+            // [Dn v] -> Move selected action row down
+            move_selected_action_row(1);
+            scroll_action_list_to_selected(g_action_win.win_rect.h - 244);
+        } else if (mx >= wx + 516 && mx <= wx + 592) {
             // [Refresh] -> Rescan scripts folder for newly added .lua / .py scripts & save keyboard_shortcuts.json
             scan_scripts_directory_to_actions(&g_daw);
             save_keyboard_shortcuts_json();
             refresh_filtered_actions();
             snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
                      "Refreshed scripts folder (%d actions ready)", g_num_actions);
-        } else if (mx >= wx + 592 && mx <= wx + 766) {
+        } else if (mx >= wx + 598 && mx <= wx + 766) {
             // [Find shortcut...]
             g_action_win.capturing_find_shortcut = true;
         }
@@ -7182,10 +9189,10 @@ static void render_action_window(SDL_Renderer *ren) {
     }
     draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
 
-    // ---- Top Filter Row ----
+    // ---- Top Filter + Pin & Move Row ----
     draw_text(ren, "Filter", wx + 14, wy + 45, c_white);
 
-    SDL_Rect flt_box = { wx + 62, wy + 38, 350, 26 };
+    SDL_Rect flt_box = { wx + 58, wy + 38, 228, 26 };
     SDL_SetRenderDrawColor(ren, 16, 15, 14, 255);
     SDL_RenderFillRect(ren, &flt_box);
     draw_brown_border_rect(ren, &flt_box, g_action_win.filter_focused, false);
@@ -7200,23 +9207,44 @@ static void render_action_window(SDL_Renderer *ren) {
         }
     }
 
-    SDL_Rect btn_clear = { wx + 420, wy + 38, 72, 26 };
+    SDL_Rect btn_clear = { wx + 292, wy + 38, 58, 26 };
     SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
     SDL_RenderFillRect(ren, &btn_clear);
     draw_brown_border_rect(ren, &btn_clear, false, false);
-    draw_text(ren, "Clear", wx + 436, wy + 45, c_white);
+    draw_text(ren, "Clear", wx + 301, wy + 45, c_white);
 
-    SDL_Rect btn_opt = { wx + 500, wy + 38, 84, 26 };
+    bool cur_pinned = (g_action_win.selected_action_idx >= 0 && g_action_win.selected_action_idx < g_num_actions &&
+                       g_actions[g_action_win.selected_action_idx].is_pinned);
+    SDL_Rect btn_pin = { wx + 356, wy + 38, 64, 26 };
+    SDL_SetRenderDrawColor(ren, cur_pinned ? 74 : 44, cur_pinned ? 52 : 38, cur_pinned ? 30 : 34, 255);
+    SDL_RenderFillRect(ren, &btn_pin);
+    draw_brown_border_rect(ren, &btn_pin, cur_pinned, false);
+    draw_pin_symbol_icon(ren, wx + 362, wy + 44, cur_pinned, cur_pinned ? c_accent : c_white);
+    draw_text(ren, "Pin", wx + 378, wy + 45, c_white);
+
+    SDL_Rect btn_up = { wx + 426, wy + 38, 38, 26 };
+    SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
+    SDL_RenderFillRect(ren, &btn_up);
+    draw_brown_border_rect(ren, &btn_up, false, false);
+    draw_text(ren, "Up^", wx + 433, wy + 45, c_white);
+
+    SDL_Rect btn_dn = { wx + 470, wy + 38, 40, 26 };
+    SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
+    SDL_RenderFillRect(ren, &btn_dn);
+    draw_brown_border_rect(ren, &btn_dn, false, false);
+    draw_text(ren, "Dn v", wx + 474, wy + 45, c_white);
+
+    SDL_Rect btn_opt = { wx + 516, wy + 38, 76, 26 };
     SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
     SDL_RenderFillRect(ren, &btn_opt);
     draw_brown_border_rect(ren, &btn_opt, false, false);
-    draw_text(ren, "Refresh", wx + 514, wy + 45, c_white);
+    draw_text(ren, "Refresh", wx + 526, wy + 45, c_white);
 
-    SDL_Rect btn_find = { wx + 592, wy + 38, 174, 26 };
+    SDL_Rect btn_find = { wx + 598, wy + 38, 168, 26 };
     SDL_SetRenderDrawColor(ren, 52, 42, 34, 255);
     SDL_RenderFillRect(ren, &btn_find);
     draw_brown_border_rect(ren, &btn_find, true, false);
-    draw_text(ren, "Find shortcut...", wx + 616, wy + 45, c_white);
+    draw_text(ren, "Find shortcut...", wx + 618, wy + 45, c_white);
 
     // ---- Main Table: Shortcut | Description ----
     int tbl_x = wx + 14;
@@ -7278,10 +9306,15 @@ static void render_action_window(SDL_Renderer *ren) {
                               is_sel ? c_white : c_accent, &sc_clip, &rows_clip);
         }
 
-        // Column 2: Description
+        // Column 2: Description (with Pin symbol when pinned)
+        int desc_text_x = tbl_x + col1_w + 10;
+        if (act->is_pinned) {
+            draw_pin_symbol_icon(ren, tbl_x + col1_w + 8, ry + 4, true, c_accent);
+            desc_text_x += 16;
+        }
         SDL_Rect desc_clip = { tbl_x + col1_w + 6, ry + 1, tbl_w - col1_w - 26, 19 };
-        draw_text_clipped(ren, act->description, tbl_x + col1_w + 10, ry + 4,
-                          c_white, &desc_clip, &rows_clip);
+        draw_text_clipped(ren, act->description, desc_text_x, ry + 4,
+                          act->is_pinned ? c_accent : c_white, &desc_clip, &rows_clip);
     }
     SDL_RenderSetClipRect(ren, NULL);
 
@@ -7415,6 +9448,9 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
 
     if (g_daw.save_prompt_open) return true;
     if (g_multi_import.is_open) return true;
+    if (g_dyn_split.is_open && point_in_rect(mx, my, &g_dyn_split.win_rect)) return true;
+    if (g_reposition.is_open && point_in_rect(mx, my, &g_reposition.win_rect)) return true;
+    if (g_script_popup.is_open && point_in_rect(mx, my, &g_script_popup.win_rect)) return true;
 
     if (g_export.is_open) {
         if (out_cursor) {
@@ -7495,7 +9531,7 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
         if (point_in_rect(mx, my, &f_box)) return true;
     }
     if (g_daw.menu_action_open) {
-        SDL_Rect a_box = { 60, m_start, 168, 56 };
+        SDL_Rect a_box = { 60, m_start, 178, 108 };
         if (point_in_rect(mx, my, &a_box)) return true;
     }
     if (g_menu_tools_open) {
@@ -7559,8 +9595,10 @@ int main(int argc, char *argv[]) {
     g_daw.editing_track_name_idx = -1;
     g_daw.editing_marker_idx = -1;
     g_daw.script_selected_idx = -1;
-    g_daw.script_win_rect = (SDL_Rect){ 390, 140, 480, 320 };
+    g_daw.script_win_rect = (SDL_Rect){ 360, 120, 560, 380 };
 
+    set_daw_window_thumbnail_icon(win);
+    init_default_recording_folder();
     init_tab_defaults(0, "Project 1");
     init_keyboard_actions_system();
     push_undo_state();
@@ -7731,6 +9769,38 @@ int main(int argc, char *argv[]) {
                 }
             } else if (e.type == SDL_TEXTINPUT) {
                 if (g_daw.save_prompt_open) continue;
+                if (g_script_popup.is_open && g_script_popup.focused_ctrl_idx >= 0 &&
+                    g_script_popup.focused_ctrl_idx < g_script_popup.num_controls) {
+                    ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.focused_ctrl_idx];
+                    if (strlen(ctrl->str_val) + strlen(e.text.text) < sizeof(ctrl->str_val) - 1) {
+                        strcat(ctrl->str_val, e.text.text);
+                        ctrl->num_val = atof(ctrl->str_val);
+                    }
+                    continue;
+                }
+                if (g_reposition.is_open && g_reposition.interval_focused) {
+                    if (strlen(g_reposition.interval_str) + strlen(e.text.text) < sizeof(g_reposition.interval_str) - 1) {
+                        strcat(g_reposition.interval_str, e.text.text);
+                    }
+                    continue;
+                }
+                if (g_dyn_split.is_open && g_dyn_split.editing_field_id > 0) {
+                    if (strlen(g_dyn_split.edit_buf) + strlen(e.text.text) < sizeof(g_dyn_split.edit_buf) - 1) {
+                        strcat(g_dyn_split.edit_buf, e.text.text);
+                    }
+                    continue;
+                }
+                if (g_daw.script_manager_open && g_script_filter_focused) {
+                    if (strlen(g_script_filter_text) + strlen(e.text.text) < sizeof(g_script_filter_text) - 1) {
+                        strcat(g_script_filter_text, e.text.text);
+                        g_script_scroll_y = 0;
+                        refresh_filtered_scripts();
+                        if (g_script_num_filtered > 0) {
+                            g_daw.script_selected_idx = g_script_filtered_indices[0];
+                        }
+                    }
+                    continue;
+                }
                 if (g_theme.is_open && g_theme.code_focused) {
                     if (strlen(g_theme.code_buf) + strlen(e.text.text) < sizeof(g_theme.code_buf) - 1) {
                         strcat(g_theme.code_buf, e.text.text);
@@ -7808,6 +9878,92 @@ int main(int argc, char *argv[]) {
                 if (g_daw.save_prompt_open) {
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
                         handle_save_modal_choice(3, &running);
+                    }
+                    continue;
+                }
+                if (g_script_popup.is_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        g_script_popup.is_open = false;
+                        SDL_StopTextInput();
+                        continue;
+                    }
+                    if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        g_script_popup.is_open = false;
+                        SDL_StopTextInput();
+                        char custom_msg[160] = {0};
+                        interpret_custom_script_file(p, ren, win, g_script_popup.script_filepath, custom_msg, sizeof(custom_msg));
+                        record_project_change(custom_msg[0] ? custom_msg : g_script_popup.title, true);
+                        continue;
+                    }
+                    if (e.key.keysym.sym == SDLK_BACKSPACE && g_script_popup.focused_ctrl_idx >= 0 &&
+                        g_script_popup.focused_ctrl_idx < g_script_popup.num_controls) {
+                        char *sb = g_script_popup.controls[g_script_popup.focused_ctrl_idx].str_val;
+                        size_t l = strlen(sb);
+                        if (l > 0) sb[l - 1] = '\0';
+                        g_script_popup.controls[g_script_popup.focused_ctrl_idx].num_val = atof(sb);
+                        continue;
+                    }
+                    continue;
+                }
+                if (g_reposition.is_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        g_reposition.is_open = false;
+                        g_reposition.interval_focused = false;
+                        SDL_StopTextInput();
+                        continue;
+                    }
+                    if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        g_reposition.interval_focused = false;
+                        SDL_StopTextInput();
+                        execute_reposition_items_dialog(p);
+                        continue;
+                    }
+                    if (e.key.keysym.sym == SDLK_BACKSPACE && g_reposition.interval_focused) {
+                        size_t l = strlen(g_reposition.interval_str);
+                        if (l > 0) g_reposition.interval_str[l - 1] = '\0';
+                        continue;
+                    }
+                    continue;
+                }
+                if (g_dyn_split.is_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        if (g_dyn_split.editing_field_id > 0) {
+                            g_dyn_split.editing_field_id = 0;
+                            SDL_StopTextInput();
+                        } else {
+                            g_dyn_split.is_open = false;
+                        }
+                        continue;
+                    }
+                    if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        if (g_dyn_split.editing_field_id > 0) {
+                            commit_dyn_split_field_edit();
+                        } else {
+                            execute_dynamic_split_items(p);
+                        }
+                        continue;
+                    }
+                    if (e.key.keysym.sym == SDLK_BACKSPACE && g_dyn_split.editing_field_id > 0) {
+                        size_t l = strlen(g_dyn_split.edit_buf);
+                        if (l > 0) g_dyn_split.edit_buf[l - 1] = '\0';
+                        continue;
+                    }
+                    continue;
+                }
+                if (g_daw.script_manager_open && g_script_filter_focused) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN) {
+                        g_script_filter_focused = false;
+                        SDL_StopTextInput();
+                    } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
+                        size_t l = strlen(g_script_filter_text);
+                        if (l > 0) {
+                            g_script_filter_text[l - 1] = '\0';
+                            g_script_scroll_y = 0;
+                            refresh_filtered_scripts();
+                            if (g_script_num_filtered > 0) {
+                                g_daw.script_selected_idx = g_script_filtered_indices[0];
+                            }
+                        }
                     }
                     continue;
                 }
@@ -7973,6 +10129,276 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // ================= LUA & PYTHON SCRIPT POPUP WINDOW INTERACTIONS =================
+                if (g_script_popup.is_open) {
+                    SDL_Rect *wr = &g_script_popup.win_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 30) {
+                        if (mx >= wx + ww - 28) {
+                            g_script_popup.is_open = false;
+                            SDL_StopTextInput();
+                        } else {
+                            g_script_popup.is_dragging = true;
+                            g_script_popup.drag_off_x = mx - wx;
+                            g_script_popup.drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+                    if (mx >= wx && mx <= wx + ww && my >= wy + 30 && my <= wy + wh) {
+                        g_script_popup.focused_ctrl_idx = -1;
+                        SDL_StopTextInput();
+                        for (int i = 0; i < g_script_popup.num_controls; i++) {
+                            ScriptPopupControl *ctrl = &g_script_popup.controls[i];
+                            int cy = wy + 46 + i * 38;
+                            if (my >= cy && my <= cy + 28) {
+                                if (ctrl->type == SCP_CTRL_CHECKBOX && mx >= wx + 20 && mx <= wx + 240) {
+                                    ctrl->bool_val = !ctrl->bool_val;
+                                    ctrl->num_val = ctrl->bool_val ? 1.0 : 0.0;
+                                } else if (ctrl->type == SCP_CTRL_SLIDER) {
+                                    int sl_x = wx + 180, sl_w = ww - 270;
+                                    if (sl_w < 80) sl_w = 80;
+                                    if (mx >= sl_x && mx <= sl_x + sl_w) {
+                                        g_script_popup.dragging_slider_idx = i;
+                                        double u = (double)(mx - sl_x) / (double)(sl_w > 1 ? sl_w : 1);
+                                        if (u < 0.0) u = 0.0; else if (u > 1.0) u = 1.0;
+                                        ctrl->num_val = ctrl->min_val + u * (ctrl->max_val - ctrl->min_val);
+                                    }
+                                } else if (ctrl->type == SCP_CTRL_INPUT && mx >= wx + 180 && mx <= wx + ww - 20) {
+                                    g_script_popup.focused_ctrl_idx = i;
+                                    SDL_StartTextInput();
+                                }
+                            }
+                        }
+                        int by = wy + wh - 42;
+                        if (my >= by && my <= by + 28) {
+                            if (mx >= wx + ww - 216 && mx <= wx + ww - 116) {
+                                // [OK / Run]
+                                g_script_popup.is_open = false;
+                                SDL_StopTextInput();
+                                char custom_msg[160] = {0};
+                                interpret_custom_script_file(p, ren, win, g_script_popup.script_filepath, custom_msg, sizeof(custom_msg));
+                                record_project_change(custom_msg[0] ? custom_msg : g_script_popup.title, true);
+                            } else if (mx >= wx + ww - 104 && mx <= wx + ww - 16) {
+                                g_script_popup.is_open = false;
+                                SDL_StopTextInput();
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // ================= REPOSITION ITEMS POPUP INTERACTIONS =================
+                if (g_reposition.is_open) {
+                    SDL_Rect *wr = &g_reposition.win_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 30) {
+                        if (mx >= wx + ww - 28) {
+                            g_reposition.is_open = false;
+                            g_reposition.interval_focused = false;
+                            SDL_StopTextInput();
+                        } else {
+                            g_reposition.is_dragging = true;
+                            g_reposition.drag_off_x = mx - wx;
+                            g_reposition.drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+                    if (mx >= wx && mx <= wx + ww && my >= wy + 30 && my <= wy + wh) {
+                        g_reposition.interval_focused = false;
+                        SDL_StopTextInput();
+                        if (mx >= wx + 24 && mx <= wx + 200 && my >= wy + 64 && my <= wy + 84) {
+                            g_reposition.mode = 0; // Item start
+                            save_themes_settings_json();
+                        } else if (mx >= wx + 24 && mx <= wx + 200 && my >= wy + 88 && my <= wy + 110) {
+                            g_reposition.mode = 1; // Item end
+                            save_themes_settings_json();
+                        } else if (mx >= wx + 132 && mx <= wx + 218 && my >= wy + 132 && my <= wy + 158) {
+                            g_reposition.interval_focused = true;
+                            SDL_StartTextInput();
+                        }
+                        int by = wy + wh - 42;
+                        if (my >= by && my <= by + 28) {
+                            if (mx >= wx + ww - 204 && mx <= wx + ww - 116) {
+                                execute_reposition_items_dialog(p);
+                            } else if (mx >= wx + ww - 104 && mx <= wx + ww - 16) {
+                                g_reposition.is_open = false;
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // ================= DYNAMIC SPLIT ITEMS POPUP INTERACTIONS =================
+                if (g_dyn_split.is_open) {
+                    SDL_Rect *wr = &g_dyn_split.win_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    if (g_dyn_split.editing_field_id > 0) {
+                        commit_dyn_split_field_edit();
+                    }
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 30) {
+                        if (mx >= wx + ww - 28) {
+                            g_dyn_split.is_open = false;
+                        } else {
+                            g_dyn_split.is_dragging = true;
+                            g_dyn_split.drag_off_x = mx - wx;
+                            g_dyn_split.drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+                    if (mx >= wx && mx <= wx + ww && my >= wy + 30 && my <= wy + wh) {
+                        int sl_x = wx + 162, sl_w = 232;
+                        int box_x = wx + 404, box_w = 54;
+                        // Top 3 checkboxes
+                        if (my >= wy + 66 && my <= wy + 86) {
+                            if (mx >= wx + 36 && mx <= wx + 158) g_dyn_split.split_at_transients = !g_dyn_split.split_at_transients;
+                            else if (mx >= wx + 168 && mx <= wx + 314) g_dyn_split.split_when_gate_opens = !g_dyn_split.split_when_gate_opens;
+                            else if (mx >= wx + 324 && mx <= wx + 476) g_dyn_split.split_when_gate_closes = !g_dyn_split.split_when_gate_closes;
+                            save_themes_settings_json();
+                        }
+                        // Reduce splits checkbox, slider, box
+                        if (my >= wy + 98 && my <= wy + 122) {
+                            if (mx >= wx + 24 && mx <= wx + 150) {
+                                g_dyn_split.reduce_splits_enabled = !g_dyn_split.reduce_splits_enabled;
+                                save_themes_settings_json();
+                            } else if (mx >= sl_x && mx <= sl_x + sl_w) {
+                                g_dyn_split.dragging_slider_id = 1;
+                                float u = (float)(mx - sl_x) / (float)sl_w;
+                                if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                                g_dyn_split.reduce_splits_val = 1 + (int)(u * 99.0f + 0.5f);
+                                save_themes_settings_json();
+                            } else if (mx >= box_x && mx <= box_x + box_w) {
+                                g_dyn_split.editing_field_id = 1;
+                                snprintf(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf), "%d", g_dyn_split.reduce_splits_val);
+                                SDL_StartTextInput();
+                            }
+                        }
+                        // Min slice length slider & box
+                        if (my >= wy + 134 && my <= wy + 158) {
+                            if (mx >= sl_x && mx <= sl_x + sl_w) {
+                                g_dyn_split.dragging_slider_id = 2;
+                                float u = (float)(mx - sl_x) / (float)sl_w;
+                                if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                                g_dyn_split.min_slice_ms = 1 + (int)(u * 999.0f + 0.5f);
+                                save_themes_settings_json();
+                            } else if (mx >= box_x && mx <= box_x + box_w) {
+                                g_dyn_split.editing_field_id = 2;
+                                snprintf(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf), "%d", g_dyn_split.min_slice_ms);
+                                SDL_StartTextInput();
+                            }
+                        }
+                        // Min silence length slider & box
+                        if (my >= wy + 170 && my <= wy + 194) {
+                            if (mx >= sl_x && mx <= sl_x + sl_w) {
+                                g_dyn_split.dragging_slider_id = 3;
+                                float u = (float)(mx - sl_x) / (float)sl_w;
+                                if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                                g_dyn_split.min_silence_ms = 10 + (int)(u * 1990.0f + 0.5f);
+                                save_themes_settings_json();
+                            } else if (mx >= box_x && mx <= box_x + box_w) {
+                                g_dyn_split.editing_field_id = 3;
+                                snprintf(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf), "%d", g_dyn_split.min_silence_ms);
+                                SDL_StartTextInput();
+                            }
+                        }
+                        // Threshold slider & box
+                        if (my >= wy + 250 && my <= wy + 274) {
+                            if (mx >= sl_x && mx <= sl_x + sl_w) {
+                                g_dyn_split.dragging_slider_id = 4;
+                                float u = (float)(mx - sl_x) / (float)sl_w;
+                                if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                                g_dyn_split.gate_threshold_db = -90.0f + u * 90.0f;
+                                save_themes_settings_json();
+                            } else if (mx >= box_x && mx <= box_x + box_w) {
+                                g_dyn_split.editing_field_id = 4;
+                                snprintf(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf), "%.1f", g_dyn_split.gate_threshold_db);
+                                SDL_StartTextInput();
+                            }
+                        }
+                        // Hysteresis slider & box
+                        if (my >= wy + 284 && my <= wy + 308) {
+                            if (mx >= sl_x && mx <= sl_x + sl_w) {
+                                g_dyn_split.dragging_slider_id = 5;
+                                float u = (float)(mx - sl_x) / (float)sl_w;
+                                if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                                g_dyn_split.gate_hysteresis_db = -24.0f + u * 24.0f;
+                                save_themes_settings_json();
+                            } else if (mx >= box_x && mx <= box_x + box_w) {
+                                g_dyn_split.editing_field_id = 5;
+                                snprintf(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf), "%.1f", g_dyn_split.gate_hysteresis_db);
+                                SDL_StartTextInput();
+                            }
+                        }
+                        // Display gate threshold in media items
+                        if (my >= wy + 316 && my <= wy + 336 && mx >= wx + 28 && mx <= wx + 340) {
+                            g_dyn_split.display_gate_threshold = !g_dyn_split.display_gate_threshold;
+                            save_themes_settings_json();
+                        }
+                        // Action mode selector
+                        if (my >= wy + 382 && my <= wy + 406 && mx >= wx + 28 && mx <= wx + ww - 28) {
+                            g_dyn_split.action_mode = (g_dyn_split.action_mode + 1) & 1;
+                            save_themes_settings_json();
+                        }
+                        // Timebase to beats
+                        if (my >= wy + 410 && my <= wy + 428 && mx >= wx + 28 && mx <= wx + 320) {
+                            g_dyn_split.set_timebase_to_beats = !g_dyn_split.set_timebase_to_beats;
+                            save_themes_settings_json();
+                        }
+                        // Snap offset checkbox & box
+                        if (my >= wy + 432 && my <= wy + 452) {
+                            if (mx >= wx + 28 && mx <= wx + 365) {
+                                g_dyn_split.set_snap_offset_peak = !g_dyn_split.set_snap_offset_peak;
+                                save_themes_settings_json();
+                            } else if (mx >= wx + 372 && mx <= wx + 420) {
+                                g_dyn_split.editing_field_id = 6;
+                                snprintf(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf), "%d", g_dyn_split.snap_offset_first_ms);
+                                SDL_StartTextInput();
+                            }
+                        }
+                        // Remove silent areas
+                        if (my >= wy + 454 && my <= wy + 474 && mx >= wx + 28 && mx <= wx + 450) {
+                            g_dyn_split.remove_silent_areas = !g_dyn_split.remove_silent_areas;
+                            save_themes_settings_json();
+                        }
+                        // Leading pad, Trailing pad, Fade pad
+                        if (my >= wy + 478 && my <= wy + 500) {
+                            if (mx >= wx + 128 && mx <= wx + 174) {
+                                g_dyn_split.editing_field_id = 7;
+                                snprintf(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf), "%d", g_dyn_split.leading_pad_ms);
+                                SDL_StartTextInput();
+                            } else if (mx >= wx + 306 && mx <= wx + 352) {
+                                g_dyn_split.editing_field_id = 8;
+                                snprintf(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf), "%d", g_dyn_split.trailing_pad_ms);
+                                SDL_StartTextInput();
+                            } else if (mx >= wx + 384 && mx <= wx + 480) {
+                                g_dyn_split.fade_pad = !g_dyn_split.fade_pad;
+                                save_themes_settings_json();
+                            }
+                        }
+                        // Bottom buttons: [Set transient sensitivity] [Presets] [Split] [Cancel]
+                        int btn_y = wy + wh - 42;
+                        if (my >= btn_y && my <= btn_y + 28) {
+                            if (mx >= wx + 14 && mx <= wx + 188) {
+                                g_dyn_split.split_at_transients = true;
+                                save_themes_settings_json();
+                            } else if (mx >= wx + 196 && mx <= wx + 278) {
+                                // Presets: restore default REAPER gate preset (-50dB, -6dB, 20ms, 500ms)
+                                g_dyn_split.gate_threshold_db = -50.0f;
+                                g_dyn_split.gate_hysteresis_db = -6.0f;
+                                g_dyn_split.min_slice_ms = 20;
+                                g_dyn_split.min_silence_ms = 500;
+                                g_dyn_split.leading_pad_ms = 50;
+                                g_dyn_split.trailing_pad_ms = 150;
+                                save_themes_settings_json();
+                            } else if (mx >= wx + 286 && mx <= wx + 390) {
+                                execute_dynamic_split_items(p);
+                            } else if (mx >= wx + 398 && mx <= wx + 486) {
+                                g_dyn_split.is_open = false;
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 // ================= UNIFIED EXPORT MEDIA POPUP INTERACTIONS =================
                 if (g_export.is_open) {
                     SDL_Rect *er = &g_export.win_rect;
@@ -8110,6 +10536,7 @@ int main(int argc, char *argv[]) {
                             g_export.two_pass_render = !g_export.two_pass_render;
                         }
 
+                        save_themes_settings_json();
                         // 8. Bottom buttons: [Render / Export] and [Close]
                         int btn_y = ey + eh - 44;
                         if (my >= btn_y && my <= btn_y + 32) {
@@ -8603,8 +11030,41 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
                     if (mx >= sr->x && mx <= sr->x + sr->w && my >= sr->y + 28 && my <= sr->y + sr->h) {
-                        int list_y = sr->y + 36;
-                        int list_h = sr->h - 82;
+                        if (g_script_filter_focused) {
+                            g_script_filter_focused = false;
+                            SDL_StopTextInput();
+                        }
+                        refresh_filtered_scripts();
+
+                        // Top Filter & Pin / Move Up / Move Down row (sr->y + 34 .. sr->y + 60)
+                        int top_y = sr->y + 34;
+                        if (my >= top_y && my <= top_y + 26) {
+                            int flt_w = sr->w - 310;
+                            if (flt_w < 110) flt_w = 110;
+                            int flt_x = sr->x + 56;
+                            int clr_x = flt_x + flt_w + 6;
+                            int pin_x = clr_x + 58;
+                            int up_x  = pin_x + 64;
+                            int dn_x  = up_x + 42;
+                            if (mx >= flt_x && mx <= flt_x + flt_w) {
+                                g_script_filter_focused = true;
+                                SDL_StartTextInput();
+                            } else if (mx >= clr_x && mx <= clr_x + 52) {
+                                g_script_filter_text[0] = '\0';
+                                g_script_scroll_y = 0;
+                                refresh_filtered_scripts();
+                            } else if (mx >= pin_x && mx <= pin_x + 58) {
+                                toggle_pin_selected_script();
+                            } else if (mx >= up_x && mx <= up_x + 38) {
+                                move_selected_script_row(-1);
+                            } else if (mx >= dn_x && mx <= dn_x + 40) {
+                                move_selected_script_row(1);
+                            }
+                            continue;
+                        }
+
+                        int list_y = sr->y + 66;
+                        int list_h = sr->h - 112;
                         int sb_x = sr->x + sr->w - 26;
 
                         // Scrollbar drag inside Script Manager
@@ -8615,19 +11075,20 @@ int main(int argc, char *argv[]) {
                             continue;
                         }
 
-                        // Script row selection & double-click execution
+                        // Script row selection & double-click execution (using filtered & pinned order)
                         if (my >= list_y && my < list_y + list_h && mx >= sr->x + 12 && mx < sb_x) {
                             int r = (my - (list_y + 4) + g_script_scroll_y) / 24;
-                            if (r >= 0 && r < g_daw.num_scripts) {
-                                g_daw.script_selected_idx = r;
+                            if (r >= 0 && r < g_script_num_filtered) {
+                                int sc_idx = g_script_filtered_indices[r];
+                                g_daw.script_selected_idx = sc_idx;
                                 if (e.button.clicks >= 2) {
                                     scan_scripts_directory_to_actions(&g_daw);
                                     for (int a = 0; a < g_num_actions; a++) {
-                                        if (g_actions[a].linked_script_idx == r ||
-                                            str_contains_nocase(g_actions[a].description, g_daw.scripts[r].name)) {
+                                        if (g_actions[a].linked_script_idx == sc_idx ||
+                                            str_contains_nocase(g_actions[a].description, g_daw.scripts[sc_idx].name)) {
                                             execute_daw_action_by_index(p, ren, win, a);
                                             snprintf(g_script_status_msg, sizeof(g_script_status_msg),
-                                                     "Executed: %s", g_daw.scripts[r].name);
+                                                     "Executed: %s", g_daw.scripts[sc_idx].name);
                                             break;
                                         }
                                     }
@@ -8738,8 +11199,8 @@ int main(int argc, char *argv[]) {
 
                 if (g_daw.menu_action_open) {
                     int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-                    if (mx >= 60 && mx <= 228 && my >= m_start && my <= m_start + 56) {
-                        if (my >= m_start && my < m_start + 28) {
+                    if (mx >= 60 && mx <= 238 && my >= m_start && my <= m_start + 108) {
+                        if (my >= m_start && my < m_start + 27) {
                             // Submenu 1: Keyboard Shortcut -> Opens REAPER-style Actions & Keyboard Shortcuts popup window
                             scan_scripts_directory_to_actions(&g_daw);
                             save_keyboard_shortcuts_json();
@@ -8748,11 +11209,30 @@ int main(int argc, char *argv[]) {
                             g_action_win.win_rect.y = (win_h - g_action_win.win_rect.h) / 2;
                             g_daw.menu_action_open = false;
                             continue;
-                        } else if (my >= m_start + 28 && my <= m_start + 56) {
+                        } else if (my >= m_start + 27 && my < m_start + 54) {
                             // Submenu 2: Scripts -> Opens unified Lua & Python Script Manager popup window
                             scan_scripts_directory_to_actions(&g_daw);
                             save_keyboard_shortcuts_json();
+                            refresh_filtered_scripts();
                             g_daw.script_manager_open = true;
+                            g_daw.menu_action_open = false;
+                            continue;
+                        } else if (my >= m_start + 54 && my < m_start + 81) {
+                            // Submenu 3: Dynamic Split (Ctrl+D) -> Opens REAPER Dynamic split items popup window
+                            g_dyn_split.is_open = true;
+                            g_dyn_split.win_rect.x = (win_w - g_dyn_split.win_rect.w) / 2;
+                            g_dyn_split.win_rect.y = (win_h - g_dyn_split.win_rect.h) / 2;
+                            g_dyn_split.editing_field_id = 0;
+                            g_dyn_split.dragging_slider_id = 0;
+                            g_daw.menu_action_open = false;
+                            continue;
+                        } else if (my >= m_start + 81 && my <= m_start + 108) {
+                            // Submenu 4: Reposition (W) -> Opens Reposition Items popup window
+                            g_reposition.is_open = true;
+                            g_reposition.win_rect.x = (win_w - g_reposition.win_rect.w) / 2;
+                            g_reposition.win_rect.y = (win_h - g_reposition.win_rect.h) / 2;
+                            g_reposition.interval_focused = true;
+                            SDL_StartTextInput();
                             g_daw.menu_action_open = false;
                             continue;
                         }
@@ -8840,13 +11320,20 @@ int main(int argc, char *argv[]) {
 
                 int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
                 if (mx < g_daw.tcp_width && my > corner_y && my <= corner_y + RULER_HEIGHT + m_lane_h) {
-                    if (mx >= 8 && mx <= 88 && p->num_tracks < MAX_TRACKS) {
+                    if (mx >= 6 && mx <= 66 && p->num_tracks < MAX_TRACKS) {
                         push_undo_state();
                         p->track_heights[p->num_tracks] = 84;
                         snprintf(p->track_names[p->num_tracks], 64, "Track %d", p->num_tracks + 1);
                         p->num_tracks++;
                         record_project_change("Added New Track", true);
-                    } else if (mx >= 94 && mx <= 180) p->is_playing = !p->is_playing;
+                    } else if (mx >= 70 && mx <= 118) {
+                        if (g_rec.is_recording) start_or_stop_recording(p, ren, win);
+                        else p->is_playing = !p->is_playing;
+                    } else if (mx >= 122 && mx <= 162) {
+                        start_or_stop_recording(p, ren, win);
+                    } else if (mx >= 166 && mx <= 196) {
+                        browse_recording_folder_dialog();
+                    }
                     continue;
                 }
 
@@ -8953,25 +11440,11 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (mx >= g_daw.tcp_width && my > ruler_y && my <= ruler_y + RULER_HEIGHT) {
-                    if (e.button.button == SDL_BUTTON_RIGHT) {
-                        // Right-clicking the ruler auto-shows the marker lane and adds a marker
-                        p->show_marker_lane = true;
-                        if (p->num_markers < MAX_MARKERS) {
-                            push_undo_state();
-                            double m_time = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
-                            int new_idx = p->num_markers++;
-                            DawMarker *mk = &p->markers[new_idx];
-                            mk->time_sec = m_time;
-                            char def_txt[64];
-                            snprintf(def_txt, sizeof(def_txt), "Marker %d", p->num_markers);
-                            set_marker_full_str(p, new_idx, def_txt);
-                            g_selected_marker_idx = new_idx;
-                            record_project_change("Added Marker", true);
-                        }
-                    } else {
+                    if (e.button.button == SDL_BUTTON_LEFT) {
                         scrubbing_ruler = true;
                         p->playhead_seconds = fmax(0.0, p->scroll_x_sec + (double)(mx - g_daw.tcp_width) / p->pixels_per_second);
                     }
+                    // Right-clicking on the timeline ruler does NOT open the marker strip or add a marker
                     continue;
                 }
 
@@ -8992,11 +11465,30 @@ int main(int argc, char *argv[]) {
 
                             if (ctrl_pressed) {
                                 p->track_selected[t] = !p->track_selected[t];
+                                g_last_clicked_track_idx = t;
                             } else if (shift_pressed) {
-                                for (int tr = 0; tr <= t; tr++) p->track_selected[tr] = true;
+                                int anchor = g_last_clicked_track_idx;
+                                if (anchor < 0 || anchor >= p->num_tracks) {
+                                    // Find existing single selected track if any, else make t the anchor
+                                    for (int tr = 0; tr < p->num_tracks; tr++) {
+                                        if (p->track_selected[tr]) { anchor = tr; break; }
+                                    }
+                                }
+                                if (anchor < 0 || anchor >= p->num_tracks) {
+                                    for (int tr = 0; tr < p->num_tracks; tr++) p->track_selected[tr] = false;
+                                    p->track_selected[t] = true;
+                                    g_last_clicked_track_idx = t;
+                                } else {
+                                    int t_min = (anchor < t) ? anchor : t;
+                                    int t_max = (anchor > t) ? anchor : t;
+                                    for (int tr = 0; tr < p->num_tracks; tr++) {
+                                        p->track_selected[tr] = (!is_track_hidden(tr) && tr >= t_min && tr <= t_max);
+                                    }
+                                }
                             } else {
                                 for (int tr = 0; tr < p->num_tracks; tr++) p->track_selected[tr] = false;
                                 p->track_selected[t] = true;
+                                g_last_clicked_track_idx = t;
                             }
 
                             bool handled_btn = false;
@@ -9039,10 +11531,46 @@ int main(int argc, char *argv[]) {
                     if (hit_idx >= 0) {
                         AudioItem *it = &p->items[hit_idx];
                         push_undo_state();
-                        if (ctrl_pressed) it->is_selected = !it->is_selected;
-                        else if (!shift_pressed && !it->is_selected) {
-                            for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
-                            it->is_selected = true;
+                        if (ctrl_pressed) {
+                            it->is_selected = !it->is_selected;
+                            g_last_clicked_item_idx = hit_idx;
+                        } else if (shift_pressed) {
+                            int anchor = g_last_clicked_item_idx;
+                            if (anchor < 0 || anchor >= p->num_items) {
+                                for (int o = 0; o < p->num_items; o++) {
+                                    if (p->items[o].is_selected) { anchor = o; break; }
+                                }
+                            }
+                            if (anchor < 0 || anchor >= p->num_items || anchor == hit_idx) {
+                                for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
+                                it->is_selected = true;
+                                g_last_clicked_item_idx = hit_idx;
+                            } else {
+                                int trk_a = p->items[anchor].track_idx;
+                                int trk_b = it->track_idx;
+                                int trk_min = (trk_a < trk_b) ? trk_a : trk_b;
+                                int trk_max = (trk_a > trk_b) ? trk_a : trk_b;
+                                double t_a = p->items[anchor].start_time;
+                                double t_b = it->start_time;
+                                double t_min = (t_a < t_b) ? t_a : t_b;
+                                double t_max = (t_a > t_b) ? t_a : t_b;
+                                for (int o = 0; o < p->num_items; o++) {
+                                    AudioItem *cand = &p->items[o];
+                                    if (!is_track_hidden(cand->track_idx) &&
+                                        cand->track_idx >= trk_min && cand->track_idx <= trk_max &&
+                                        cand->start_time >= t_min - 1e-4 && cand->start_time <= t_max + 1e-4) {
+                                        cand->is_selected = true;
+                                    } else {
+                                        cand->is_selected = false;
+                                    }
+                                }
+                            }
+                        } else {
+                            if (!it->is_selected) {
+                                for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
+                                it->is_selected = true;
+                            }
+                            g_last_clicked_item_idx = hit_idx;
                         }
                         dragging_item_idx = hit_idx;
                         drag_start_mouse_time = click_time;
@@ -9096,6 +11624,12 @@ int main(int argc, char *argv[]) {
                 g_theme.dragging_hue = false;
                 g_theme.dragging_alpha = false;
                 g_theme.saved_sb_dragging = false;
+                if (g_dyn_split.dragging_slider_id != 0) save_themes_settings_json();
+                g_dyn_split.is_dragging = false;
+                g_dyn_split.dragging_slider_id = 0;
+                g_reposition.is_dragging = false;
+                g_script_popup.is_dragging = false;
+                g_script_popup.dragging_slider_idx = -1;
                 if (dragging_item_idx != -1) {
                     if (dragging_fade_in) record_project_change("Adjusted Clip Fade-In", true);
                     else if (dragging_fade_out) record_project_change("Adjusted Clip Fade-Out", true);
@@ -9127,6 +11661,49 @@ int main(int argc, char *argv[]) {
                 }
             } else if (e.type == SDL_MOUSEMOTION) {
                 int mx = e.motion.x, my = e.motion.y;
+
+                if (g_script_popup.is_open && g_script_popup.is_dragging) {
+                    g_script_popup.win_rect.x = mx - g_script_popup.drag_off_x;
+                    g_script_popup.win_rect.y = my - g_script_popup.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_script_popup.is_open && g_script_popup.dragging_slider_idx >= 0 &&
+                    g_script_popup.dragging_slider_idx < g_script_popup.num_controls) {
+                    ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.dragging_slider_idx];
+                    int sl_x = g_script_popup.win_rect.x + 180;
+                    int sl_w = g_script_popup.win_rect.w - 270;
+                    if (sl_w < 80) sl_w = 80;
+                    double u = (double)(mx - sl_x) / (double)sl_w;
+                    if (u < 0.0) u = 0.0; else if (u > 1.0) u = 1.0;
+                    ctrl->num_val = ctrl->min_val + u * (ctrl->max_val - ctrl->min_val);
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_reposition.is_open && g_reposition.is_dragging) {
+                    g_reposition.win_rect.x = mx - g_reposition.drag_off_x;
+                    g_reposition.win_rect.y = my - g_reposition.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_dyn_split.is_open && g_dyn_split.is_dragging) {
+                    g_dyn_split.win_rect.x = mx - g_dyn_split.drag_off_x;
+                    g_dyn_split.win_rect.y = my - g_dyn_split.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_dyn_split.is_open && g_dyn_split.dragging_slider_id != 0) {
+                    int sl_x = g_dyn_split.win_rect.x + 162, sl_w = 232;
+                    float u = (float)(mx - sl_x) / (float)sl_w;
+                    if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                    if (g_dyn_split.dragging_slider_id == 1) g_dyn_split.reduce_splits_val = 1 + (int)(u * 99.0f + 0.5f);
+                    else if (g_dyn_split.dragging_slider_id == 2) g_dyn_split.min_slice_ms = 1 + (int)(u * 999.0f + 0.5f);
+                    else if (g_dyn_split.dragging_slider_id == 3) g_dyn_split.min_silence_ms = 10 + (int)(u * 1990.0f + 0.5f);
+                    else if (g_dyn_split.dragging_slider_id == 4) g_dyn_split.gate_threshold_db = -90.0f + u * 90.0f;
+                    else if (g_dyn_split.dragging_slider_id == 5) g_dyn_split.gate_hysteresis_db = -24.0f + u * 24.0f;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
 
                 if (g_export.is_open && g_export.is_dragging) {
                     g_export.win_rect.x = mx - g_export.drag_off_x;
@@ -9754,7 +12331,7 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &v_menu, p->video.is_open, false);
         draw_text(ren, "Video", 200, TABBAR_HEIGHT + 13, c_white);
 
-        // Center Timecode Display
+        // Center Timecode Display + Red Round Recording Indicator Dot Near Time Clock
         char clock_buf[32];
         format_timecode(p->playhead_seconds, clock_buf, sizeof(clock_buf));
         int left_menu_end = 266;
@@ -9764,8 +12341,19 @@ int main(int argc, char *argv[]) {
         SDL_Rect clock_bg = { clock_x - 10, TABBAR_HEIGHT + 4, 128, 28 };
         SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
         SDL_RenderFillRect(ren, &clock_bg);
-        draw_brown_border_rect(ren, &clock_bg, false, false);
+        draw_brown_border_rect(ren, &clock_bg, g_rec.is_recording, false);
         draw_text(ren, clock_buf, clock_x - 4, TABBAR_HEIGHT + 12, c_white);
+
+        if (g_rec.is_recording) {
+            // Bright red round dot right near the time clock (pulses subtly while recording)
+            int dot_cx = clock_bg.x + clock_bg.w + 14;
+            int dot_cy = TABBAR_HEIGHT + 18;
+            draw_filled_circle_sdl(ren, dot_cx, dot_cy, 8, 95, 18, 18, 255);
+            draw_filled_circle_sdl(ren, dot_cx, dot_cy, 6, 242, 32, 32, 255);
+            if (((SDL_GetTicks() / 350) % 2) == 0) {
+                draw_filled_circle_sdl(ren, dot_cx - 2, dot_cy - 2, 2, 255, 145, 145, 255);
+            }
+        }
 
         // Right-side top menu: Undo | Redo | Zoom- | Zoom+ | Range | Crossfade | Hide | Save
         SDL_Rect btn_undo = { win_w - 520, TABBAR_HEIGHT + 5, 52, 26 };
@@ -9826,17 +12414,29 @@ int main(int argc, char *argv[]) {
         SDL_RenderFillRect(ren, &corner_area);
         draw_brown_border_rect(ren, &corner_area, false, true);
 
-        SDL_Rect btn_corner_add = { 8, corner_y + 10, 72, 26 };
+        SDL_Rect btn_corner_add = { 6, corner_y + 8, 60, 24 };
         SDL_SetRenderDrawColor(ren, 48, 48, 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_add);
         draw_brown_border_rect(ren, &btn_corner_add, false, false);
-        draw_text(ren, "+ Track", 16, corner_y + 18, c_white);
+        draw_text(ren, "+Track", 11, corner_y + 15, c_white);
 
-        SDL_Rect btn_corner_play = { 86, corner_y + 10, 72, 26 };
+        SDL_Rect btn_corner_play = { 70, corner_y + 8, 48, 24 };
         SDL_SetRenderDrawColor(ren, p->is_playing ? 68 : 48, p->is_playing ? 50 : 48, p->is_playing ? 34 : 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_play);
         draw_brown_border_rect(ren, &btn_corner_play, p->is_playing, false);
-        draw_text(ren, p->is_playing ? "Pause" : "Play", 102, corner_y + 18, c_white);
+        draw_text(ren, p->is_playing ? "Stop" : "Play", 78, corner_y + 15, c_white);
+
+        SDL_Rect btn_corner_rec = { 122, corner_y + 8, 40, 24 };
+        SDL_SetRenderDrawColor(ren, g_rec.is_recording ? 155 : 48, g_rec.is_recording ? 28 : 38, g_rec.is_recording ? 28 : 38, 255);
+        SDL_RenderFillRect(ren, &btn_corner_rec);
+        draw_brown_border_rect(ren, &btn_corner_rec, g_rec.is_recording, false);
+        draw_text(ren, "Rec", 130, corner_y + 15, c_white);
+
+        SDL_Rect btn_corner_dir = { 166, corner_y + 8, 30, 24 };
+        SDL_SetRenderDrawColor(ren, 44, 40, 36, 255);
+        SDL_RenderFillRect(ren, &btn_corner_dir);
+        draw_brown_border_rect(ren, &btn_corner_dir, false, false);
+        draw_text(ren, "Dir", 170, corner_y + 15, c_white);
 
         // 4. Time Ruler & Logic Pro Yellow Cycle Range Strip
         SDL_Rect ruler = { g_daw.tcp_width, corner_y, view_w, RULER_HEIGHT };
@@ -10171,6 +12771,15 @@ int main(int argc, char *argv[]) {
                 }
             }
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+            // Optional Dynamic Split Gate Threshold overlay line in media items
+            if (g_dyn_split.is_open && g_dyn_split.display_gate_threshold && it->is_selected) {
+                float thr_lin = db_to_linear(g_dyn_split.gate_threshold_db);
+                int dy_thr = (int)(thr_lin * (ih / 2.0f - 4));
+                SDL_SetRenderDrawColor(ren, 80, 235, 120, 220);
+                SDL_RenderDrawLine(ren, ix, mid_y - dy_thr, ix + iw, mid_y - dy_thr);
+                SDL_RenderDrawLine(ren, ix, mid_y + dy_thr, ix + iw, mid_y + dy_thr);
+            }
 
             // Brown clip border (thicker when clip is selected)
             SDL_Rect clip_r = { ix, iy, iw, ih };
@@ -10508,15 +13117,17 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Delete Marker", g_marker_context_x + 12, g_marker_context_y + 8, c_white);
         }
 
-        // 7. Action Menu (Submenus: Keyboard Shortcut, Scripts)
+        // 7. Action Menu (Submenus: Keyboard Shortcut, Scripts, Dynamic Split, Reposition)
         if (g_daw.menu_action_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect a_box = { 60, m_start, 168, 56 };
+            SDL_Rect a_box = { 60, m_start, 178, 108 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &a_box);
             draw_brown_border_rect(ren, &a_box, true, false);
-            draw_text(ren, "Keyboard Shortcut", 68, m_start + 8, c_white);
+            draw_text(ren, "Keyboard Shortcut", 68, m_start + 7, c_white);
             draw_text(ren, "Scripts", 68, m_start + 34, c_white);
+            draw_text(ren, "Dynamic Split (Ctrl+D)", 68, m_start + 61, c_white);
+            draw_text(ren, "Reposition (W)", 68, m_start + 88, c_white);
         }
 
         // Unified Script Manager (Lua & Python Scripts, Edge-Draggable Resize, Vertical Scrollbar, Refresh Script & Run Script)
@@ -10545,23 +13156,79 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Script Manager (Lua & Python)", sr->x + 12, sr->y + 8, c_white);
             draw_text(ren, "X", sr->x + sr->w - 20, sr->y + 8, c_white);
 
-            int list_y = sr->y + 36;
-            int list_h = sr->h - 82;
+            refresh_filtered_scripts();
+            SDL_Color c_accent = get_theme_accent_sdl_color();
+
+            // Top Filter Search Box + [Clear] + [Pin] + [Up^] + [Dn v]
+            int top_y = sr->y + 34;
+            int flt_w = sr->w - 310;
+            if (flt_w < 110) flt_w = 110;
+            int flt_x = sr->x + 56;
+            int clr_x = flt_x + flt_w + 6;
+            int pin_x = clr_x + 58;
+            int up_x  = pin_x + 64;
+            int dn_x  = up_x + 42;
+
+            draw_text(ren, "Filter", sr->x + 12, top_y + 6, c_white);
+            SDL_Rect s_flt_box = { flt_x, top_y, flt_w, 24 };
+            SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+            SDL_RenderFillRect(ren, &s_flt_box);
+            draw_brown_border_rect(ren, &s_flt_box, g_script_filter_focused, false);
+
+            SDL_Rect s_flt_clip = { s_flt_box.x + 4, s_flt_box.y + 2, s_flt_box.w - 8, s_flt_box.h - 4 };
+            draw_text_clipped(ren, g_script_filter_text, s_flt_box.x + 6, top_y + 5, c_white, &s_flt_clip, NULL);
+            if (g_script_filter_focused && ((SDL_GetTicks() / 450) % 2 == 0)) {
+                int cx = s_flt_box.x + 6 + (int)strlen(g_script_filter_text) * 8;
+                if (cx < s_flt_box.x + s_flt_box.w - 4) {
+                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+                    SDL_RenderDrawLine(ren, cx, top_y + 4, cx, top_y + 20);
+                }
+            }
+
+            SDL_Rect b_s_clr = { clr_x, top_y, 52, 24 };
+            SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
+            SDL_RenderFillRect(ren, &b_s_clr);
+            draw_brown_border_rect(ren, &b_s_clr, false, false);
+            draw_text(ren, "Clear", clr_x + 6, top_y + 5, c_white);
+
+            bool sel_sc_pinned = (g_daw.script_selected_idx >= 0 && g_daw.script_selected_idx < g_daw.num_scripts &&
+                                  g_script_pinned[g_daw.script_selected_idx]);
+            SDL_Rect b_s_pin = { pin_x, top_y, 58, 24 };
+            SDL_SetRenderDrawColor(ren, sel_sc_pinned ? 74 : 44, sel_sc_pinned ? 52 : 38, sel_sc_pinned ? 30 : 34, 255);
+            SDL_RenderFillRect(ren, &b_s_pin);
+            draw_brown_border_rect(ren, &b_s_pin, sel_sc_pinned, false);
+            draw_pin_symbol_icon(ren, pin_x + 5, top_y + 5, sel_sc_pinned, sel_sc_pinned ? c_accent : c_white);
+            draw_text(ren, "Pin", pin_x + 22, top_y + 5, c_white);
+
+            SDL_Rect b_s_up = { up_x, top_y, 38, 24 };
+            SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
+            SDL_RenderFillRect(ren, &b_s_up);
+            draw_brown_border_rect(ren, &b_s_up, false, false);
+            draw_text(ren, "Up^", up_x + 6, top_y + 5, c_white);
+
+            SDL_Rect b_s_dn = { dn_x, top_y, 40, 24 };
+            SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
+            SDL_RenderFillRect(ren, &b_s_dn);
+            draw_brown_border_rect(ren, &b_s_dn, false, false);
+            draw_text(ren, "Dn v", dn_x + 4, top_y + 5, c_white);
+
+            int list_y = sr->y + 66;
+            int list_h = sr->h - 112;
             SDL_Rect list_box = { sr->x + 12, list_y, sr->w - 24, list_h };
             SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
             SDL_RenderFillRect(ren, &list_box);
             draw_brown_border_rect(ren, &list_box, false, false);
 
-            int content_h = g_daw.num_scripts * 24 + 8;
+            int content_h = g_script_num_filtered * 24 + 8;
             int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
             if (g_script_scroll_y > max_sc) g_script_scroll_y = max_sc;
             if (g_script_scroll_y < 0) g_script_scroll_y = 0;
 
-            SDL_Color c_accent = get_theme_accent_sdl_color();
             SDL_Rect sc_clip = { list_box.x + 2, list_box.y + 2, list_box.w - 18, list_box.h - 4 };
             SDL_RenderSetClipRect(ren, &sc_clip);
-            for (int s = 0; s < g_daw.num_scripts; s++) {
-                int sy = list_box.y + 4 + (s * 24) - g_script_scroll_y;
+            for (int r = 0; r < g_script_num_filtered; r++) {
+                int s = g_script_filtered_indices[r];
+                int sy = list_box.y + 4 + (r * 24) - g_script_scroll_y;
                 if (sy + 22 < list_box.y || sy > list_box.y + list_box.h) continue;
 
                 bool is_sel = (s == g_daw.script_selected_idx);
@@ -10570,17 +13237,24 @@ int main(int argc, char *argv[]) {
                     SDL_SetRenderDrawColor(ren, shr + 14, shg + 10, shb + 8, 255);
                     SDL_RenderFillRect(ren, &s_row);
                     draw_brown_border_rect(ren, &s_row, false, false);
-                } else if ((s & 1) == 1) {
+                } else if ((r & 1) == 1) {
                     SDL_SetRenderDrawColor(ren, 21, 20, 19, 255);
                     SDL_RenderFillRect(ren, &s_row);
                 }
 
+                int text_start_x = s_row.x + 6;
+                if (g_script_pinned[s]) {
+                    draw_pin_symbol_icon(ren, s_row.x + 5, sy + 4, true, c_accent);
+                    text_start_x += 14;
+                }
+
                 const char *type_tag = g_daw.scripts[s].is_python ? "[PY] " : "[LUA]";
-                draw_text(ren, type_tag, s_row.x + 6, sy + 4, is_sel ? c_white : c_accent);
+                draw_text(ren, type_tag, text_start_x, sy + 4, is_sel ? c_white : c_accent);
 
                 int sc_col_w = g_daw.scripts[s].shortcut[0] ? 90 : 8;
-                SDL_Rect name_clip = { s_row.x + 52, sy + 1, s_row.w - 56 - sc_col_w, 20 };
-                draw_text_clipped(ren, g_daw.scripts[s].name, s_row.x + 52, sy + 4, c_white, &name_clip, &sc_clip);
+                SDL_Rect name_clip = { text_start_x + 46, sy + 1, s_row.w - (text_start_x - s_row.x) - 50 - sc_col_w, 20 };
+                draw_text_clipped(ren, g_daw.scripts[s].name, text_start_x + 46, sy + 4,
+                                  g_script_pinned[s] ? c_accent : c_white, &name_clip, &sc_clip);
 
                 if (g_daw.scripts[s].shortcut[0] != '\0') {
                     SDL_Rect key_clip = { s_row.x + s_row.w - 86, sy + 1, 80, 20 };
@@ -11420,6 +14094,21 @@ int main(int argc, char *argv[]) {
         // Tools -> Themes ARGB Popup Window
         if (g_theme.is_open) {
             render_themes_popup_window(ren);
+        }
+
+        // Action -> Dynamic Split Items Popup Window (Ctrl+D)
+        if (g_dyn_split.is_open) {
+            render_dynamic_split_window(ren);
+        }
+
+        // Action -> Reposition Items Popup Window (W)
+        if (g_reposition.is_open) {
+            render_reposition_window(ren);
+        }
+
+        // Lua & Python Custom Script Popup Window
+        if (g_script_popup.is_open) {
+            render_script_popup_window(ren);
         }
 
         // 8. Save Confirmation Dialog Modal (with Brown Borders)
