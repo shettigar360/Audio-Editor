@@ -29,8 +29,11 @@ void force_close_tab(int idx) {
         ProjectTab *p = &g_daw.tabs[0];
         close_video(&p->video);
         for (int i = 0; i < p->num_items; i++) {
-            if (p->items[i].raw_file_handle) fclose(p->items[i].raw_file_handle);
-            if (p->items[i].peaks) free(p->items[i].peaks);
+            if (p->items[i].raw_file_handle) {
+                fclose(p->items[i].raw_file_handle);
+                p->items[i].raw_file_handle = NULL;
+            }
+            p->items[i].peaks = NULL;
         }
         init_tab_defaults(0, "Project 1");
         g_daw.active_tab = 0;
@@ -40,8 +43,11 @@ void force_close_tab(int idx) {
     ProjectTab *target = &g_daw.tabs[idx];
     close_video(&target->video);
     for (int i = 0; i < target->num_items; i++) {
-        if (target->items[i].raw_file_handle) fclose(target->items[i].raw_file_handle);
-        if (target->items[i].peaks) free(target->items[i].peaks);
+        if (target->items[i].raw_file_handle) {
+            fclose(target->items[i].raw_file_handle);
+            target->items[i].raw_file_handle = NULL;
+        }
+        target->items[i].peaks = NULL;
     }
 
     for (int t = idx; t < g_daw.num_tabs - 1; t++) {
