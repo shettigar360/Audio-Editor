@@ -39,7 +39,7 @@ static void upload_frame_to_texture(SimpleVideoPlayer *player) {
             player->width,
             player->height,
             AV_PIX_FMT_RGB24,
-            SWS_BILINEAR,
+            SWS_FAST_BILINEAR,
             NULL,
             NULL,
             NULL
@@ -132,6 +132,7 @@ int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Rend
     }
 
     player->codec_ctx->thread_count = 0;
+    player->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
     if (avcodec_open2(player->codec_ctx, codec, NULL) < 0) {
         avcodec_free_context(&player->codec_ctx);
@@ -175,7 +176,7 @@ int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Rend
             player->width,
             player->height,
             AV_PIX_FMT_RGB24,
-            SWS_BILINEAR,
+            SWS_FAST_BILINEAR,
             NULL,
             NULL,
             NULL
@@ -243,7 +244,7 @@ void seek_video(SimpleVideoPlayer *player, double seconds) {
     if (seconds < 0.0) seconds = 0.0;
 
     // Avoid redundant seeks when playhead is stationary at the already-decoded timestamp
-    if (player->has_active_frame && player->current_pts_sec >= 0.0 && fabs(seconds - player->current_pts_sec) < 0.005) {
+    if (player->has_active_frame && player->current_pts_sec >= 0.0 && fabs(seconds - player->current_pts_sec) < 0.015) {
         return;
     }
 
@@ -257,15 +258,24 @@ void seek_video(SimpleVideoPlayer *player, double seconds) {
 
     bool got_frame = false;
     bool reached_target = false;
+    int decoded_steps = 0;
+    const int max_sync_decode_frames = 16; // Fast non-blocking seek budget
 
-    while (!reached_target && av_read_frame(player->fmt_ctx, packet) >= 0) {
+    // Skip non-reference B-frames during post-seek fast-forward for instant scrubbing even on 4-hour videos
+    player->codec_ctx->skip_frame = AVDISCARD_NONREF;
+
+    while (!reached_target && decoded_steps < max_sync_decode_frames && av_read_frame(player->fmt_ctx, packet) >= 0) {
         if (packet->stream_index == player->video_stream_idx) {
             if (avcodec_send_packet(player->codec_ctx, packet) >= 0) {
                 while (avcodec_receive_frame(player->codec_ctx, player->frame) == 0) {
                     double pts = get_frame_pts_sec(player, seconds);
                     got_frame = true;
                     player->current_pts_sec = pts;
-                    if (pts >= seconds - 0.02) {
+                    decoded_steps++;
+                    if (pts >= seconds - 0.15) {
+                        player->codec_ctx->skip_frame = AVDISCARD_DEFAULT;
+                    }
+                    if (pts >= seconds - 0.025 || decoded_steps >= max_sync_decode_frames) {
                         reached_target = true;
                         break;
                     }
@@ -275,20 +285,21 @@ void seek_video(SimpleVideoPlayer *player, double seconds) {
         av_packet_unref(packet);
     }
 
-    // Flush delayed B-frames if EOF was reached before target_pts
-    if (!reached_target) {
+    player->codec_ctx->skip_frame = AVDISCARD_DEFAULT;
+
+    // Flush delayed frames if EOF was reached before any frame was decoded
+    if (!got_frame) {
         avcodec_send_packet(player->codec_ctx, NULL);
         while (avcodec_receive_frame(player->codec_ctx, player->frame) == 0) {
             double pts = get_frame_pts_sec(player, seconds);
             got_frame = true;
             player->current_pts_sec = pts;
-            if (pts >= seconds - 0.02) break;
+            if (pts >= seconds - 0.025) break;
         }
     }
 
     if (got_frame) {
         upload_frame_to_texture(player);
-        player->current_pts_sec = seconds;
     }
 
     av_packet_free(&packet);
@@ -300,15 +311,16 @@ void sync_video_to_audio_clock(SimpleVideoPlayer *player, double target_sec, boo
     if (target_sec < 0.0) target_sec = 0.0;
 
     if (force_seek) {
-        if (!player->has_active_frame || player->current_pts_sec < 0.0 || fabs(target_sec - player->current_pts_sec) > 0.005) {
+        if (!player->has_active_frame || player->current_pts_sec < 0.0 || fabs(target_sec - player->current_pts_sec) > 0.025) {
             seek_video(player, target_sec);
         }
         return;
     }
 
+    // If user jumped backward or skipped forward by > 0.65s (e.g. 15m -> 40m), immediately seek to keyframe
     if (!player->has_active_frame || player->current_pts_sec < 0.0 ||
-        target_sec < player->current_pts_sec - 0.05 ||
-        (target_sec - player->current_pts_sec) > 1.0) {
+        target_sec < player->current_pts_sec - 0.06 ||
+        (target_sec - player->current_pts_sec) > 0.65) {
         seek_video(player, target_sec);
         return;
     }
@@ -316,19 +328,34 @@ void sync_video_to_audio_clock(SimpleVideoPlayer *player, double target_sec, boo
     AVPacket *packet = av_packet_alloc();
     if (!packet) return;
 
+    // If video is slightly behind audio (> 0.12s), skip non-reference B-frames to catch up smoothly
+    if (target_sec - player->current_pts_sec > 0.12) {
+        player->codec_ctx->skip_frame = AVDISCARD_NONREF;
+    } else {
+        player->codec_ctx->skip_frame = AVDISCARD_DEFAULT;
+    }
+
     bool decoded_new_frame = false;
-    while (player->current_pts_sec < target_sec && av_read_frame(player->fmt_ctx, packet) >= 0) {
+    int frames_this_tick = 0;
+    const int max_frames_per_tick = 5;
+
+    while (player->current_pts_sec < target_sec &&
+           frames_this_tick < max_frames_per_tick &&
+           av_read_frame(player->fmt_ctx, packet) >= 0) {
         if (packet->stream_index == player->video_stream_idx) {
             if (avcodec_send_packet(player->codec_ctx, packet) >= 0) {
                 while (avcodec_receive_frame(player->codec_ctx, player->frame) == 0) {
                     player->current_pts_sec = get_frame_pts_sec(player, target_sec);
                     decoded_new_frame = true;
-                    if (player->current_pts_sec >= target_sec) break;
+                    frames_this_tick++;
+                    if (player->current_pts_sec >= target_sec || frames_this_tick >= max_frames_per_tick) break;
                 }
             }
         }
         av_packet_unref(packet);
     }
+
+    player->codec_ctx->skip_frame = AVDISCARD_DEFAULT;
 
     if (decoded_new_frame) {
         upload_frame_to_texture(player);
