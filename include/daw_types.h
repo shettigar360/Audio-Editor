@@ -25,7 +25,7 @@
 #define MARKER_BAR_HEIGHT 24
 #define SCROLLBAR_SIZE 16
 #define MAX_UNDO_STACK 32
-#define MAX_SCRIPTS 32
+#define MAX_SCRIPTS 64
 #define MAX_TABS 8
 #define MAX_MARKERS 64
 
