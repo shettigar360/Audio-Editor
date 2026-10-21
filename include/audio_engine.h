@@ -13,6 +13,7 @@
 #include <libavcodec/avcodec.h>
 #include <libswresample/swresample.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -21,7 +22,8 @@
 #define MAX_TRACKS 32
 #define MAX_ITEMS 1024
 #define SAMPLE_RATE 48000
-#define PEAK_SAMPLES_PER_BIN 256
+#define PEAK_SAMPLES_PER_BIN 1024
+#define MAX_SHARED_PEAK_ENTRIES 256
 
 typedef struct {
     float min_val;
@@ -37,9 +39,9 @@ typedef struct {
     char file_path[512];        // Original media path reference
     char raw_audio_path[512];   // Cached demuxed raw PCM in temp folder
     char label[128];
-    PeakBin *peaks;             // Small visual peak array (< 400 KB)
+    PeakBin *peaks;             // Shared visual peak array (zero duplication across splits/undo)
     int peak_count;
-    FILE *raw_file_handle;      // Persistent handle for ultra-fast reading
+    FILE *raw_file_handle;      // Persistent handle for ultra-fast 64-bit reading
     bool is_selected;
     bool has_video;             // True if media container has a video stream
 } AudioItem;
@@ -52,6 +54,102 @@ typedef struct {
     float volume;
 } Track;
 
+typedef struct {
+    bool in_use;
+    char raw_audio_path[512];
+    PeakBin *peaks;
+    int peak_count;
+    double total_duration;
+    bool has_video;
+} SharedPeakPoolEntry;
+
+static SharedPeakPoolEntry g_shared_peak_pool[MAX_SHARED_PEAK_ENTRIES];
+
+// Cross-platform 64-bit file seek (fixes 32-bit long overflow past 2GB / ~44 mins of stereo float PCM on Windows)
+static inline int daw_fseek64(FILE *fp, int64_t offset, int origin) {
+    if (!fp) return -1;
+    clearerr(fp);
+#ifdef _WIN32
+    return _fseeki64(fp, (__int64)offset, origin);
+#else
+    return fseeko(fp, (off_t)offset, origin);
+#endif
+}
+
+static inline FILE* daw_fopen_LockFreeRead(const char *path) {
+    if (!path || !path[0]) return NULL;
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        setvbuf(fp, NULL, _IOFBF, 65536);
+    }
+    return fp;
+}
+
+static inline bool daw_is_pooled_peaks(const PeakBin *peaks) {
+    if (!peaks) return false;
+    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
+        if (g_shared_peak_pool[i].in_use && g_shared_peak_pool[i].peaks == peaks) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline void daw_free_peaks_if_unpooled(PeakBin *peaks) {
+    if (!peaks) return;
+    if (!daw_is_pooled_peaks(peaks)) {
+        free(peaks);
+    }
+}
+
+static inline PeakBin* daw_find_shared_peaks(const char *raw_path, int *out_peak_count,
+                                             double *out_total_dur, bool *out_has_video) {
+    if (!raw_path || !raw_path[0]) return NULL;
+    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
+        if (g_shared_peak_pool[i].in_use &&
+            strcmp(g_shared_peak_pool[i].raw_audio_path, raw_path) == 0 &&
+            g_shared_peak_pool[i].peaks != NULL) {
+            if (out_peak_count) *out_peak_count = g_shared_peak_pool[i].peak_count;
+            if (out_total_dur)  *out_total_dur  = g_shared_peak_pool[i].total_duration;
+            if (out_has_video)  *out_has_video  = g_shared_peak_pool[i].has_video;
+            return g_shared_peak_pool[i].peaks;
+        }
+    }
+    return NULL;
+}
+
+static inline PeakBin* daw_register_shared_peaks(const char *raw_path, PeakBin *peaks,
+                                                 int peak_count, double total_dur, bool has_video) {
+    if (!raw_path || !raw_path[0] || !peaks) return peaks;
+    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
+        if (g_shared_peak_pool[i].in_use &&
+            strcmp(g_shared_peak_pool[i].raw_audio_path, raw_path) == 0) {
+            if (g_shared_peak_pool[i].peaks && g_shared_peak_pool[i].peaks != peaks) {
+                free(peaks);
+                return g_shared_peak_pool[i].peaks;
+            }
+            g_shared_peak_pool[i].peaks = peaks;
+            g_shared_peak_pool[i].peak_count = peak_count;
+            g_shared_peak_pool[i].total_duration = total_dur;
+            g_shared_peak_pool[i].has_video = has_video;
+            return peaks;
+        }
+    }
+    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
+        if (!g_shared_peak_pool[i].in_use) {
+            g_shared_peak_pool[i].in_use = true;
+            strncpy(g_shared_peak_pool[i].raw_audio_path, raw_path, sizeof(g_shared_peak_pool[i].raw_audio_path) - 1);
+            g_shared_peak_pool[i].raw_audio_path[sizeof(g_shared_peak_pool[i].raw_audio_path) - 1] = '\0';
+            g_shared_peak_pool[i].peaks = peaks;
+            g_shared_peak_pool[i].peak_count = peak_count;
+            g_shared_peak_pool[i].total_duration = total_dur;
+            g_shared_peak_pool[i].has_video = has_video;
+            return peaks;
+        }
+    }
+    return peaks;
+}
+
 // Simple string hash to generate distinct cache filenames
 static inline unsigned int hash_path(const char *str) {
     unsigned int hash = 5381;
@@ -60,8 +158,7 @@ static inline unsigned int hash_path(const char *str) {
     return hash;
 }
 
-// Demuxes and caches raw 48kHz stereo float PCM and peaks to .cache/ with 0 RAM overhead.
-// Also supports video-only containers without an audio stream so video clips still appear on the timeline.
+// Demuxes and caches raw 48kHz stereo float PCM and shared peaks to .cache/ with minimal RAM overhead.
 static inline int process_media_cache(const char *filepath, AudioItem *item) {
     if (!filepath || !item) return -1;
 
@@ -70,6 +167,36 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
 #else
     mkdir(".cache", 0777);
 #endif
+
+    strncpy(item->file_path, filepath, sizeof(item->file_path) - 1);
+    item->file_path[sizeof(item->file_path) - 1] = '\0';
+
+    const char *name = strrchr(filepath, '\\');
+    if (!name) name = strrchr(filepath, '/');
+    snprintf(item->label, sizeof(item->label), "%s", name ? name + 1 : filepath);
+
+    unsigned int h = hash_path(filepath);
+    snprintf(item->raw_audio_path, sizeof(item->raw_audio_path), ".cache/%u.raw", h);
+
+    // 1. Check in-RAM shared peak pool first (0 disk I/O, 0 RAM allocation)
+    int pooled_cnt = 0;
+    double pooled_dur = 0.0;
+    bool pooled_vid = false;
+    PeakBin *pooled_pk = daw_find_shared_peaks(item->raw_audio_path, &pooled_cnt, &pooled_dur, &pooled_vid);
+    if (pooled_pk && pooled_dur > 0.0) {
+        FILE *f_existing = daw_fopen_LockFreeRead(item->raw_audio_path);
+        if (f_existing) {
+            item->peaks = pooled_pk;
+            item->peak_count = pooled_cnt;
+            item->file_total_duration = pooled_dur;
+            item->duration = pooled_dur;
+            item->offset_in_file = 0.0;
+            item->is_selected = false;
+            item->has_video = pooled_vid;
+            item->raw_file_handle = f_existing;
+            return 0;
+        }
+    }
 
     AVFormatContext *fmt = NULL;
     if (avformat_open_input(&fmt, filepath, NULL, NULL) < 0) return -1;
@@ -90,7 +217,6 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
             }
         }
     }
-    // Fallback if only an attached-pic video stream was present
     if (v_idx == -1) {
         for (unsigned int i = 0; i < fmt->nb_streams; i++) {
             if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -117,14 +243,6 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
     }
     if (total_sec <= 0.0) total_sec = 10.0;
 
-    strncpy(item->file_path, filepath, sizeof(item->file_path) - 1);
-    item->file_path[sizeof(item->file_path) - 1] = '\0';
-
-    const char *name = strrchr(filepath, '\\');
-    if (!name) name = strrchr(filepath, '/');
-    snprintf(item->label, sizeof(item->label), "%s", name ? name + 1 : filepath);
-
-    // Handle video-only files (no audio stream) gracefully
     if (a_idx == -1) {
         avformat_close_input(&fmt);
         item->raw_audio_path[0] = '\0';
@@ -137,9 +255,6 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
         item->is_selected = false;
         return 0;
     }
-
-    unsigned int h = hash_path(filepath);
-    snprintf(item->raw_audio_path, sizeof(item->raw_audio_path), ".cache/%u.raw", h);
 
     AVCodecParameters *cpar = fmt->streams[a_idx]->codecpar;
     const AVCodec *codec = avcodec_find_decoder(cpar->codec_id);
@@ -161,6 +276,7 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
 
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(ctx, cpar);
+    ctx->thread_count = 0;
     if (avcodec_open2(ctx, codec, NULL) < 0) {
         avcodec_free_context(&ctx);
         avformat_close_input(&fmt);
@@ -212,14 +328,16 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
         avformat_close_input(&fmt);
         return -1;
     }
+    setvbuf(f_raw, NULL, _IOFBF, 65536);
 
-    int estimated_bins = (int)((total_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN) + 2000;
-    PeakBin *peak_cache = (PeakBin *)calloc(estimated_bins, sizeof(PeakBin));
+    int estimated_bins = (int)((total_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN) + 1024;
+    if (estimated_bins < 1024) estimated_bins = 1024;
+    PeakBin *peak_cache = (PeakBin *)calloc((size_t)estimated_bins, sizeof(PeakBin));
     int current_bin = 0;
 
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    float temp_pcm[2048 * 2]; // Stereo float chunk
+    float temp_pcm[4096 * 2];
     float cur_min = 0.0f, cur_max = 0.0f;
     int samples_in_bin = 0;
     int64_t total_written_frames = 0;
@@ -229,9 +347,9 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
             if (avcodec_send_packet(ctx, pkt) == 0) {
                 while (avcodec_receive_frame(ctx, frame) == 0) {
                     uint8_t *out_d[2] = { (uint8_t *)temp_pcm, NULL };
-                    int converted = swr_convert(swr, out_d, 2048, (const uint8_t **)frame->extended_data, frame->nb_samples);
+                    int converted = swr_convert(swr, out_d, 4096, (const uint8_t **)frame->extended_data, frame->nb_samples);
                     if (converted > 0) {
-                        fwrite(temp_pcm, sizeof(float) * 2, converted, f_raw);
+                        fwrite(temp_pcm, sizeof(float) * 2, (size_t)converted, f_raw);
                         total_written_frames += converted;
 
                         for (int s = 0; s < converted; s++) {
@@ -241,7 +359,16 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
                             samples_in_bin++;
 
                             if (samples_in_bin >= PEAK_SAMPLES_PER_BIN) {
-                                if (current_bin < estimated_bins) {
+                                if (current_bin >= estimated_bins && peak_cache) {
+                                    int new_cap = estimated_bins * 2;
+                                    PeakBin *grown = (PeakBin *)realloc(peak_cache, (size_t)new_cap * sizeof(PeakBin));
+                                    if (grown) {
+                                        memset(grown + estimated_bins, 0, (size_t)(new_cap - estimated_bins) * sizeof(PeakBin));
+                                        peak_cache = grown;
+                                        estimated_bins = new_cap;
+                                    }
+                                }
+                                if (peak_cache && current_bin < estimated_bins) {
                                     peak_cache[current_bin].min_val = cur_min;
                                     peak_cache[current_bin].max_val = cur_max;
                                     current_bin++;
@@ -265,15 +392,15 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
     avcodec_free_context(&ctx);
     avformat_close_input(&fmt);
 
-    item->peaks = peak_cache;
-    item->peak_count = current_bin;
     double actual_dur = (total_written_frames > 0) ? ((double)total_written_frames / SAMPLE_RATE) : total_sec;
+    item->peaks = daw_register_shared_peaks(item->raw_audio_path, peak_cache, current_bin, actual_dur, item->has_video);
+    item->peak_count = current_bin;
     item->file_total_duration = actual_dur;
     item->duration = actual_dur;
     item->offset_in_file = 0.0;
     item->is_selected = false;
 
-    item->raw_file_handle = fopen(item->raw_audio_path, "rb");
+    item->raw_file_handle = daw_fopen_LockFreeRead(item->raw_audio_path);
     return 0;
 }
 
