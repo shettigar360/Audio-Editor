@@ -1,3 +1,4 @@
+#define DAW_COMPILING_MAIN_C 1
 #ifndef SDL_MAIN_HANDLED
 #define SDL_MAIN_HANDLED
 #endif
@@ -24,6 +25,175 @@
 #ifndef OFN_EXPLORER
 #define OFN_EXPLORER 0x00080000
 #endif
+
+#ifndef DAW_PEAK_POOL_DEFINED
+#define DAW_PEAK_POOL_DEFINED
+#define MAX_SHARED_PEAK_ENTRIES 256
+typedef struct {
+    bool in_use;
+    char raw_audio_path[512];
+    PeakBin *peaks;
+    int peak_count;
+    double total_duration;
+    bool has_video;
+} SharedPeakPoolEntry;
+static SharedPeakPoolEntry g_shared_peak_pool[MAX_SHARED_PEAK_ENTRIES];
+static inline int daw_fseek64(FILE *fp, int64_t offset, int origin) {
+    if (!fp) return -1;
+    clearerr(fp);
+#ifdef _WIN32
+    return _fseeki64(fp, (int64_t)offset, origin);
+#else
+    return fseeko(fp, (off_t)offset, origin);
+#endif
+}
+static inline FILE* daw_fopen_LockFreeRead(const char *path) {
+    if (!path || !path[0]) return NULL;
+    FILE *fp = fopen(path, "rb");
+    if (fp) setvbuf(fp, NULL, _IOFBF, 65536);
+    return fp;
+}
+static inline bool daw_is_pooled_peaks(const PeakBin *peaks) {
+    if (!peaks) return false;
+    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
+        if (g_shared_peak_pool[i].in_use && g_shared_peak_pool[i].peaks == peaks) return true;
+    }
+    return false;
+}
+static inline void daw_free_peaks_if_unpooled(PeakBin *peaks) {
+    if (!peaks) return;
+    if (!daw_is_pooled_peaks(peaks)) free(peaks);
+}
+static inline PeakBin* daw_find_shared_peaks(const char *raw_path, int *out_peak_count, double *out_total_dur, bool *out_has_video) {
+    if (!raw_path || !raw_path[0]) return NULL;
+    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
+        if (g_shared_peak_pool[i].in_use && strcmp(g_shared_peak_pool[i].raw_audio_path, raw_path) == 0 && g_shared_peak_pool[i].peaks != NULL) {
+            if (out_peak_count) *out_peak_count = g_shared_peak_pool[i].peak_count;
+            if (out_total_dur)  *out_total_dur  = g_shared_peak_pool[i].total_duration;
+            if (out_has_video)  *out_has_video  = g_shared_peak_pool[i].has_video;
+            return g_shared_peak_pool[i].peaks;
+        }
+    }
+    return NULL;
+}
+static inline PeakBin* daw_register_shared_peaks(const char *raw_path, PeakBin *peaks, int peak_count, double total_dur, bool has_video) {
+    if (!raw_path || !raw_path[0] || !peaks) return peaks;
+    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
+        if (g_shared_peak_pool[i].in_use && strcmp(g_shared_peak_pool[i].raw_audio_path, raw_path) == 0) {
+            if (g_shared_peak_pool[i].peaks && g_shared_peak_pool[i].peaks != peaks) { free(peaks); return g_shared_peak_pool[i].peaks; }
+            g_shared_peak_pool[i].peaks = peaks;
+            g_shared_peak_pool[i].peak_count = peak_count;
+            g_shared_peak_pool[i].total_duration = total_dur;
+            g_shared_peak_pool[i].has_video = has_video;
+            return peaks;
+        }
+    }
+    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
+        if (!g_shared_peak_pool[i].in_use) {
+            g_shared_peak_pool[i].in_use = true;
+            strncpy(g_shared_peak_pool[i].raw_audio_path, raw_path, sizeof(g_shared_peak_pool[i].raw_audio_path) - 1);
+            g_shared_peak_pool[i].raw_audio_path[sizeof(g_shared_peak_pool[i].raw_audio_path) - 1] = '\0';
+            g_shared_peak_pool[i].peaks = peaks;
+            g_shared_peak_pool[i].peak_count = peak_count;
+            g_shared_peak_pool[i].total_duration = total_dur;
+            g_shared_peak_pool[i].has_video = has_video;
+            return peaks;
+        }
+    }
+    return peaks;
+}
+#endif // DAW_PEAK_POOL_DEFINED
+
+#ifndef DAW_CORE_STRUCTS_DEFINED
+#define DAW_CORE_STRUCTS_DEFINED
+#ifndef TABBAR_HEIGHT
+#define TABBAR_HEIGHT 30
+#define TOPBAR_HEIGHT 36
+#define RULER_HEIGHT 28
+#define MARKER_BAR_HEIGHT 24
+#define SCROLLBAR_SIZE 16
+#define MAX_UNDO_STACK 32
+#define MAX_SCRIPTS 64
+#define MAX_TABS 8
+#define MAX_MARKERS 64
+typedef enum { INPUT_FOCUS_NONE = 0, INPUT_FOCUS_TRACK_NAME, INPUT_FOCUS_MARKER } InputFocusType;
+typedef struct { double time_sec; char text[64]; } DawMarker;
+typedef struct { char name[64]; char filepath[260]; char shortcut[16]; bool is_python; } DawScript;
+typedef struct { AudioItem items[MAX_ITEMS]; int num_items; int num_tracks; } DawSnapshot;
+typedef struct { DawSnapshot history[MAX_UNDO_STACK]; int head; int count; } UndoRedoManager;
+typedef struct {
+    char project_name[64];
+    char project_path[512];
+    bool is_dirty;
+    Track tracks[MAX_TRACKS];
+    char track_names[MAX_TRACKS][64];
+    float track_db[MAX_TRACKS];
+    int track_heights[MAX_TRACKS];
+    bool track_selected[MAX_TRACKS];
+    int num_tracks;
+    AudioItem items[MAX_ITEMS];
+    int num_items;
+    double playhead_seconds;
+    bool is_playing;
+    double scroll_x_sec;
+    int scroll_y_px;
+    float pixels_per_second;
+    double project_duration_sec;
+    DawMarker markers[MAX_MARKERS];
+    int num_markers;
+    bool show_marker_lane;
+    SimpleVideoPlayer video;
+    UndoRedoManager undo_mgr;
+} ProjectTab;
+typedef struct {
+    ProjectTab tabs[MAX_TABS];
+    int num_tabs;
+    int active_tab;
+    int tcp_width;
+    SDL_AudioDeviceID audio_device;
+    bool save_prompt_open;
+    int save_prompt_tab_idx;
+    bool save_prompt_quit_app;
+    DawScript scripts[MAX_SCRIPTS];
+    int num_scripts;
+    bool script_manager_open;
+    bool script_manager_is_python;
+    int script_selected_idx;
+    SDL_Rect script_win_rect;
+    bool script_win_dragging;
+    int script_drag_offset_x;
+    int script_drag_offset_y;
+    bool menu_file_open;
+    bool menu_action_open;
+    bool submenu_export_audio_open;
+    bool submenu_export_video_open;
+    InputFocusType input_focus;
+    int editing_track_name_idx;
+    char editing_name_buf[64];
+    int editing_marker_idx;
+    char editing_marker_buf[64];
+} DawEngine;
+extern DawEngine g_daw;
+static inline ProjectTab* get_cur_tab(void) {
+    if (g_daw.num_tabs <= 0) return NULL;
+    if (g_daw.active_tab < 0) g_daw.active_tab = 0;
+    if (g_daw.active_tab >= g_daw.num_tabs) g_daw.active_tab = g_daw.num_tabs - 1;
+    return &g_daw.tabs[g_daw.active_tab];
+}
+static inline float db_to_linear(float db) {
+    if (db <= -60.0f) return 0.0f;
+    return powf(10.0f, db / 20.0f);
+}
+static inline void format_timecode(double seconds, char *out, size_t max_len) {
+    if (seconds < 0.0) seconds = 0.0;
+    int h = (int)(seconds / 3600);
+    int m = (int)((seconds - h * 3600) / 60);
+    int s = (int)(seconds - h * 3600 - m * 60);
+    int ms = (int)((seconds - (int)seconds) * 1000);
+    snprintf(out, max_len, "%02d:%02d:%02d.%03d", h, m, s, ms);
+}
+#endif
+#endif // DAW_CORE_STRUCTS_DEFINED
 
 DawEngine g_daw;
 
