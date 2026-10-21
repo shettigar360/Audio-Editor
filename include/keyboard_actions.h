@@ -489,7 +489,6 @@ static void init_default_saved_themes(void) {
 static void save_themes_settings_json(void);
 #endif // DAW_THEME_STATE_DEFINED
 
-
 #define MAX_DAW_ACTIONS 256
 #define MAX_ACTION_SHORTCUTS 6
 #define SHORTCUT_STR_LEN 36
@@ -570,6 +569,7 @@ typedef enum {
     ACT_ITEM_MOVE_DOWN_TRACK,
     ACT_ITEM_DYNAMIC_SPLIT,
     ACT_ITEM_JOIN_GLUE,
+    ACT_ITEM_SHOW_PROPERTIES,
 
     // Track Controls & Tab Management (matching Basic Shortcut.pdf)
     ACT_TRACK_TOGGLE_SOLO_SELECTED,
@@ -731,6 +731,10 @@ static void paste_tracks_at_bottom_of_selected(ProjectTab *p);
 static void show_processing_wait_modal(SDL_Renderer *ren, SDL_Window *win, const char *title, const char *detail, int pct);
 static void finish_processing_wait_modal(Uint32 hold_ms);
 static void execute_join_glue_selected_items(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
+static void daw_set_playhead_seconds(ProjectTab *p, double new_sec);
+static float get_min_zoom_pps(ProjectTab *p, int view_w);
+static void open_clip_properties_window(ProjectTab *p, int win_w, int win_h);
+static void open_color_picker_dialog(int target_mode);
 static void request_open_project_with_save_prompt(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
 static void scan_scripts_directory_to_actions(DawEngine *daw);
 static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win, int act_idx);
@@ -2131,6 +2135,9 @@ static void init_keyboard_actions_system(void) {
     register_builtin_action(ACT_ITEM_JOIN_GLUE,
         "Item: Join (glue) selected items",
         "J", "Ctrl+J", NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_SHOW_PROPERTIES,
+        "Item: Show selected clip properties...",
+        "Ctrl+I", "Ctrl+=", NULL, NULL, false, false);
 
     // ---- TRACK CONTROLS & TAB MANAGEMENT (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_TRACK_TOGGLE_SOLO_SELECTED,
@@ -2395,7 +2402,6 @@ static bool resolve_script_filepath(DawActionEntry *act, char *out_path, size_t 
     return false;
 }
 
-
 // ================= UNIVERSAL DYNAMIC SCRIPT EXPRESSION & VARIABLE EVALUATOR =================
 #define MAX_SCRIPT_VARS 32
 typedef struct {
@@ -2613,10 +2619,8 @@ static bool split_single_item_at_time(ProjectTab *p, int item_idx, double split_
     AudioItem *r_item = &p->items[r_idx];
     memcpy(r_item, it, sizeof(AudioItem));
     if (it->peak_count > 0 && it->peaks) {
-        r_item->peaks = (PeakBin *)calloc((size_t)it->peak_count, sizeof(PeakBin));
-        if (r_item->peaks) {
-            memcpy(r_item->peaks, it->peaks, (size_t)it->peak_count * sizeof(PeakBin));
-        }
+        it->peaks = daw_register_shared_peaks(it->raw_audio_path, it->peaks, it->peak_count, it->file_total_duration, it->has_video);
+        r_item->peaks = it->peaks;
     }
 
     it->duration = left_dur;
@@ -2625,7 +2629,7 @@ static bool split_single_item_at_time(ProjectTab *p, int item_idx, double split_
     r_item->duration = right_dur;
     r_item->is_selected = true;
     it->is_selected = true;
-    r_item->raw_file_handle = r_item->raw_audio_path[0] ? fopen(r_item->raw_audio_path, "rb") : NULL;
+    r_item->raw_file_handle = daw_fopen_LockFreeRead(r_item->raw_audio_path);
 
     g_item_fade_in[tab][item_idx] = fmin(orig_fin, it->duration);
     g_item_fade_out[tab][item_idx] = 0.0;
@@ -2712,10 +2716,8 @@ static bool split_selected_items_at_center(ProjectTab *p) {
         AudioItem *r_item = &p->items[r_idx];
         memcpy(r_item, it, sizeof(AudioItem));
         if (it->peak_count > 0 && it->peaks) {
-            r_item->peaks = (PeakBin *)calloc((size_t)it->peak_count, sizeof(PeakBin));
-            if (r_item->peaks) {
-                memcpy(r_item->peaks, it->peaks, (size_t)it->peak_count * sizeof(PeakBin));
-            }
+            it->peaks = daw_register_shared_peaks(it->raw_audio_path, it->peaks, it->peak_count, it->file_total_duration, it->has_video);
+            r_item->peaks = it->peaks;
         }
 
         it->duration = half_dur;
@@ -2724,7 +2726,7 @@ static bool split_selected_items_at_center(ProjectTab *p) {
         r_item->duration = half_dur;
         r_item->is_selected = true;
         it->is_selected = true;
-        r_item->raw_file_handle = r_item->raw_audio_path[0] ? fopen(r_item->raw_audio_path, "rb") : NULL;
+        r_item->raw_file_handle = daw_fopen_LockFreeRead(r_item->raw_audio_path);
 
         g_item_fade_in[tab][i]      = fmin(orig_fin, it->duration);
         g_item_fade_out[tab][i]     = 0.0;
@@ -3009,14 +3011,12 @@ static void execute_dynamic_split_items(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             dst->offset_in_file = src_copy.offset_in_file + (final_segs[s].s - clip_s);
             dst->duration       = final_segs[s].e - final_segs[s].s;
             dst->is_selected    = true;
-            dst->peaks          = NULL;
             if (src_copy.peak_count > 0 && src_copy.peaks) {
-                dst->peaks = (PeakBin *)calloc((size_t)src_copy.peak_count, sizeof(PeakBin));
-                if (dst->peaks) {
-                    memcpy(dst->peaks, src_copy.peaks, (size_t)src_copy.peak_count * sizeof(PeakBin));
-                }
+                dst->peaks = daw_register_shared_peaks(src_copy.raw_audio_path, src_copy.peaks, src_copy.peak_count, src_copy.file_total_duration, src_copy.has_video);
+            } else {
+                dst->peaks = NULL;
             }
-            dst->raw_file_handle = dst->raw_audio_path[0] ? fopen(dst->raw_audio_path, "rb") : NULL;
+            dst->raw_file_handle = daw_fopen_LockFreeRead(dst->raw_audio_path);
             g_item_fade_in[tab][ni]   = fmin(0.010, dst->duration * 0.2);
             g_item_fade_out[tab][ni]  = fmin(0.010, dst->duration * 0.2);
             g_item_vol_db[tab][ni]    = orig_vol;
@@ -3724,7 +3724,7 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
             double cpos = 0.0;
             const char *tok = str_contains_nocase(s, "SetEditCurPos") ? "SetEditCurPos" : "set_cursor_pos";
             if (parse_number_after_token(s, tok, &cpos) && cpos >= 0.0) {
-                p->playhead_seconds = cpos;
+                daw_set_playhead_seconds(p, cpos);
                 did_any_action = true;
             }
         }
@@ -4129,8 +4129,9 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             }
             if (any_sel && max_e > min_s + 0.05 && view_w > 100) {
                 double span = (max_e - min_s) * 1.15;
+                float min_pps = get_min_zoom_pps(p, view_w);
                 float new_pps = (float)((double)view_w / span);
-                if (new_pps < 15.0f) new_pps = 15.0f;
+                if (new_pps < min_pps) new_pps = min_pps;
                 if (new_pps > 400.0f) new_pps = 400.0f;
                 p->pixels_per_second = new_pps;
                 p->scroll_x_sec = fmax(0.0, min_s - (max_e - min_s) * 0.05);
@@ -4144,7 +4145,11 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         }
         case ACT_VIEW_ZOOM_OUT_HORIZ:
         case ACT_VIEW_ZOOM_HORIZ_REV_WHEEL: {
-            p->pixels_per_second = fmaxf(15.0f, p->pixels_per_second * 0.8f);
+            float min_pps = get_min_zoom_pps(p, view_w);
+            p->pixels_per_second = fmaxf(min_pps, p->pixels_per_second * 0.80f);
+            if (p->pixels_per_second <= min_pps * 1.02f) {
+                p->scroll_x_sec = 0.0;
+            }
             break;
         }
         case ACT_VIEW_SCROLL_HORIZ_WHEEL: {
@@ -4172,16 +4177,8 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_VIEW_ZOOM_OUT_PROJECT: {
-            double max_e = 10.0;
-            for (int i = 0; i < p->num_items; i++) {
-                double ie = p->items[i].start_time + p->items[i].duration;
-                if (ie > max_e) max_e = ie;
-            }
             if (view_w > 100) {
-                float new_pps = (float)((double)view_w / (max_e * 1.08));
-                if (new_pps < 15.0f) new_pps = 15.0f;
-                if (new_pps > 400.0f) new_pps = 400.0f;
-                p->pixels_per_second = new_pps;
+                p->pixels_per_second = get_min_zoom_pps(p, view_w);
                 p->scroll_x_sec = 0.0;
             }
             break;
@@ -4192,8 +4189,9 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                 double re = get_range_end();
                 double span = (re - rs) * 1.1;
                 if (span > 0.05) {
+                    float min_pps = get_min_zoom_pps(p, view_w);
                     float new_pps = (float)((double)view_w / span);
-                    if (new_pps < 15.0f) new_pps = 15.0f;
+                    if (new_pps < min_pps) new_pps = min_pps;
                     if (new_pps > 400.0f) new_pps = 400.0f;
                     p->pixels_per_second = new_pps;
                     p->scroll_x_sec = fmax(0.0, rs - (re - rs) * 0.05);
@@ -4268,6 +4266,10 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         }
         case ACT_ITEM_JOIN_GLUE: {
             execute_join_glue_selected_items(p, ren, win);
+            break;
+        }
+        case ACT_ITEM_SHOW_PROPERTIES: {
+            open_clip_properties_window(p, win_w, win_h);
             break;
         }
         case ACT_ITEM_MOVE_UP_TRACK: {
@@ -4393,7 +4395,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             if (best_idx >= 0) {
                 for (int i = 0; i < p->num_items; i++) p->items[i].is_selected = (i == best_idx);
                 g_last_clicked_item_idx = best_idx;
-                p->playhead_seconds = p->items[best_idx].start_time;
+                daw_set_playhead_seconds(p, p->items[best_idx].start_time);
             }
             break;
         }
@@ -4427,7 +4429,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             if (best_idx >= 0) {
                 for (int i = 0; i < p->num_items; i++) p->items[i].is_selected = (i == best_idx);
                 g_last_clicked_item_idx = best_idx;
-                p->playhead_seconds = p->items[best_idx].start_time;
+                daw_set_playhead_seconds(p, p->items[best_idx].start_time);
             }
             break;
         }
@@ -4450,7 +4452,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                     }
                 }
             }
-            if (target_s >= 0.0) p->playhead_seconds = target_s;
+            if (target_s >= 0.0) daw_set_playhead_seconds(p, target_s);
             break;
         }
         case ACT_ITEM_NAV_CURSOR_RIGHT_EDGE_OF_ITEM: {
@@ -4471,7 +4473,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                     }
                 }
             }
-            if (target_e >= 0.0) p->playhead_seconds = target_e;
+            if (target_e >= 0.0) daw_set_playhead_seconds(p, target_e);
             break;
         }
         case ACT_ITEM_NAV_CURSOR_LEFT_NEAREST_EDGE: {
@@ -4483,8 +4485,8 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                 if (s < p->playhead_seconds - 0.001 && s > best_edge) best_edge = s;
                 if (e < p->playhead_seconds - 0.001 && e > best_edge) best_edge = e;
             }
-            if (best_edge >= 0.0) p->playhead_seconds = best_edge;
-            else p->playhead_seconds = 0.0;
+            if (best_edge >= 0.0) daw_set_playhead_seconds(p, best_edge);
+            else daw_set_playhead_seconds(p, 0.0);
             break;
         }
         case ACT_ITEM_NAV_CURSOR_RIGHT_NEAREST_EDGE: {
@@ -4496,7 +4498,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                 if (s > p->playhead_seconds + 0.001 && s < best_edge) best_edge = s;
                 if (e > p->playhead_seconds + 0.001 && e < best_edge) best_edge = e;
             }
-            if (best_edge < 1e17) p->playhead_seconds = best_edge;
+            if (best_edge < 1e17) daw_set_playhead_seconds(p, best_edge);
             break;
         }
 
@@ -4579,12 +4581,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_ITEM_SET_CUSTOM_COLOR: {
-            for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].is_selected) {
-                    g_item_color_idx[tab][i] = (g_item_color_idx[tab][i] + 1) % 8;
-                }
-            }
-            record_project_change("Set Item Custom Color", true);
+            open_color_picker_dialog(1);
             break;
         }
         case ACT_ITEM_SPLIT_AT_CURSOR: {
@@ -4610,10 +4607,8 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                     AudioItem *r_item = &p->items[r_idx];
                     memcpy(r_item, it, sizeof(AudioItem));
                     if (it->peak_count > 0 && it->peaks) {
-                        r_item->peaks = (PeakBin *)calloc((size_t)it->peak_count, sizeof(PeakBin));
-                        if (r_item->peaks) {
-                            memcpy(r_item->peaks, it->peaks, (size_t)it->peak_count * sizeof(PeakBin));
-                        }
+                        it->peaks = daw_register_shared_peaks(it->raw_audio_path, it->peaks, it->peak_count, it->file_total_duration, it->has_video);
+                        r_item->peaks = it->peaks;
                     }
                     double delta = cur_t - it_s;
                     it->duration = delta;
@@ -4622,7 +4617,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                     r_item->duration = it_e - cur_t;
                     r_item->is_selected = true;
                     it->is_selected = false;
-                    r_item->raw_file_handle = r_item->raw_audio_path[0] ? fopen(r_item->raw_audio_path, "rb") : NULL;
+                    r_item->raw_file_handle = daw_fopen_LockFreeRead(r_item->raw_audio_path);
                     g_item_fade_in[tab][i] = fmin(orig_fin, it->duration);
                     g_item_fade_out[tab][i] = 0.0;
                     g_item_fade_in[tab][r_idx] = 0.0;
@@ -4649,10 +4644,10 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                     memcpy(dst, src, sizeof(AudioItem));
                     dst->start_time = src->start_time + src->duration;
                     if (src->peak_count > 0 && src->peaks) {
-                        dst->peaks = (PeakBin *)calloc((size_t)src->peak_count, sizeof(PeakBin));
-                        if (dst->peaks) memcpy(dst->peaks, src->peaks, (size_t)src->peak_count * sizeof(PeakBin));
+                        src->peaks = daw_register_shared_peaks(src->raw_audio_path, src->peaks, src->peak_count, src->file_total_duration, src->has_video);
+                        dst->peaks = src->peaks;
                     }
-                    dst->raw_file_handle = dst->raw_audio_path[0] ? fopen(dst->raw_audio_path, "rb") : NULL;
+                    dst->raw_file_handle = daw_fopen_LockFreeRead(dst->raw_audio_path);
                     g_item_fade_in[tab][ni] = g_item_fade_in[tab][i];
                     g_item_fade_out[tab][ni] = g_item_fade_out[tab][i];
                     g_item_vol_db[tab][ni] = g_item_vol_db[tab][i];
@@ -4913,7 +4908,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_TRANSPORT_GO_TO_START: {
-            p->playhead_seconds = 0.0;
+            daw_set_playhead_seconds(p, 0.0);
             p->scroll_x_sec = 0.0;
             ensure_playhead_visible_in_viewport(p, view_w);
             break;
@@ -4924,7 +4919,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                 double ie = p->items[i].start_time + p->items[i].duration;
                 if (ie > max_e) max_e = ie;
             }
-            p->playhead_seconds = max_e;
+            daw_set_playhead_seconds(p, max_e);
             ensure_playhead_visible_in_viewport(p, view_w);
             break;
         }
@@ -5012,7 +5007,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                     best_t = p->markers[m].time_sec;
                 }
             }
-            if (best_t < 1e17) p->playhead_seconds = best_t;
+            if (best_t < 1e17) daw_set_playhead_seconds(p, best_t);
             break;
         }
         case ACT_MARKER_PREV: {
@@ -5022,8 +5017,8 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                     best_t = p->markers[m].time_sec;
                 }
             }
-            if (best_t >= 0.0) p->playhead_seconds = best_t;
-            else p->playhead_seconds = 0.0;
+            if (best_t >= 0.0) daw_set_playhead_seconds(p, best_t);
+            else daw_set_playhead_seconds(p, 0.0);
             break;
         }
         case ACT_MARKER_DELETE_NEAREST: {
@@ -5270,28 +5265,20 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
         return true;
     }
 
-    // 2. Top Filter & Pin / Move Row (wy + 38 .. wy + 64)
+    // 2. Top Filter & Pin Row (wy + 38 .. wy + 64) - Up/Down options removed
     if (my >= wy + 38 && my <= wy + 64) {
-        if (mx >= wx + 58 && mx <= wx + 286) {
+        if (mx >= wx + 58 && mx <= wx + 366) {
             g_action_win.filter_focused = true;
             SDL_StartTextInput();
-        } else if (mx >= wx + 292 && mx <= wx + 350) {
+        } else if (mx >= wx + 372 && mx <= wx + 434) {
             // [Clear]
             g_action_win.filter_text[0] = '\0';
             g_action_win.scroll_y = 0;
             refresh_filtered_actions();
-        } else if (mx >= wx + 356 && mx <= wx + 420) {
+        } else if (mx >= wx + 440 && mx <= wx + 508) {
             // [Pin] -> Toggle Pin on selected action (brings to top & saves permanently)
             toggle_pin_selected_action();
-        } else if (mx >= wx + 426 && mx <= wx + 464) {
-            // [Up ^] -> Move selected action row up
-            move_selected_action_row(-1);
-            scroll_action_list_to_selected(g_action_win.win_rect.h - 244);
-        } else if (mx >= wx + 470 && mx <= wx + 510) {
-            // [Dn v] -> Move selected action row down
-            move_selected_action_row(1);
-            scroll_action_list_to_selected(g_action_win.win_rect.h - 244);
-        } else if (mx >= wx + 516 && mx <= wx + 592) {
+        } else if (mx >= wx + 514 && mx <= wx + 592) {
             // [Refresh] -> Rescan scripts folder for newly added .lua / .py scripts & save keyboard_shortcuts.json
             scan_scripts_directory_to_actions(&g_daw);
             save_keyboard_shortcuts_json();
@@ -5447,7 +5434,7 @@ static void render_action_window(SDL_Renderer *ren) {
     // ---- Top Filter + Pin & Move Row ----
     draw_text(ren, "Filter", wx + 14, wy + 45, c_white);
 
-    SDL_Rect flt_box = { wx + 58, wy + 38, 228, 26 };
+    SDL_Rect flt_box = { wx + 58, wy + 38, 308, 26 };
     SDL_SetRenderDrawColor(ren, 16, 15, 14, 255);
     SDL_RenderFillRect(ren, &flt_box);
     draw_brown_border_rect(ren, &flt_box, g_action_win.filter_focused, false);
@@ -5462,38 +5449,26 @@ static void render_action_window(SDL_Renderer *ren) {
         }
     }
 
-    SDL_Rect btn_clear = { wx + 292, wy + 38, 58, 26 };
+    SDL_Rect btn_clear = { wx + 372, wy + 38, 62, 26 };
     SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
     SDL_RenderFillRect(ren, &btn_clear);
     draw_brown_border_rect(ren, &btn_clear, false, false);
-    draw_text(ren, "Clear", wx + 301, wy + 45, c_white);
+    draw_text(ren, "Clear", wx + 383, wy + 45, c_white);
 
     bool cur_pinned = (g_action_win.selected_action_idx >= 0 && g_action_win.selected_action_idx < g_num_actions &&
                        g_actions[g_action_win.selected_action_idx].is_pinned);
-    SDL_Rect btn_pin = { wx + 356, wy + 38, 64, 26 };
+    SDL_Rect btn_pin = { wx + 440, wy + 38, 68, 26 };
     SDL_SetRenderDrawColor(ren, cur_pinned ? 74 : 44, cur_pinned ? 52 : 38, cur_pinned ? 30 : 34, 255);
     SDL_RenderFillRect(ren, &btn_pin);
     draw_brown_border_rect(ren, &btn_pin, cur_pinned, false);
-    draw_pin_symbol_icon(ren, wx + 362, wy + 44, cur_pinned, cur_pinned ? c_accent : c_white);
-    draw_text(ren, "Pin", wx + 378, wy + 45, c_white);
+    draw_pin_symbol_icon(ren, wx + 448, wy + 44, cur_pinned, cur_pinned ? c_accent : c_white);
+    draw_text(ren, "Pin", wx + 464, wy + 45, c_white);
 
-    SDL_Rect btn_up = { wx + 426, wy + 38, 38, 26 };
-    SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
-    SDL_RenderFillRect(ren, &btn_up);
-    draw_brown_border_rect(ren, &btn_up, false, false);
-    draw_text(ren, "Up^", wx + 433, wy + 45, c_white);
-
-    SDL_Rect btn_dn = { wx + 470, wy + 38, 40, 26 };
-    SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
-    SDL_RenderFillRect(ren, &btn_dn);
-    draw_brown_border_rect(ren, &btn_dn, false, false);
-    draw_text(ren, "Dn v", wx + 474, wy + 45, c_white);
-
-    SDL_Rect btn_opt = { wx + 516, wy + 38, 76, 26 };
+    SDL_Rect btn_opt = { wx + 514, wy + 38, 78, 26 };
     SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
     SDL_RenderFillRect(ren, &btn_opt);
     draw_brown_border_rect(ren, &btn_opt, false, false);
-    draw_text(ren, "Refresh", wx + 526, wy + 45, c_white);
+    draw_text(ren, "Refresh", wx + 525, wy + 45, c_white);
 
     SDL_Rect btn_find = { wx + 598, wy + 38, 168, 26 };
     SDL_SetRenderDrawColor(ren, 52, 42, 34, 255);
