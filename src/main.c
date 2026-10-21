@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include <time.h>
+#include <ctype.h>
 
 #include "font.h"
 #include "video_player.h"
@@ -24,6 +25,16 @@
 #endif
 #ifndef OFN_EXPLORER
 #define OFN_EXPLORER 0x00080000
+#endif
+#ifdef _WIN32
+#ifndef MOVEFILE_REPLACE_EXISTING
+#define MOVEFILE_REPLACE_EXISTING 0x00000001
+#endif
+#ifndef MOVEFILE_COPY_ALLOWED
+#define MOVEFILE_COPY_ALLOWED 0x00000002
+#endif
+#else
+#include <dirent.h>
 #endif
 
 #ifndef DAW_PEAK_POOL_DEFINED
@@ -1589,7 +1600,7 @@ static RecordingEngineState g_rec = {
     0, -1, 0.0, 0, 0,
     NULL, NULL,
     "", "",
-    "C:\\Users\\USER\\Documents\\Recordings",
+    "Recordings",
     0.0f, 0.0f, 0, 0, 0,
     false
 };
@@ -1597,11 +1608,30 @@ static RecordingEngineState g_rec = {
 static inline void init_default_recording_folder(void) {
     if (g_rec.folder_initialized) return;
     g_rec.folder_initialized = true;
-    const char *user_prof = getenv("USERPROFILE");
-    if (user_prof && user_prof[0]) {
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Documents\\Recordings", user_prof);
+    char *base = SDL_GetBasePath();
+    if (base && base[0]) {
+        size_t blen = strlen(base);
+        while (blen > 0 && (base[blen - 1] == '\\' || base[blen - 1] == '/')) {
+            base[--blen] = '\0';
+        }
+#ifdef _WIN32
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Recordings", base);
+        CreateDirectoryA(g_rec.folder_path, NULL);
+        CreateDirectoryA("Recordings", NULL);
+#else
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s/Recordings", base);
+        mkdir(g_rec.folder_path, 0777);
+        mkdir("Recordings", 0777);
+#endif
+        SDL_free(base);
     } else {
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "C:\\Users\\USER\\Documents\\Recordings");
+        if (base) SDL_free(base);
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "Recordings");
+#ifdef _WIN32
+        CreateDirectoryA("Recordings", NULL);
+#else
+        mkdir("Recordings", 0777);
+#endif
     }
 }
 
@@ -4224,10 +4254,362 @@ static void execute_multi_media_import(ProjectTab *p, SDL_Renderer *ren, SDL_Win
 // ================= CLEAN PROJECT EXPORT & IMPORT SYSTEM (.ehs) =================
 #define EHS_EXT_MAGIC 0x45485333U // "EHS3" Extended Project Metadata Signature
 
+static void ensure_recording_directory_exists(const char *dir_path);
+static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
+
+// Compares two file paths case-insensitively while treating '/' and '\' as equivalent
+static int daw_strcasecmp_custom(const char *a, const char *b) {
+    if (!a || !b) return (a == b) ? 0 : (a ? 1 : -1);
+    while (*a && *b) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        a++;
+        b++;
+    }
+    return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+}
+
+static int daw_strncasecmp_custom(const char *a, const char *b, size_t n) {
+    if (n == 0) return 0;
+    if (!a || !b) return (a == b) ? 0 : (a ? 1 : -1);
+    while (n-- > 0 && *a && *b) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        a++;
+        b++;
+    }
+    if (n == (size_t)-1) return 0;
+    return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+}
+
+static bool daw_paths_equal_norm(const char *a, const char *b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char ca = (*a == '/') ? '\\' : (char)tolower((unsigned char)*a);
+        char cb = (*b == '/') ? '\\' : (char)tolower((unsigned char)*b);
+        if (ca != cb) return false;
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0');
+}
+
+// Returns true if fpath is inside the software's temporary Recordings folder
+static bool is_temp_recordings_clip_path(const char *fpath) {
+    if (!fpath || !fpath[0]) return false;
+    init_default_recording_folder();
+
+    // 1. Check if fpath starts with g_rec.folder_path + separator
+    size_t rlen = strlen(g_rec.folder_path);
+    if (rlen > 0 && strlen(fpath) > rlen) {
+        bool prefix_ok = true;
+        for (size_t i = 0; i < rlen; i++) {
+            char ca = (fpath[i] == '/') ? '\\' : (char)tolower((unsigned char)fpath[i]);
+            char cb = (g_rec.folder_path[i] == '/') ? '\\' : (char)tolower((unsigned char)g_rec.folder_path[i]);
+            if (ca != cb) { prefix_ok = false; break; }
+        }
+        if (prefix_ok && (fpath[rlen] == '\\' || fpath[rlen] == '/')) {
+            return true;
+        }
+    }
+
+    // 2. Check relative Recordings/... or ./Recordings/...
+    const char *p = fpath;
+    if (p[0] == '.' && (p[1] == '/' || p[1] == '\\')) p += 2;
+    if (daw_strncasecmp_custom(p, "Recordings/", 11) == 0 || daw_strncasecmp_custom(p, "Recordings\\", 11) == 0) {
+        return true;
+    }
+
+    // 3. Check if path contains /Recordings/ or \Recordings\ and the file exists in software Recordings
+    char norm[512];
+    size_t n = strlen(fpath);
+    if (n >= sizeof(norm)) n = sizeof(norm) - 1;
+    for (size_t i = 0; i < n; i++) {
+        norm[i] = (fpath[i] == '/') ? '\\' : (char)tolower((unsigned char)fpath[i]);
+    }
+    norm[n] = '\0';
+    if (strstr(norm, "\\recordings\\") != NULL) {
+        return true;
+    }
+    return false;
+}
+
+// Moves a temporary file from the software Recordings folder to the permanent project folder (safe across drives)
+static bool move_temp_file_to_project_folder(const char *src_path, const char *dst_path) {
+    if (!src_path || !src_path[0] || !dst_path || !dst_path[0]) return false;
+    if (daw_paths_equal_norm(src_path, dst_path)) return true;
+
+    FILE *chk_src = fopen(src_path, "rb");
+    if (!chk_src) {
+        // If src_path was already moved by an earlier split clip sharing the same file, verify dst_path exists
+        FILE *chk_dst = fopen(dst_path, "rb");
+        if (chk_dst) {
+            fclose(chk_dst);
+            return true;
+        }
+        return false;
+    }
+    fclose(chk_src);
+
+#ifdef _WIN32
+    if (MoveFileExA(src_path, dst_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+        return true;
+    }
+#endif
+    if (rename(src_path, dst_path) == 0) {
+        return true;
+    }
+
+    // Cross-volume / fallback copy + remove
+    FILE *in = fopen(src_path, "rb");
+    if (!in) return false;
+    FILE *out = fopen(dst_path, "wb");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+    char buf[65536];
+    size_t bytes_read;
+    bool copy_ok = true;
+    while ((bytes_read = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, bytes_read, out) != bytes_read) {
+            copy_ok = false;
+            break;
+        }
+    }
+    fclose(in);
+    fclose(out);
+    if (copy_ok) {
+        remove(src_path);
+        return true;
+    }
+    return false;
+}
+
+// Updates all in-memory AudioItem file_path references (tabs, undo stacks, clipboards) after moving a clip
+static void update_clip_filepath_references(const char *old_path, const char *new_path) {
+    if (!old_path || !old_path[0] || !new_path || !new_path[0]) return;
+
+    for (int t = 0; t < g_daw.num_tabs; t++) {
+        ProjectTab *tp = &g_daw.tabs[t];
+        for (int i = 0; i < tp->num_items; i++) {
+            if (daw_paths_equal_norm(tp->items[i].file_path, old_path)) {
+                strncpy(tp->items[i].file_path, new_path, sizeof(tp->items[i].file_path) - 1);
+                tp->items[i].file_path[sizeof(tp->items[i].file_path) - 1] = '\0';
+            }
+        }
+        for (int h = 0; h < tp->undo_mgr.count && h < MAX_UNDO_STACK; h++) {
+            DawSnapshot *snap = &tp->undo_mgr.history[h];
+            for (int i = 0; i < snap->num_items; i++) {
+                if (daw_paths_equal_norm(snap->items[i].file_path, old_path)) {
+                    strncpy(snap->items[i].file_path, new_path, sizeof(snap->items[i].file_path) - 1);
+                    snap->items[i].file_path[sizeof(snap->items[i].file_path) - 1] = '\0';
+                }
+            }
+        }
+        if (g_deep_undo_stack[t]) {
+            for (int h = 0; h < MAX_DEEP_UNDO; h++) {
+                DeepUndoEntry *ent = &g_deep_undo_stack[t][h];
+                for (int i = 0; i < ent->num_items; i++) {
+                    if (daw_paths_equal_norm(ent->items[i].file_path, old_path)) {
+                        strncpy(ent->items[i].file_path, new_path, sizeof(ent->items[i].file_path) - 1);
+                        ent->items[i].file_path[sizeof(ent->items[i].file_path) - 1] = '\0';
+                    }
+                }
+            }
+        }
+    }
+
+    for (int c = 0; c < g_clipboard_count; c++) {
+        if (daw_paths_equal_norm(g_clipboard[c].item.file_path, old_path)) {
+            strncpy(g_clipboard[c].item.file_path, new_path, sizeof(g_clipboard[c].item.file_path) - 1);
+            g_clipboard[c].item.file_path[sizeof(g_clipboard[c].item.file_path) - 1] = '\0';
+        }
+    }
+    for (int tc = 0; tc < g_track_clipboard_count; tc++) {
+        for (int c = 0; c < g_track_clipboard[tc].num_clips; c++) {
+            if (daw_paths_equal_norm(g_track_clipboard[tc].clips[c].item.file_path, old_path)) {
+                strncpy(g_track_clipboard[tc].clips[c].item.file_path, new_path,
+                        sizeof(g_track_clipboard[tc].clips[c].item.file_path) - 1);
+                g_track_clipboard[tc].clips[c].item.file_path[sizeof(g_track_clipboard[tc].clips[c].item.file_path) - 1] = '\0';
+            }
+        }
+    }
+    if (daw_paths_equal_norm(g_rec.current_wav_path, old_path)) {
+        strncpy(g_rec.current_wav_path, new_path, sizeof(g_rec.current_wav_path) - 1);
+        g_rec.current_wav_path[sizeof(g_rec.current_wav_path) - 1] = '\0';
+    }
+}
+
+// Sweeps a temporary Recordings directory, moving all remaining files into proj_folder so Recordings becomes empty
+static void sweep_and_empty_temp_recordings_dir(const char *rec_dir, const char *proj_folder) {
+    if (!rec_dir || !rec_dir[0] || !proj_folder || !proj_folder[0]) return;
+    if (daw_paths_equal_norm(rec_dir, proj_folder)) return;
+
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*.*", rec_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(pattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            const char *fname = fd.cFileName;
+            if (fname[0] == '.') continue;
+            char src_f[1024], dst_f[1024], rel_f[1024];
+            snprintf(src_f, sizeof(src_f), "%s\\%s", rec_dir, fname);
+            snprintf(dst_f, sizeof(dst_f), "%s\\%s", proj_folder, fname);
+            snprintf(rel_f, sizeof(rel_f), "Recordings\\%s", fname);
+            move_temp_file_to_project_folder(src_f, dst_f);
+            remove(src_f);
+            update_clip_filepath_references(src_f, dst_f);
+            update_clip_filepath_references(rel_f, dst_f);
+        }
+    } while (FindNextFileA(hFind, &fd) != 0);
+    FindClose(hFind);
+#else
+    DIR *d = opendir(rec_dir);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *fname = ent->d_name;
+        if (fname[0] == '.') continue;
+        char src_f[1024], dst_f[1024], rel_f[1024];
+        snprintf(src_f, sizeof(src_f), "%s/%s", rec_dir, fname);
+        snprintf(dst_f, sizeof(dst_f), "%s/%s", proj_folder, fname);
+        snprintf(rel_f, sizeof(rel_f), "Recordings/%s", fname);
+        move_temp_file_to_project_folder(src_f, dst_f);
+        remove(src_f);
+        update_clip_filepath_references(src_f, dst_f);
+        update_clip_filepath_references(rel_f, dst_f);
+    }
+    closedir(d);
+#endif
+}
+
+// Moves all temporary Recorded and Glued clips from software Recordings folder into proj_folder permanently
+static void migrate_temp_recordings_to_project_folder(ProjectTab *p, const char *proj_folder) {
+    if (!p || !proj_folder || !proj_folder[0]) return;
+    init_default_recording_folder();
+
+    if (g_rec.is_recording) {
+        start_or_stop_recording(p, NULL, NULL);
+    }
+
+    ensure_recording_directory_exists(proj_folder);
+
+    // 1. Move any clip referenced by the project from software Recordings folder to proj_folder
+    for (int i = 0; i < p->num_items; i++) {
+        AudioItem *it = &p->items[i];
+        if (!is_temp_recordings_clip_path(it->file_path)) continue;
+
+        const char *fn = strrchr(it->file_path, '\\');
+        const char *fn2 = strrchr(it->file_path, '/');
+        if (fn2 && (!fn || fn2 > fn)) fn = fn2;
+        const char *short_name = fn ? (fn + 1) : it->file_path;
+        if (!short_name[0]) continue;
+
+        char old_path[512];
+        strncpy(old_path, it->file_path, sizeof(old_path) - 1);
+        old_path[sizeof(old_path) - 1] = '\0';
+
+        char dst_path[512];
+#ifdef _WIN32
+        snprintf(dst_path, sizeof(dst_path), "%s\\%s", proj_folder, short_name);
+#else
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", proj_folder, short_name);
+#endif
+
+        if (!move_temp_file_to_project_folder(old_path, dst_path)) {
+            // Also try moving from g_rec.folder_path / short_name or "Recordings/" / short_name
+            char alt_src[512];
+#ifdef _WIN32
+            snprintf(alt_src, sizeof(alt_src), "%s\\%s", g_rec.folder_path, short_name);
+#else
+            snprintf(alt_src, sizeof(alt_src), "%s/%s", g_rec.folder_path, short_name);
+#endif
+            if (!move_temp_file_to_project_folder(alt_src, dst_path)) {
+                snprintf(alt_src, sizeof(alt_src), "Recordings/%s", short_name);
+                move_temp_file_to_project_folder(alt_src, dst_path);
+            }
+        }
+        update_clip_filepath_references(old_path, dst_path);
+    }
+
+    // 2. Sweep software Recordings folder so all temporary files are moved to proj_folder and Recordings becomes empty
+    sweep_and_empty_temp_recordings_dir(g_rec.folder_path, proj_folder);
+    sweep_and_empty_temp_recordings_dir("Recordings", proj_folder);
+}
+
 static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     if (!p || !path || !path[0]) return false;
-    FILE *f = fopen(path, "wb");
-    if (!f) return false;
+
+    // Resolve designated directory, project base name, and same-named project folder
+    char parent_dir[512] = {0};
+    char proj_base_name[128] = {0};
+
+    const char *last_sep = strrchr(path, '\\');
+    const char *last_sep2 = strrchr(path, '/');
+    if (last_sep2 && (!last_sep || last_sep2 > last_sep)) last_sep = last_sep2;
+
+    if (last_sep) {
+        size_t dlen = (size_t)(last_sep - path);
+        if (dlen >= sizeof(parent_dir)) dlen = sizeof(parent_dir) - 1;
+        memcpy(parent_dir, path, dlen);
+        parent_dir[dlen] = '\0';
+        snprintf(proj_base_name, sizeof(proj_base_name), "%s", last_sep + 1);
+    } else {
+        strcpy(parent_dir, ".");
+        snprintf(proj_base_name, sizeof(proj_base_name), "%s", path);
+    }
+
+    strip_ehs_extension(proj_base_name);
+    if (!proj_base_name[0]) {
+        strcpy(proj_base_name, "Project");
+    }
+
+    // Check if parent_dir already ends with proj_base_name (e.g., saving an already-folderized project)
+    const char *parent_tail = strrchr(parent_dir, '\\');
+    const char *parent_tail2 = strrchr(parent_dir, '/');
+    if (parent_tail2 && (!parent_tail || parent_tail2 > parent_tail)) parent_tail = parent_tail2;
+    const char *parent_folder_name = parent_tail ? (parent_tail + 1) : parent_dir;
+
+    char proj_folder[512] = {0};
+    char final_ehs_path[512] = {0};
+
+    if (daw_strcasecmp_custom(parent_folder_name, proj_base_name) == 0) {
+        snprintf(proj_folder, sizeof(proj_folder), "%s", parent_dir);
+#ifdef _WIN32
+        snprintf(final_ehs_path, sizeof(final_ehs_path), "%s\\%s.ehs", proj_folder, proj_base_name);
+#else
+        snprintf(final_ehs_path, sizeof(final_ehs_path), "%s/%s.ehs", proj_folder, proj_base_name);
+#endif
+    } else {
+#ifdef _WIN32
+        snprintf(proj_folder, sizeof(proj_folder), "%s\\%s", parent_dir, proj_base_name);
+        snprintf(final_ehs_path, sizeof(final_ehs_path), "%s\\%s.ehs", proj_folder, proj_base_name);
+#else
+        snprintf(proj_folder, sizeof(proj_folder), "%s/%s", parent_dir, proj_base_name);
+        snprintf(final_ehs_path, sizeof(final_ehs_path), "%s/%s.ehs", proj_folder, proj_base_name);
+#endif
+    }
+
+    // Auto-create the project folder and permanently move all temporary Recorded & Glued clips into it
+    ensure_recording_directory_exists(proj_folder);
+    migrate_temp_recordings_to_project_folder(p, proj_folder);
+
+    FILE *f = fopen(final_ehs_path, "wb");
+    if (!f) {
+        f = fopen(path, "wb");
+        if (!f) return false;
+        strncpy(final_ehs_path, path, sizeof(final_ehs_path) - 1);
+        final_ehs_path[sizeof(final_ehs_path) - 1] = '\0';
+    } else if (!daw_paths_equal_norm(path, final_ehs_path)) {
+        // If an older loose .ehs file existed outside the project folder, remove it so the project lives cleanly in its folder
+        remove(path);
+    }
 
     int tab_i = get_valid_tab_idx();
 
@@ -4276,15 +4658,13 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
 
     fclose(f);
 
-    strncpy(p->project_path, path, sizeof(p->project_path) - 1);
+    strncpy(p->project_path, final_ehs_path, sizeof(p->project_path) - 1);
     p->project_path[sizeof(p->project_path) - 1] = '\0';
 
-    const char *fn = strrchr(path, '\\');
-    if (!fn) fn = strrchr(path, '/');
-    snprintf(p->project_name, sizeof(p->project_name), "%s", fn ? fn + 1 : path);
+    snprintf(p->project_name, sizeof(p->project_name), "%s", proj_base_name);
     strip_ehs_extension(p->project_name);
     p->is_dirty = false;
-    record_project_change("Project Saved", false);
+    record_project_change("Project Saved (Clips Moved to Project Folder)", false);
     return true;
 }
 
@@ -4433,10 +4813,64 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
     }
     fclose(f);
 
+    // Resolve project directory from path so moved project folders always find their audio clips
+    char ehs_dir[512] = {0};
+    char ehs_base[128] = {0};
+    {
+        const char *ls1 = strrchr(path, '\\');
+        const char *ls2 = strrchr(path, '/');
+        if (ls2 && (!ls1 || ls2 > ls1)) ls1 = ls2;
+        if (ls1) {
+            size_t dl = (size_t)(ls1 - path);
+            if (dl >= sizeof(ehs_dir)) dl = sizeof(ehs_dir) - 1;
+            memcpy(ehs_dir, path, dl);
+            ehs_dir[dl] = '\0';
+            snprintf(ehs_base, sizeof(ehs_base), "%s", ls1 + 1);
+        } else {
+            strcpy(ehs_dir, ".");
+            snprintf(ehs_base, sizeof(ehs_base), "%s", path);
+        }
+        strip_ehs_extension(ehs_base);
+    }
+
     // Reconstruct every clip item and strictly restore saved split/trimmed offset, duration, start_time & fades
     for (int i = 0; i < loaded_items; i++) {
         AudioItem *it = &p->items[i];
         memset(it, 0, sizeof(AudioItem));
+
+        // If saved_fpath[i] was moved with the project folder, check near the .ehs file automatically
+        if (saved_fpath[i][0] != '\0') {
+            FILE *chk_f = fopen(saved_fpath[i], "rb");
+            if (chk_f) {
+                fclose(chk_f);
+            } else {
+                const char *cfn = strrchr(saved_fpath[i], '\\');
+                const char *cfn2 = strrchr(saved_fpath[i], '/');
+                if (cfn2 && (!cfn || cfn2 > cfn)) cfn = cfn2;
+                const char *clip_short = cfn ? (cfn + 1) : saved_fpath[i];
+                char cand1[512], cand2[512];
+#ifdef _WIN32
+                snprintf(cand1, sizeof(cand1), "%s\\%s", ehs_dir, clip_short);
+                snprintf(cand2, sizeof(cand2), "%s\\%s\\%s", ehs_dir, ehs_base, clip_short);
+#else
+                snprintf(cand1, sizeof(cand1), "%s/%s", ehs_dir, clip_short);
+                snprintf(cand2, sizeof(cand2), "%s/%s/%s", ehs_dir, ehs_base, clip_short);
+#endif
+                FILE *c1 = fopen(cand1, "rb");
+                if (c1) {
+                    fclose(c1);
+                    strncpy(saved_fpath[i], cand1, sizeof(saved_fpath[i]) - 1);
+                    saved_fpath[i][sizeof(saved_fpath[i]) - 1] = '\0';
+                } else {
+                    FILE *c2 = fopen(cand2, "rb");
+                    if (c2) {
+                        fclose(c2);
+                        strncpy(saved_fpath[i], cand2, sizeof(saved_fpath[i]) - 1);
+                        saved_fpath[i][sizeof(saved_fpath[i]) - 1] = '\0';
+                    }
+                }
+            }
+        }
 
         // Check if an earlier clip in this project already loaded the same source media file
         int shared_idx = -1;
@@ -4565,15 +4999,26 @@ static void execute_join_glue_selected_items(ProjectTab *p, SDL_Renderer *ren, S
         uint32_t total_frames = (uint32_t)(total_dur * (double)SAMPLE_RATE);
         if (total_frames == 0) continue;
 
+        init_default_recording_folder();
+        ensure_recording_directory_exists(g_rec.folder_path);
         unsigned int ticks = (unsigned int)SDL_GetTicks();
         char raw_path[512];
         char wav_path[512];
         snprintf(raw_path, sizeof(raw_path), ".cache/glued_%u_t%d.raw", ticks, t + 1);
-        snprintf(wav_path, sizeof(wav_path), "Recordings/Glued_Track%d_%u.wav", t + 1, ticks);
+#ifdef _WIN32
+        snprintf(wav_path, sizeof(wav_path), "%s\\Glued_Track%d_%u.wav", g_rec.folder_path, t + 1, ticks);
+#else
+        snprintf(wav_path, sizeof(wav_path), "%s/Glued_Track%d_%u.wav", g_rec.folder_path, t + 1, ticks);
+#endif
 
         FILE *f_raw = fopen(raw_path, "wb");
         if (!f_raw) continue;
         FILE *f_wav = fopen(wav_path, "wb");
+        if (!f_wav) {
+            ensure_recording_directory_exists("Recordings");
+            snprintf(wav_path, sizeof(wav_path), "Recordings/Glued_Track%d_%u.wav", t + 1, ticks);
+            f_wav = fopen(wav_path, "wb");
+        }
         if (f_wav) write_wav_pcm_header(f_wav, total_frames, SAMPLE_RATE, 2, 24);
 
         int alloc_bins = (int)(total_frames / PEAK_SAMPLES_PER_BIN) + 16;
