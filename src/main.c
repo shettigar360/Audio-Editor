@@ -1579,6 +1579,33 @@ static bool g_script_pinned[64] = { false };
 static int  g_script_filtered_indices[64] = { 0 };
 static int  g_script_num_filtered = 0;
 
+#ifndef DAW_14POINT_STATE_DEFINED
+#define DAW_14POINT_STATE_DEFINED
+#define NUM_INBUILT_THEMES 6
+static int  g_universal_peak_color_idx = 0;
+static bool g_rec_master_enabled = false; // Near Record menu ON/OFF button (default OFF)
+static bool g_menu_settings_open = false;
+static bool g_mouse_click_empty_moves_playhead = false;
+static bool g_mouse_click_universal_moves_playhead = false;
+static bool g_mouse_settings_open = false;
+static SDL_Rect g_mouse_win_rect = { 420, 180, 440, 220 };
+static bool g_mouse_win_dragging = false;
+static int  g_mouse_drag_off_x = 0;
+static int  g_mouse_drag_off_y = 0;
+static bool g_time_jump_open = false;
+static SDL_Rect g_time_jump_rect = { 510, 82, 268, 124 };
+static bool g_time_jump_dragging = false;
+static int  g_time_jump_drag_off_x = 0;
+static int  g_time_jump_drag_off_y = 0;
+static char g_time_jump_buf[32] = "";
+static bool g_video_pinned_global = false;
+static SDL_Window   *g_video_ext_win = NULL;
+static SDL_Renderer *g_video_ext_ren = NULL;
+static SDL_Texture  *g_video_ext_tex = NULL;
+static int           g_video_ext_tex_w = 0;
+static int           g_video_ext_tex_h = 0;
+#endif
+
 // Anchor indices for standard Shift+Click range selection on tracks and clips
 
 // ================= STABILIZED BOX-BASED DYNAMIC SPLIT POPUP STATE =================
@@ -1976,10 +2003,9 @@ static void init_default_saved_themes(void) {
         return;
     }
     g_theme_defaults_initialized = true;
-    static const struct { const char *name; uint8_t r, g, b, a; } defs[] = {
+    static const struct { const char *name; uint8_t r, g, b, a; } defs[NUM_INBUILT_THEMES] = {
         { "Default Orange", 205, 138,  72, 255 },
-        { "Emerald Green",   77, 191,  59, 130 },
-        { "Forest Green",    77, 191,  59, 255 },
+        { "Emerald Green",   77, 191,  59, 255 },
         { "Studio Blue",     68, 150, 235, 255 },
         { "Royal Purple",   162,  98, 232, 255 },
         { "Crimson Red",    224,  78,  78, 255 },
@@ -2045,7 +2071,14 @@ static void draw_text_clipped(SDL_Renderer *ren, const char *text, int x, int y,
 }
 
 static void delete_saved_theme_at_index(int del_idx) {
-    if (del_idx < 0 || del_idx >= g_theme.num_saved) return;
+    if (del_idx < NUM_INBUILT_THEMES || del_idx >= g_theme.num_saved) {
+        if (del_idx >= 0 && del_idx < NUM_INBUILT_THEMES) {
+            snprintf(g_theme.status_msg, sizeof(g_theme.status_msg),
+                     "Inbuilt theme '%s' cannot be deleted (only manually added themes)",
+                     g_theme.saved[del_idx].name);
+        }
+        return;
+    }
     char deleted_name[64] = {0};
     strncpy(deleted_name, g_theme.saved[del_idx].name, sizeof(deleted_name) - 1);
     for (int k = del_idx; k < g_theme.num_saved - 1; k++) {
@@ -2212,7 +2245,9 @@ static void render_themes_popup_window(SDL_Renderer *ren) {
     draw_brown_border_rect(ren, &btn_save_th, true, false);
     draw_text(ren, "Save Theme", p_x + 4, b_y + 9, c_white);
 
-    bool can_del_theme = (g_theme.num_saved > 0 && g_theme.selected_saved_idx >= 0 && g_theme.selected_saved_idx < g_theme.num_saved);
+    bool can_del_theme = (g_theme.num_saved > NUM_INBUILT_THEMES &&
+                          g_theme.selected_saved_idx >= NUM_INBUILT_THEMES &&
+                          g_theme.selected_saved_idx < g_theme.num_saved);
     SDL_Rect btn_del_th = { p_x + 88, b_y, 72, 30 };
     SDL_SetRenderDrawColor(ren, can_del_theme ? 92 : 34, can_del_theme ? 32 : 30, can_del_theme ? 30 : 28, 255);
     SDL_RenderFillRect(ren, &btn_del_th);
@@ -2266,12 +2301,14 @@ static void render_themes_popup_window(SDL_Renderer *ren) {
         SDL_Rect row_clip = { row_r.x + 26, ry + 2, row_r.w - 52, 20 };
         draw_text_clipped(ren, item_lbl, row_r.x + 26, ry + 6, is_active ? c_white : c_muted, &row_clip, &list_clip);
 
-        // Per-row [x] delete button on the right edge of the saved theme row
-        SDL_Rect del_r = { row_r.x + row_r.w - 22, ry + 3, 18, 19 };
-        SDL_SetRenderDrawColor(ren, 68, 28, 28, 255);
-        SDL_RenderFillRect(ren, &del_r);
-        draw_brown_border_rect(ren, &del_r, false, true);
-        draw_text_clipped(ren, "x", del_r.x + 5, del_r.y + 3, c_white, &del_r, &list_clip);
+        // Per-row [x] delete button ONLY for extra manually added themes (i >= NUM_INBUILT_THEMES)
+        if (i >= NUM_INBUILT_THEMES) {
+            SDL_Rect del_r = { row_r.x + row_r.w - 22, ry + 3, 18, 19 };
+            SDL_SetRenderDrawColor(ren, 68, 28, 28, 255);
+            SDL_RenderFillRect(ren, &del_r);
+            draw_brown_border_rect(ren, &del_r, false, true);
+            draw_text_clipped(ren, "x", del_r.x + 5, del_r.y + 3, c_white, &del_r, &list_clip);
+        }
     }
     SDL_RenderSetClipRect(ren, NULL);
 
@@ -2752,42 +2789,19 @@ static void apply_studio_color_choice(ProjectTab *p, int color_idx) {
             record_project_change("Changed Selected Clip Color", true);
         }
     } else {
-        // Peaks Color (target_mode == 2): applies to selected clip(s), or selected track(s), or entire project tab
-        bool any_clip = false;
-        for (int i = 0; i < p->num_items; i++) {
-            if (p->items[i].is_selected) { any_clip = true; break; }
-        }
-        push_undo_state();
-        if (any_clip) {
-            for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].is_selected) {
-                    g_item_peak_color_idx[tab][i] = color_idx;
-                }
+        // Universal Peaks Color (target_mode == 2): applies universally across the entire software and saves forever like themes
+        g_universal_peak_color_idx = color_idx;
+        for (int t_idx = 0; t_idx < MAX_TABS; t_idx++) {
+            g_tab_peak_color_idx[t_idx] = color_idx;
+            for (int tr = 0; tr < MAX_TRACKS; tr++) {
+                g_track_peak_color_idx[t_idx][tr] = color_idx;
             }
-            record_project_change("Changed Selected Clip Peaks Color", true);
-        } else {
-            bool any_trk = false;
-            for (int t = 0; t < p->num_tracks; t++) {
-                if (p->track_selected[t]) { any_trk = true; break; }
-            }
-            if (any_trk) {
-                for (int t = 0; t < p->num_tracks; t++) {
-                    if (p->track_selected[t]) {
-                        g_track_peak_color_idx[tab][t] = color_idx;
-                        for (int i = 0; i < p->num_items; i++) {
-                            if (p->items[i].track_idx == t) g_item_peak_color_idx[tab][i] = color_idx;
-                        }
-                    }
-                }
-                record_project_change("Changed Selected Track Peaks Color", true);
-            } else {
-                g_tab_peak_color_idx[tab] = color_idx;
-                for (int i = 0; i < p->num_items; i++) {
-                    g_item_peak_color_idx[tab][i] = color_idx;
-                }
-                record_project_change("Changed Project Peaks Color", true);
+            for (int it = 0; it < MAX_ITEMS; it++) {
+                g_item_peak_color_idx[t_idx][it] = color_idx;
             }
         }
+        save_themes_settings_json();
+        record_project_change("Changed Universal Peaks Color (Saved Forever)", false);
     }
 }
 
@@ -2842,7 +2856,7 @@ static void render_color_picker_window(SDL_Renderer *ren, ProjectTab *p) {
 
     const char *hint_txt = (m == 0) ? "Click a color swatch to apply to selected track(s):"
                          : ((m == 1) ? "Click a color swatch to apply to selected clip(s):"
-                                     : "Click a color swatch to change waveform peaks color:");
+                                     : "Click a swatch for universal software peaks color (saved forever):");
     draw_text(ren, hint_txt, wx + 16, wy + 72, c_muted);
 
     // 4x3 Grid of 12 Studio Colors
@@ -2885,23 +2899,165 @@ static void render_color_picker_window(SDL_Renderer *ren, ProjectTab *p) {
     (void)c_accent;
 }
 
-// ================= SELECTED CLIP PROPERTY DETAILS WINDOW (CTRL+I) =================
+// ================= SELECTED CLIP PROPERTY DETAILS WINDOW (CTRL+I, EXPANDABLE + MEDIA STREAM SPECS) =================
 typedef struct {
     bool is_open;
     SDL_Rect win_rect;
     bool is_dragging;
     int drag_off_x;
     int drag_off_y;
+    bool is_expanded;
+    SDL_Rect saved_norm_rect;
+    int resize_edge;
+    int resize_start_mx;
+    int resize_start_my;
+    SDL_Rect resize_orig_rect;
+
+    // Cached probed FFmpeg media stream properties for the currently inspected clip
+    char probed_path[512];
+    bool has_audio_stream;
+    int  audio_sample_rate_hz;
+    int  audio_bitrate_kbps;
+    int  audio_channels;
+    bool has_video_stream;
+    int  video_width;
+    int  video_height;
+    double video_fps;
+    int  video_bitrate_kbps;
 } ClipPropertiesWindowState;
 
 static ClipPropertiesWindowState g_clip_props = {
     false,
-    { 360, 96, 560, 420 },
-    false, 0, 0
+    { 310, 86, 650, 448 },
+    false, 0, 0,
+    false,
+    { 310, 86, 650, 448 },
+    0, 0, 0,
+    { 310, 86, 650, 448 },
+    "",
+    false, 48000, 0, 2,
+    false, 0, 0, 0.0, 0
 };
+
+// Probes original media file with FFmpeg to retrieve exact Video (FPS, Resolution, Video bitrate kbps)
+// and Audio (Audio bitrate kbps, Sample rate Hz) metadata. Cached by file path for zero frame overhead.
+static void probe_clip_media_stream_specs(AudioItem *it, ProjectTab *p) {
+    if (!it) return;
+    if (it->file_path[0] != '\0' && strcmp(g_clip_props.probed_path, it->file_path) == 0) {
+        return;
+    }
+    strncpy(g_clip_props.probed_path, it->file_path, sizeof(g_clip_props.probed_path) - 1);
+    g_clip_props.probed_path[sizeof(g_clip_props.probed_path) - 1] = '\0';
+
+    g_clip_props.has_audio_stream     = true;
+    g_clip_props.audio_sample_rate_hz = SAMPLE_RATE;
+    g_clip_props.audio_bitrate_kbps   = (SAMPLE_RATE * 2 * 24) / 1000;
+    g_clip_props.audio_channels       = 2;
+    g_clip_props.has_video_stream     = it->has_video;
+    g_clip_props.video_width          = (p && p->video.width > 0) ? p->video.width : 0;
+    g_clip_props.video_height         = (p && p->video.height > 0) ? p->video.height : 0;
+    g_clip_props.video_fps            = 0.0;
+    g_clip_props.video_bitrate_kbps   = 0;
+
+    if (!it->file_path[0]) return;
+
+    AVFormatContext *fmt = NULL;
+    if (avformat_open_input(&fmt, it->file_path, NULL, NULL) < 0) return;
+    if (avformat_find_stream_info(fmt, NULL) >= 0) {
+        int a_idx = -1, v_idx = -1;
+        for (unsigned int s = 0; s < fmt->nb_streams; s++) {
+            AVStream *st = fmt->streams[s];
+            if (!st || !st->codecpar) continue;
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && a_idx < 0) {
+                a_idx = (int)s;
+            } else if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && v_idx < 0 &&
+                       !(st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+                v_idx = (int)s;
+            }
+        }
+        if (v_idx < 0) {
+            for (unsigned int s = 0; s < fmt->nb_streams; s++) {
+                if (fmt->streams[s]->codecpar && fmt->streams[s]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    v_idx = (int)s;
+                    break;
+                }
+            }
+        }
+
+        int64_t container_kbps = (fmt->bit_rate > 0) ? (fmt->bit_rate / 1000) : 0;
+
+        if (a_idx >= 0) {
+            AVCodecParameters *ac = fmt->streams[a_idx]->codecpar;
+            g_clip_props.has_audio_stream = true;
+            if (ac->sample_rate > 0) g_clip_props.audio_sample_rate_hz = ac->sample_rate;
+            if (ac->ch_layout.nb_channels > 0) g_clip_props.audio_channels = ac->ch_layout.nb_channels;
+            if (ac->bit_rate > 0) {
+                g_clip_props.audio_bitrate_kbps = (int)(ac->bit_rate / 1000);
+            } else if (ac->bits_per_coded_sample > 0 && ac->sample_rate > 0) {
+                int ch = (ac->ch_layout.nb_channels > 0) ? ac->ch_layout.nb_channels : 2;
+                g_clip_props.audio_bitrate_kbps = (ac->sample_rate * ch * ac->bits_per_coded_sample) / 1000;
+            } else if (v_idx < 0 && container_kbps > 0) {
+                g_clip_props.audio_bitrate_kbps = (int)container_kbps;
+            }
+        } else {
+            g_clip_props.has_audio_stream = false;
+        }
+
+        if (v_idx >= 0) {
+            AVStream *vst = fmt->streams[v_idx];
+            AVCodecParameters *vc = vst->codecpar;
+            g_clip_props.has_video_stream = true;
+            if (vc->width > 0)  g_clip_props.video_width  = vc->width;
+            if (vc->height > 0) g_clip_props.video_height = vc->height;
+
+            double fps = 0.0;
+            if (vst->avg_frame_rate.den > 0 && vst->avg_frame_rate.num > 0) {
+                fps = av_q2d(vst->avg_frame_rate);
+            }
+            if (fps <= 0.01 && vst->r_frame_rate.den > 0 && vst->r_frame_rate.num > 0) {
+                fps = av_q2d(vst->r_frame_rate);
+            }
+            g_clip_props.video_fps = (fps > 0.01) ? fps : 25.0;
+
+            if (vc->bit_rate > 0) {
+                g_clip_props.video_bitrate_kbps = (int)(vc->bit_rate / 1000);
+            } else if (container_kbps > 0) {
+                int a_kb = g_clip_props.has_audio_stream ? g_clip_props.audio_bitrate_kbps : 0;
+                int est_v = (int)container_kbps - a_kb;
+                g_clip_props.video_bitrate_kbps = (est_v > 0) ? est_v : (int)container_kbps;
+            }
+        } else {
+            g_clip_props.has_video_stream = false;
+        }
+    }
+    avformat_close_input(&fmt);
+}
+
+AudioItem* get_active_video_clip_at_playhead(ProjectTab *p);
+static double get_project_step_fps(ProjectTab *p) {
+    if (p) {
+        AudioItem *vc = get_active_video_clip_at_playhead(p);
+        if (vc) {
+            probe_clip_media_stream_specs(vc, p);
+            if (g_clip_props.video_fps > 1.0) return g_clip_props.video_fps;
+        }
+        for (int i = 0; i < p->num_items; i++) {
+            if (p->items[i].has_video) {
+                probe_clip_media_stream_specs(&p->items[i], p);
+                if (g_clip_props.video_fps > 1.0) return g_clip_props.video_fps;
+                break;
+            }
+        }
+    }
+    double exp_fps = atof(g_export.mp4_fps_str);
+    return (exp_fps >= 1.0 && exp_fps <= 240.0) ? exp_fps : 25.0;
+}
 
 static void open_clip_properties_window(ProjectTab *p, int win_w, int win_h) {
     (void)p;
+    g_clip_props.probed_path[0] = '\0';
+    if (g_clip_props.win_rect.w < 540) g_clip_props.win_rect.w = 650;
+    if (g_clip_props.win_rect.h < 400) g_clip_props.win_rect.h = 448;
     g_clip_props.win_rect.x = (win_w - g_clip_props.win_rect.w) / 2;
     g_clip_props.win_rect.y = (win_h - g_clip_props.win_rect.h) / 2;
     g_clip_props.is_open = true;
@@ -2910,6 +3066,8 @@ static void open_clip_properties_window(ProjectTab *p, int win_w, int win_h) {
 static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
     if (!g_clip_props.is_open || !p) return;
     SDL_Rect *wr = &g_clip_props.win_rect;
+    if (wr->w < 520) wr->w = 520;
+    if (wr->h < 400) wr->h = 400;
     int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
     SDL_Color c_white  = { 228, 228, 228, 255 };
     SDL_Color c_muted  = { 155, 150, 145, 255 };
@@ -2931,7 +3089,15 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
     SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
     SDL_RenderFillRect(ren, &hdr);
     draw_brown_border_rect(ren, &hdr, false, false);
-    draw_text(ren, "Clip properties", wx + 14, wy + 9, c_white);
+    draw_text(ren, "Clip properties (Drag Edges or Click [+] to Expand)", wx + 14, wy + 9, c_white);
+
+    // Expand / Restore button [+] / [-] next to [X]
+    SDL_Rect exp_btn = { wx + ww - 54, wy + 4, 22, 22 };
+    SDL_SetRenderDrawColor(ren, g_clip_props.is_expanded ? 68 : 44, g_clip_props.is_expanded ? 48 : 38, 32, 255);
+    SDL_RenderFillRect(ren, &exp_btn);
+    draw_brown_border_rect(ren, &exp_btn, g_clip_props.is_expanded, false);
+    draw_text(ren, g_clip_props.is_expanded ? "-" : "+", exp_btn.x + 7, exp_btn.y + 4, c_white);
+
     draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
 
     int sel_idx = -1;
@@ -2954,7 +3120,7 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
         sel_max_e = sel_min_s + p->items[sel_idx].duration;
     }
 
-    SDL_Rect body_box = { wx + 14, wy + 40, ww - 28, wh - 92 };
+    SDL_Rect body_box = { wx + 14, wy + 38, ww - 28, wh - 88 };
     SDL_SetRenderDrawColor(ren, 18, 17, 16, 255);
     SDL_RenderFillRect(ren, &body_box);
     draw_brown_border_rect(ren, &body_box, false, true);
@@ -2965,6 +3131,8 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
     } else {
         int tab = get_valid_tab_idx();
         AudioItem *it = &p->items[sel_idx];
+        probe_clip_media_stream_specs(it, p);
+
         int trk = it->track_idx;
         const char *tname = (trk >= 0 && trk < p->num_tracks) ? p->track_names[trk] : "Track";
         int col_i = g_item_color_idx[tab][sel_idx] % NUM_STUDIO_COLORS;
@@ -2977,11 +3145,11 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
         format_timecode(it->offset_in_file, off_tc, sizeof(off_tc));
         format_timecode(it->file_total_duration, tot_tc, sizeof(tot_tc));
 
-        char line_buf[256];
-        int ry = wy + 50;
+        char line_buf[512];
+        int ry = wy + 46;
         int lx = wx + 24;
         int vx = wx + 188;
-        SDL_Rect val_clip = { vx, wy + 42, ww - 208, wh - 96 };
+        SDL_Rect val_clip = { vx, wy + 40, ww - 206, wh - 92 };
 
         draw_text(ren, "Clip Name:", lx, ry, c_muted);
         if (sel_count > 1) {
@@ -2990,26 +3158,26 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
             snprintf(line_buf, sizeof(line_buf), "%s", it->label);
         }
         draw_text_clipped(ren, line_buf, vx, ry, c_accent, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
         draw_text(ren, "Source File:", lx, ry, c_muted);
         draw_text_clipped(ren, it->file_path[0] ? it->file_path : "(Internal Recording)", vx, ry, c_white, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
         draw_text(ren, "Track:", lx, ry, c_muted);
         snprintf(line_buf, sizeof(line_buf), "Track %d - %s", trk + 1, tname);
         draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
         draw_text(ren, "Timeline Start:", lx, ry, c_muted);
         snprintf(line_buf, sizeof(line_buf), "%s  (%.3f sec)", st_tc, it->start_time);
         draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
         draw_text(ren, "Timeline End:", lx, ry, c_muted);
         snprintf(line_buf, sizeof(line_buf), "%s  (%.3f sec)", end_tc, it->start_time + it->duration);
         draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
         draw_text(ren, "Clip Duration:", lx, ry, c_muted);
         if (sel_count > 1) {
@@ -3019,44 +3187,55 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
             snprintf(line_buf, sizeof(line_buf), "%s  (%.3f sec)", dur_tc, it->duration);
         }
         draw_text_clipped(ren, line_buf, vx, ry, c_accent, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
         draw_text(ren, "Source Offset:", lx, ry, c_muted);
         snprintf(line_buf, sizeof(line_buf), "%s  |  Total File Length: %s", off_tc, tot_tc);
         draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
-        draw_text(ren, "Audio Stream:", lx, ry, c_muted);
-        snprintf(line_buf, sizeof(line_buf), "%d Hz, 32-bit Float Stereo  |  Peak Bins: %d",
-                 SAMPLE_RATE, it->peak_count);
-        draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 26;
-
-        draw_text(ren, "Video Stream:", lx, ry, c_muted);
-        if (it->has_video) {
-            if (p->video.width > 0 && p->video.height > 0) {
-                snprintf(line_buf, sizeof(line_buf), "Yes (%dx%d Video Stream Linked)", p->video.width, p->video.height);
-            } else {
-                snprintf(line_buf, sizeof(line_buf), "Yes (Video Container Stream Present)");
-            }
+        // Requirement 1: Audio: audio bitrate kbps, sample rate Hz (if available)
+        draw_text(ren, "Audio :", lx, ry, c_muted);
+        if (g_clip_props.has_audio_stream || it->peak_count > 0) {
+            int a_kbps = (g_clip_props.audio_bitrate_kbps > 0) ? g_clip_props.audio_bitrate_kbps : 1536;
+            int a_sr   = (g_clip_props.audio_sample_rate_hz > 0) ? g_clip_props.audio_sample_rate_hz : SAMPLE_RATE;
+            snprintf(line_buf, sizeof(line_buf),
+                     "Audio Bitrate: %d kbps   |   Sample Rate: %d Hz   (%d ch)",
+                     a_kbps, a_sr, g_clip_props.audio_channels);
+            draw_text_clipped(ren, line_buf, vx, ry, c_accent, &val_clip, NULL);
         } else {
-            snprintf(line_buf, sizeof(line_buf), "No (Audio-Only Clip)");
+            draw_text_clipped(ren, "Not available (Video-only clip)", vx, ry, c_muted, &val_clip, NULL);
         }
-        draw_text_clipped(ren, line_buf, vx, ry, it->has_video ? c_accent : c_white, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
+
+        // Requirement 1: Video: frame rate, resolution, and video bitrate kbps (if available)
+        draw_text(ren, "Video :", lx, ry, c_muted);
+        if (it->has_video || g_clip_props.has_video_stream) {
+            int vw = (g_clip_props.video_width > 0) ? g_clip_props.video_width : ((p->video.width > 0) ? p->video.width : 1920);
+            int vh = (g_clip_props.video_height > 0) ? g_clip_props.video_height : ((p->video.height > 0) ? p->video.height : 1080);
+            double vfps = (g_clip_props.video_fps > 0.01) ? g_clip_props.video_fps : 25.0;
+            int vkbps = (g_clip_props.video_bitrate_kbps > 0) ? g_clip_props.video_bitrate_kbps : 2048;
+            snprintf(line_buf, sizeof(line_buf),
+                     "Frame Rate: %.2f fps  |  Resolution: %dx%d  |  Bitrate: %d kbps",
+                     vfps, vw, vh, vkbps);
+            draw_text_clipped(ren, line_buf, vx, ry, c_accent, &val_clip, NULL);
+        } else {
+            draw_text_clipped(ren, "Not available (Audio-only clip)", vx, ry, c_white, &val_clip, NULL);
+        }
+        ry += 25;
 
         draw_text(ren, "Gain & Mute:", lx, ry, c_muted);
         float trk_db = (trk >= 0 && trk < p->num_tracks) ? p->track_db[trk] : 0.0f;
         snprintf(line_buf, sizeof(line_buf), "Clip: %+.1f dB  |  Track: %+.1f dB  |  Muted: %s",
                  g_item_vol_db[tab][sel_idx], trk_db, g_item_muted[tab][sel_idx] ? "YES" : "NO");
         draw_text_clipped(ren, line_buf, vx, ry, g_item_muted[tab][sel_idx] ? c_accent : c_white, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
         draw_text(ren, "Fade In / Out:", lx, ry, c_muted);
         snprintf(line_buf, sizeof(line_buf), "Fade-In: %.3f sec   |   Fade-Out: %.3f sec",
                  get_item_fade_in(p, sel_idx), get_item_fade_out(p, sel_idx));
         draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 26;
+        ry += 25;
 
         draw_text(ren, "Color & Group:", lx, ry, c_muted);
         SDL_Rect c_sw = { vx, ry - 2, 18, 16 };
@@ -3071,6 +3250,11 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
         }
         draw_text_clipped(ren, line_buf, vx + 26, ry, c_white, &val_clip, NULL);
     }
+
+    // Bottom-right corner resize grip indicator
+    SDL_SetRenderDrawColor(ren, 175, 125, 75, 255);
+    SDL_RenderDrawLine(ren, wx + ww - 10, wy + wh - 3, wx + ww - 3, wy + wh - 10);
+    SDL_RenderDrawLine(ren, wx + ww - 14, wy + wh - 3, wx + ww - 3, wy + wh - 14);
 
     int by = wy + wh - 40;
     SDL_Rect b_mute = { wx + 14, by, 118, 28 };
@@ -3096,6 +3280,403 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
     SDL_RenderFillRect(ren, &b_close);
     draw_brown_border_rect(ren, &b_close, true, false);
     draw_text(ren, "Close", b_close.x + 24, by + 8, c_white);
+}
+
+// ================= MASTER MUTE (M) & MASTER SOLO (S) ALL TRACKS HELPERS (REQUIREMENT 13) =================
+static void toggle_master_mute_all_tracks(ProjectTab *p) {
+    if (!p || p->num_tracks <= 0) return;
+    bool all_muted = true;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (!p->tracks[t].mute) { all_muted = false; break; }
+    }
+    push_undo_state();
+    for (int t = 0; t < p->num_tracks; t++) {
+        p->tracks[t].mute = !all_muted;
+    }
+    record_project_change(!all_muted ? "Muted All Tracks (Master M)" : "Unmuted All Tracks (Master M)", true);
+}
+
+static void toggle_master_solo_all_tracks(ProjectTab *p) {
+    if (!p || p->num_tracks <= 0) return;
+    bool all_soloed = true;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (!p->tracks[t].solo) { all_soloed = false; break; }
+    }
+    push_undo_state();
+    for (int t = 0; t < p->num_tracks; t++) {
+        p->tracks[t].solo = !all_soloed;
+    }
+    record_project_change(!all_soloed ? "Soloed All Tracks (Master S)" : "Unsoloed All Tracks (Master S)", true);
+}
+
+// Draws crisp Play (triangle) or Pause (double bars) symbol only (Requirement 12)
+static inline void draw_play_pause_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool is_playing, SDL_Color col) {
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
+    if (is_playing) {
+        // Pause symbol: two crisp vertical bars
+        SDL_Rect b1 = { cx + 2, cy + 2, 4, 12 };
+        SDL_Rect b2 = { cx + 9, cy + 2, 4, 12 };
+        SDL_RenderFillRect(ren, &b1);
+        SDL_RenderFillRect(ren, &b2);
+    } else {
+        // Play symbol: filled right-pointing triangle
+        for (int dy = 0; dy <= 12; dy++) {
+            int half = (dy <= 6) ? dy : (12 - dy);
+            int w = half * 2;
+            if (w < 1) w = 1;
+            SDL_RenderDrawLine(ren, cx + 3, cy + 2 + dy, cx + 3 + w, cy + 2 + dy);
+        }
+    }
+}
+
+// ================= SETTINGS -> MOUSE POPUP WINDOW (REQUIREMENT 9) =================
+static void render_mouse_settings_window(SDL_Renderer *ren) {
+    if (!g_mouse_settings_open) return;
+    SDL_Rect *wr = &g_mouse_win_rect;
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_Rect hdr = { wx, wy, ww, 30 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Settings - Mouse", wx + 14, wy + 9, c_white);
+    draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
+
+    // Option 1: Click on timeline, Playhead move. [default] (no checkbox required)
+    int r1_y = wy + 46;
+    SDL_Rect row1 = { wx + 18, r1_y, ww - 36, 32 };
+    SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+    SDL_RenderFillRect(ren, &row1);
+    draw_brown_border_rect(ren, &row1, false, true);
+    draw_text(ren, "Click on timeline, Playhead move. [default]", wx + 28, r1_y + 9, c_accent);
+
+    // Option 2: [x] Click on empty space, Playhead move.
+    int r2_y = wy + 88;
+    SDL_Rect row2 = { wx + 18, r2_y, ww - 36, 32 };
+    SDL_SetRenderDrawColor(ren, g_mouse_click_empty_moves_playhead ? 48 : 30,
+                                g_mouse_click_empty_moves_playhead ? 36 : 28,
+                                g_mouse_click_empty_moves_playhead ? 26 : 26, 255);
+    SDL_RenderFillRect(ren, &row2);
+    draw_brown_border_rect(ren, &row2, g_mouse_click_empty_moves_playhead, !g_mouse_click_empty_moves_playhead);
+    SDL_Rect cb2 = { wx + 28, r2_y + 7, 18, 18 };
+    SDL_SetRenderDrawColor(ren, g_mouse_click_empty_moves_playhead ? hr + 24 : 15,
+                                g_mouse_click_empty_moves_playhead ? hg + 16 : 14,
+                                g_mouse_click_empty_moves_playhead ? hb + 10 : 13, 255);
+    SDL_RenderFillRect(ren, &cb2);
+    draw_brown_border_rect(ren, &cb2, g_mouse_click_empty_moves_playhead, false);
+    if (g_mouse_click_empty_moves_playhead) draw_text(ren, "x", cb2.x + 5, cb2.y + 2, c_white);
+    draw_text(ren, "Click on empty space, Playhead move.", wx + 56, r2_y + 9, c_white);
+
+    // Option 3: [x] Click universal, Playhead move.
+    int r3_y = wy + 130;
+    SDL_Rect row3 = { wx + 18, r3_y, ww - 36, 32 };
+    SDL_SetRenderDrawColor(ren, g_mouse_click_universal_moves_playhead ? 48 : 30,
+                                g_mouse_click_universal_moves_playhead ? 36 : 28,
+                                g_mouse_click_universal_moves_playhead ? 26 : 26, 255);
+    SDL_RenderFillRect(ren, &row3);
+    draw_brown_border_rect(ren, &row3, g_mouse_click_universal_moves_playhead, !g_mouse_click_universal_moves_playhead);
+    SDL_Rect cb3 = { wx + 28, r3_y + 7, 18, 18 };
+    SDL_SetRenderDrawColor(ren, g_mouse_click_universal_moves_playhead ? hr + 24 : 15,
+                                g_mouse_click_universal_moves_playhead ? hg + 16 : 14,
+                                g_mouse_click_universal_moves_playhead ? hb + 10 : 13, 255);
+    SDL_RenderFillRect(ren, &cb3);
+    draw_brown_border_rect(ren, &cb3, g_mouse_click_universal_moves_playhead, false);
+    if (g_mouse_click_universal_moves_playhead) draw_text(ren, "x", cb3.x + 5, cb3.y + 2, c_white);
+    draw_text(ren, "Click universal, Playhead move.", wx + 56, r3_y + 9, c_white);
+
+    // Close / OK button
+    int by = wy + wh - 40;
+    draw_text(ren, "Saved automatically", wx + 20, by + 8, c_muted);
+    SDL_Rect b_ok = { wx + ww - 102, by, 84, 28 };
+    SDL_SetRenderDrawColor(ren, hr + 22, hg + 14, hb + 8, 255);
+    SDL_RenderFillRect(ren, &b_ok);
+    draw_brown_border_rect(ren, &b_ok, true, false);
+    draw_text(ren, "OK", b_ok.x + 32, by + 8, c_white);
+}
+
+// ================= TINY TIME CLOCK MANUAL ENTRY POPUP (REQUIREMENT 14: hh:mm:ss OR hhmmss) =================
+static void open_time_jump_popup(ProjectTab *p, int win_w, int win_h) {
+    if (!p) return;
+    int sec_total = (int)(p->playhead_seconds + 0.5);
+    if (sec_total < 0) sec_total = 0;
+    int hh = sec_total / 3600;
+    int mm = (sec_total % 3600) / 60;
+    int ss = sec_total % 60;
+    snprintf(g_time_jump_buf, sizeof(g_time_jump_buf), "%02d:%02d:%02d", hh, mm, ss);
+    g_time_jump_rect.x = (win_w - g_time_jump_rect.w) / 2;
+    g_time_jump_rect.y = TABBAR_HEIGHT + TOPBAR_HEIGHT + 6;
+    if (g_time_jump_rect.y + g_time_jump_rect.h > win_h) {
+        g_time_jump_rect.y = (win_h - g_time_jump_rect.h) / 2;
+    }
+    g_time_jump_open = true;
+    SDL_StartTextInput();
+}
+
+// Parses both "hh:mm:ss" (or "mm:ss" or "hh:mm:ss.ms") AND direct "hhmmss" digits without colons!
+static bool parse_manual_time_entry_to_seconds(const char *str, double *out_sec) {
+    if (!str || !out_sec) return false;
+    while (*str == ' ' || *str == '	') str++;
+    if (!*str) return false;
+
+    if (strchr(str, ':') != NULL) {
+        double parts[3] = { 0.0, 0.0, 0.0 };
+        int n_parts = 0;
+        const char *cur = str;
+        while (*cur && n_parts < 3) {
+            parts[n_parts++] = atof(cur);
+            const char *col = strchr(cur, ':');
+            if (!col) break;
+            cur = col + 1;
+        }
+        double total = 0.0;
+        if (n_parts == 3) total = parts[0] * 3600.0 + parts[1] * 60.0 + parts[2];
+        else if (n_parts == 2) total = parts[0] * 60.0 + parts[1];
+        else total = parts[0];
+        if (total < 0.0) total = 0.0;
+        *out_sec = total;
+        return true;
+    }
+
+    // Direct digits format: hhmmss (e.g. "010203" -> 1h 2m 3s, "0230" -> 2m 30s, "45" -> 45s) or decimal seconds
+    char digits[16] = {0};
+    int nd = 0;
+    bool has_dot = false;
+    double frac = 0.0;
+    const char *dot = strchr(str, '.');
+    if (dot) {
+        has_dot = true;
+        frac = atof(dot);
+    }
+    for (const char *p = str; *p && *p != '.'; p++) {
+        if (isdigit((unsigned char)*p) && nd < 12) {
+            digits[nd++] = *p;
+        }
+    }
+    digits[nd] = '\0';
+    if (nd == 0 && !has_dot) return false;
+
+    long val = atol(digits);
+    int hh = (int)(val / 10000L);
+    int mm = (int)((val / 100L) % 100L);
+    int ss = (int)(val % 100L);
+    double total = (double)hh * 3600.0 + (double)mm * 60.0 + (double)ss + frac;
+    if (total < 0.0) total = 0.0;
+    *out_sec = total;
+    return true;
+}
+
+static void commit_time_jump_popup(ProjectTab *p, int view_w) {
+    if (!p) return;
+    double target_sec = 0.0;
+    if (parse_manual_time_entry_to_seconds(g_time_jump_buf, &target_sec)) {
+        daw_set_playhead_seconds(p, target_sec);
+        ensure_playhead_visible_in_viewport(p, view_w);
+        record_project_change("Playhead Jumped to Manual Time", false);
+    }
+    g_time_jump_open = false;
+    SDL_StopTextInput();
+}
+
+static void render_time_jump_popup_window(SDL_Renderer *ren) {
+    if (!g_time_jump_open) return;
+    SDL_Rect *wr = &g_time_jump_rect;
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 5, wy + 5, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_Rect hdr = { wx, wy, ww, 26 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Jump to Time (hh:mm:ss / hhmmss)", wx + 8, wy + 7, c_white);
+    draw_text(ren, "X", wx + ww - 18, wy + 7, c_white);
+
+    draw_text(ren, "Time:", wx + 14, wy + 44, c_muted);
+    SDL_Rect tbox = { wx + 62, wy + 38, ww - 76, 26 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &tbox);
+    draw_brown_border_rect(ren, &tbox, true, false);
+    draw_text(ren, g_time_jump_buf, tbox.x + 8, tbox.y + 7, c_accent);
+    if (((SDL_GetTicks() / 450) % 2) == 0) {
+        int cx = tbox.x + 8 + (int)strlen(g_time_jump_buf) * 8;
+        if (cx < tbox.x + tbox.w - 4) {
+            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+            SDL_RenderDrawLine(ren, cx, tbox.y + 5, cx, tbox.y + 21);
+        }
+    }
+
+    int by = wy + wh - 36;
+    SDL_Rect b_ok = { wx + ww - 166, by, 72, 26 };
+    SDL_SetRenderDrawColor(ren, hr + 22, hg + 14, hb + 8, 255);
+    SDL_RenderFillRect(ren, &b_ok);
+    draw_brown_border_rect(ren, &b_ok, true, false);
+    draw_text(ren, "OK", b_ok.x + 28, by + 7, c_white);
+
+    SDL_Rect b_can = { wx + ww - 86, by, 72, 26 };
+    SDL_SetRenderDrawColor(ren, 44, 40, 38, 255);
+    SDL_RenderFillRect(ren, &b_can);
+    draw_brown_border_rect(ren, &b_can, false, false);
+    draw_text(ren, "Cancel", b_can.x + 12, by + 7, c_white);
+}
+
+// ================= VIDEO POPUP GLOBAL PIN OUTSIDE APP (REQUIREMENT 7) =================
+static void destroy_external_pinned_video_window(void) {
+    if (g_video_ext_tex) {
+        SDL_DestroyTexture(g_video_ext_tex);
+        g_video_ext_tex = NULL;
+    }
+    if (g_video_ext_ren) {
+        SDL_DestroyRenderer(g_video_ext_ren);
+        g_video_ext_ren = NULL;
+    }
+    if (g_video_ext_win) {
+        SDL_DestroyWindow(g_video_ext_win);
+        g_video_ext_win = NULL;
+    }
+    g_video_ext_tex_w = 0;
+    g_video_ext_tex_h = 0;
+}
+
+static void toggle_video_global_pin_state(ProjectTab *p, SDL_Window *main_win) {
+    (void)main_win;
+    g_video_pinned_global = !g_video_pinned_global;
+    if (g_video_pinned_global && p && p->video.is_open) {
+        int w = (p->video.rect.w >= 240) ? p->video.rect.w : 480;
+        int h = (p->video.rect.h >= 160) ? p->video.rect.h : 294;
+        if (!g_video_ext_win) {
+            g_video_ext_win = SDL_CreateWindow(
+                "Video Monitor (Pinned Outside App)",
+                SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                w, h,
+                SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALWAYS_ON_TOP
+            );
+            if (g_video_ext_win) {
+                SDL_SetWindowAlwaysOnTop(g_video_ext_win, SDL_TRUE);
+#ifdef _WIN32
+                SDL_SysWMinfo wmInfo;
+                SDL_VERSION(&wmInfo.version);
+                if (SDL_GetWindowWMInfo(g_video_ext_win, &wmInfo)) {
+                    HWND hwnd = wmInfo.info.win.window;
+                    BOOL darkMode = TRUE;
+                    DwmSetWindowAttribute(hwnd, 20, &darkMode, sizeof(darkMode));
+                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                }
+#endif
+                g_video_ext_ren = SDL_CreateRenderer(g_video_ext_win, -1, SDL_RENDERER_ACCELERATED);
+            }
+        }
+        record_project_change("Video Monitor Pinned Globally (Visible Outside App)", false);
+    } else {
+        destroy_external_pinned_video_window();
+        record_project_change("Video Monitor Unpinned (Inside App Only)", false);
+    }
+}
+
+static void sync_and_render_external_pinned_video_window(ProjectTab *p) {
+    if (!p || !p->video.is_open || !g_video_pinned_global) {
+        if (g_video_ext_win) destroy_external_pinned_video_window();
+        return;
+    }
+    if (!g_video_ext_win) {
+        g_video_pinned_global = false;
+        toggle_video_global_pin_state(p, NULL);
+    }
+    if (!g_video_ext_win || !g_video_ext_ren) return;
+
+    int ew = 480, eh = 294;
+    SDL_GetWindowSize(g_video_ext_win, &ew, &eh);
+    SDL_Color c_white  = { 224, 224, 224, 255 };
+    SDL_Color c_muted  = { 140, 140, 140, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawColor(g_video_ext_ren, 12, 12, 12, 255);
+    SDL_RenderClear(g_video_ext_ren);
+
+    // Top control bar inside global pinned window
+    SDL_Rect v_bar = { 0, 0, ew, 24 };
+    SDL_SetRenderDrawColor(g_video_ext_ren, 36, 36, 36, 255);
+    SDL_RenderFillRect(g_video_ext_ren, &v_bar);
+    draw_brown_border_rect(g_video_ext_ren, &v_bar, false, false);
+    draw_text(g_video_ext_ren, "Video Monitor [PINNED GLOBALLY]", 8, 7, c_accent);
+
+    // Pin button (active)
+    int pin_btn_x = ew - 70;
+    SDL_Rect pin_btn = { pin_btn_x, 3, 18, 18 };
+    SDL_SetRenderDrawColor(g_video_ext_ren, 78, 54, 30, 255);
+    SDL_RenderFillRect(g_video_ext_ren, &pin_btn);
+    draw_brown_border_rect(g_video_ext_ren, &pin_btn, true, false);
+    draw_pin_symbol_icon(g_video_ext_ren, pin_btn_x + 4, 5, true, c_accent);
+
+    // Close [X] button
+    draw_text(g_video_ext_ren, "X", ew - 18, 7, c_white);
+
+    SDL_Rect v_canvas = { 0, 24, ew, eh - 24 };
+    SDL_SetRenderDrawColor(g_video_ext_ren, 0, 0, 0, 255);
+    SDL_RenderFillRect(g_video_ext_ren, &v_canvas);
+
+    if (p->video.has_active_frame && p->video.frame_rgb && p->video.frame_rgb->data[0] &&
+        p->video.width > 0 && p->video.height > 0) {
+        if (!g_video_ext_tex || g_video_ext_tex_w != p->video.width || g_video_ext_tex_h != p->video.height) {
+            if (g_video_ext_tex) SDL_DestroyTexture(g_video_ext_tex);
+            g_video_ext_tex = SDL_CreateTexture(
+                g_video_ext_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING,
+                p->video.width, p->video.height
+            );
+            g_video_ext_tex_w = p->video.width;
+            g_video_ext_tex_h = p->video.height;
+        }
+        if (g_video_ext_tex) {
+            SDL_UpdateTexture(g_video_ext_tex, NULL, p->video.frame_rgb->data[0], p->video.frame_rgb->linesize[0]);
+            double v_asp = (double)p->video.width / (double)p->video.height;
+            double c_asp = (v_canvas.h > 0) ? ((double)v_canvas.w / (double)v_canvas.h) : v_asp;
+            SDL_Rect dst_rect = v_canvas;
+            if (c_asp > v_asp) {
+                dst_rect.h = v_canvas.h;
+                dst_rect.w = (int)((double)v_canvas.h * v_asp);
+                dst_rect.x = v_canvas.x + (v_canvas.w - dst_rect.w) / 2;
+                dst_rect.y = v_canvas.y;
+            } else {
+                dst_rect.w = v_canvas.w;
+                dst_rect.h = (int)((double)v_canvas.w / v_asp);
+                dst_rect.x = v_canvas.x;
+                dst_rect.y = v_canvas.y + (v_canvas.h - dst_rect.h) / 2;
+            }
+            SDL_RenderCopy(g_video_ext_ren, g_video_ext_tex, NULL, &dst_rect);
+        }
+    } else {
+        draw_text(g_video_ext_ren, "No Video Stream Loaded",
+                  v_canvas.x + (v_canvas.w - 176) / 2,
+                  v_canvas.y + v_canvas.h / 2 - 4, c_muted);
+    }
+    SDL_RenderPresent(g_video_ext_ren);
 }
 
 // Renders the Lua & Python Custom Script Popup Window (when a user script creates a GUI or input dialog)
@@ -6426,6 +7007,20 @@ static inline bool point_in_rect(int x, int y, const SDL_Rect *r) {
 
 // Returns true if any modal popup is open OR if the mouse cursor (mx, my) is over any open popup window or dropdown menu.
 // Used to keep mouse cursor and focus strictly on the active popup/menu and never on the background panel.
+static bool is_any_popup_or_dropdown_open(void) {
+    if (g_daw.save_prompt_open || g_track_delete_prompt_open || g_processing_popup_open ||
+        g_multi_import.is_open || g_export.is_open || g_action_win.is_open ||
+        g_theme.is_open || g_hide_popup_open || g_history_popup_open ||
+        g_daw.script_manager_open || g_dyn_split.is_open || g_reposition.is_open ||
+        g_color_picker.is_open || g_clip_props.is_open || g_script_popup.is_open ||
+        g_mouse_settings_open || g_time_jump_open ||
+        g_daw.menu_file_open || g_daw.menu_action_open || g_menu_tools_open ||
+        g_menu_edit_open || g_menu_settings_open || g_marker_context_menu_open) {
+        return true;
+    }
+    return false;
+}
+
 static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, SDL_Cursor **out_cursor) {
     if (out_cursor) *out_cursor = g_cursor_arrow;
 
@@ -6433,11 +7028,27 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
     if (g_track_delete_prompt_open) return true;
     if (g_processing_popup_open) return true;
     if (g_multi_import.is_open) return true;
-    if (g_dyn_split.is_open && point_in_rect(mx, my, &g_dyn_split.win_rect)) return true;
-    if (g_reposition.is_open && point_in_rect(mx, my, &g_reposition.win_rect)) return true;
-    if (g_color_picker.is_open && point_in_rect(mx, my, &g_color_picker.win_rect)) return true;
-    if (g_clip_props.is_open && point_in_rect(mx, my, &g_clip_props.win_rect)) return true;
-    if (g_script_popup.is_open && point_in_rect(mx, my, &g_script_popup.win_rect)) return true;
+    if (g_time_jump_open) {
+        if (out_cursor && point_in_rect(mx, my, &g_time_jump_rect)) {
+            int wx = g_time_jump_rect.x, wy = g_time_jump_rect.y, ww = g_time_jump_rect.w;
+            if (mx >= wx + 62 && mx <= wx + ww - 14 && my >= wy + 38 && my <= wy + 64) {
+                *out_cursor = g_cursor_ibeam;
+            }
+        }
+        return true;
+    }
+    if (g_mouse_settings_open) return true;
+    if (g_dyn_split.is_open) return true;
+    if (g_reposition.is_open) return true;
+    if (g_color_picker.is_open) return true;
+    if (g_clip_props.is_open) {
+        VideoResizeEdge cp_edge = hit_test_video_resize_edge(&g_clip_props.win_rect, mx, my);
+        if (cp_edge != VID_RESIZE_NONE && out_cursor) {
+            *out_cursor = (cp_edge == VID_RESIZE_BOTTOM) ? g_cursor_size_ns : g_cursor_size_we;
+        }
+        return true;
+    }
+    if (g_script_popup.is_open) return true;
 
     if (g_export.is_open) {
         if (out_cursor) {
@@ -6512,26 +7123,12 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
         }
     }
 
-    int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-    if (g_daw.menu_file_open) {
-        SDL_Rect f_box = { 8, m_start, 196, 126 };
-        if (point_in_rect(mx, my, &f_box)) return true;
+    if (g_theme.is_open || g_hide_popup_open || g_history_popup_open || g_daw.script_manager_open) {
+        return true;
     }
-    if (g_daw.menu_action_open) {
-        SDL_Rect a_box = { 60, m_start, 178, 108 };
-        if (point_in_rect(mx, my, &a_box)) return true;
-    }
-    if (g_menu_tools_open) {
-        SDL_Rect t_box = { 126, m_start, 156, 135 };
-        if (point_in_rect(mx, my, &t_box)) return true;
-    }
-    if (g_menu_edit_open) {
-        SDL_Rect e_box = { 190, m_start, 186, 108 };
-        if (point_in_rect(mx, my, &e_box)) return true;
-    }
-    if (g_marker_context_menu_open) {
-        SDL_Rect cm_box = { g_marker_context_x, g_marker_context_y, 128, 28 };
-        if (point_in_rect(mx, my, &cm_box)) return true;
+    if (g_daw.menu_file_open || g_daw.menu_action_open || g_menu_tools_open ||
+        g_menu_edit_open || g_menu_settings_open || g_marker_context_menu_open) {
+        return true;
     }
 
     return false;
@@ -6736,7 +7333,7 @@ int main(int argc, char *argv[]) {
                     if (g_history_scroll_y > max_sc) g_history_scroll_y = max_sc;
                     continue;
                 }
-                if (is_cursor_captured_by_popup_or_menu(p, mx, my, NULL)) continue;
+                if (is_any_popup_or_dropdown_open() || is_cursor_captured_by_popup_or_menu(p, mx, my, NULL)) continue;
                 SDL_Keymod mod = SDL_GetModState();
                 if (mod & KMOD_CTRL) {
                     // Ctrl+Mousewheel: View: Zoom vertically (mousewheel)
@@ -6776,7 +7373,18 @@ int main(int argc, char *argv[]) {
                     }
                 }
             } else if (e.type == SDL_TEXTINPUT) {
-                if (g_daw.save_prompt_open) continue;
+                if (g_daw.save_prompt_open || g_track_delete_prompt_open || g_processing_popup_open) continue;
+                if (g_time_jump_open) {
+                    for (const char *c = e.text.text; *c; c++) {
+                        if ((isdigit((unsigned char)*c) || *c == ':' || *c == '.') &&
+                            strlen(g_time_jump_buf) + 1 < sizeof(g_time_jump_buf)) {
+                            size_t l = strlen(g_time_jump_buf);
+                            g_time_jump_buf[l] = *c;
+                            g_time_jump_buf[l + 1] = '\0';
+                        }
+                    }
+                    continue;
+                }
                 if (g_script_popup.is_open && g_script_popup.focused_ctrl_idx >= 0 &&
                     g_script_popup.focused_ctrl_idx < g_script_popup.num_controls) {
                     ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.focused_ctrl_idx];
@@ -6839,6 +7447,7 @@ int main(int argc, char *argv[]) {
                     }
                     continue;
                 }
+                if (is_any_popup_or_dropdown_open()) continue;
                 if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME) {
                     if (strlen(g_daw.editing_name_buf) + strlen(e.text.text) < 63) {
                         strcat(g_daw.editing_name_buf, e.text.text);
@@ -6883,6 +7492,24 @@ int main(int argc, char *argv[]) {
                 }
                 SDL_free(file);
             } else if (e.type == SDL_KEYDOWN) {
+                if (g_time_jump_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        g_time_jump_open = false;
+                        SDL_StopTextInput();
+                    } else if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        commit_time_jump_popup(p, view_w);
+                    } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
+                        size_t l = strlen(g_time_jump_buf);
+                        if (l > 0) g_time_jump_buf[l - 1] = '\0';
+                    }
+                    continue;
+                }
+                if (g_mouse_settings_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        g_mouse_settings_open = false;
+                    }
+                    continue;
+                }
                 if (g_track_delete_prompt_open) {
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
                         g_track_delete_prompt_open = false;
@@ -7102,20 +7729,54 @@ int main(int argc, char *argv[]) {
                     }
                     continue;
                 }
-                if (e.key.keysym.sym == SDLK_ESCAPE && (g_color_picker.is_open || g_clip_props.is_open)) {
-                    g_color_picker.is_open = false;
-                    g_clip_props.is_open = false;
+                // Requirement 3: When any popup window or dropdown menu is open, focus all keyboard keys on that popup/menu only
+                if (g_color_picker.is_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN) g_color_picker.is_open = false;
+                    continue;
+                }
+                if (g_clip_props.is_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN) g_clip_props.is_open = false;
+                    continue;
+                }
+                if (g_hide_popup_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN) g_hide_popup_open = false;
+                    continue;
+                }
+                if (g_history_popup_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN) g_history_popup_open = false;
+                    continue;
+                }
+                if (g_theme.is_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) g_theme.is_open = false;
+                    else if (e.key.keysym.sym == SDLK_DELETE || e.key.keysym.sym == SDLK_BACKSPACE) {
+                        delete_saved_theme_at_index(g_theme.selected_saved_idx);
+                    }
+                    continue;
+                }
+                if (g_daw.script_manager_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) g_daw.script_manager_open = false;
+                    continue;
+                }
+                if (g_daw.menu_file_open || g_daw.menu_action_open || g_menu_tools_open ||
+                    g_menu_edit_open || g_menu_settings_open || g_marker_context_menu_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        g_daw.menu_file_open = false;
+                        g_daw.menu_action_open = false;
+                        g_menu_tools_open = false;
+                        g_menu_edit_open = false;
+                        g_menu_settings_open = false;
+                        g_marker_context_menu_open = false;
+                    }
+                    continue;
+                }
+                if (g_action_win.is_open) {
+                    handle_action_window_keydown(p, ren, win, e.key.keysym.sym, mod);
                     continue;
                 }
                 if ((mod & KMOD_CTRL) && !(mod & KMOD_ALT) && !(mod & KMOD_SHIFT) &&
                     (e.key.keysym.sym == SDLK_i || e.key.keysym.sym == SDLK_EQUALS)) {
                     open_clip_properties_window(p, win_w, win_h);
                     continue;
-                }
-                if (g_action_win.is_open) {
-                    if (handle_action_window_keydown(p, ren, win, e.key.keysym.sym, mod)) {
-                        continue;
-                    }
                 }
 
                 // Dispatch all built-in and customized keyboard shortcuts through the unified Action & Shortcut Engine
@@ -7127,6 +7788,91 @@ int main(int argc, char *argv[]) {
                 SDL_Keymod mod = SDL_GetModState();
                 bool shift_pressed = (mod & KMOD_SHIFT);
                 bool ctrl_pressed = (mod & KMOD_CTRL);
+
+                // Handle clicks inside the globally pinned external Video Monitor window
+                if (g_video_ext_win && e.button.windowID == SDL_GetWindowID(g_video_ext_win)) {
+                    int ew = 480, eh = 294;
+                    SDL_GetWindowSize(g_video_ext_win, &ew, &eh);
+                    if (my <= 24) {
+                        if (mx >= ew - 24) {
+                            g_video_pinned_global = false;
+                            destroy_external_pinned_video_window();
+                            p->video.is_open = false;
+                        } else if (mx >= ew - 72 && mx <= ew - 48) {
+                            toggle_video_global_pin_state(p, win);
+                        }
+                    }
+                    continue;
+                }
+
+                // Tiny Time Clock Manual Entry Popup (Requirement 14)
+                if (g_time_jump_open) {
+                    SDL_Rect *wr = &g_time_jump_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 26) {
+                        if (mx >= wx + ww - 24) {
+                            g_time_jump_open = false;
+                            SDL_StopTextInput();
+                        } else {
+                            g_time_jump_dragging = true;
+                            g_time_jump_drag_off_x = mx - wx;
+                            g_time_jump_drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+                    if (mx >= wx && mx <= wx + ww && my >= wy + 26 && my <= wy + wh) {
+                        int by = wy + wh - 36;
+                        if (my >= by && my <= by + 26) {
+                            if (mx >= wx + ww - 166 && mx <= wx + ww - 94) {
+                                commit_time_jump_popup(p, view_w);
+                            } else if (mx >= wx + ww - 86 && mx <= wx + ww - 14) {
+                                g_time_jump_open = false;
+                                SDL_StopTextInput();
+                            }
+                        } else {
+                            SDL_StartTextInput();
+                        }
+                        continue;
+                    }
+                    continue;
+                }
+
+                // Settings -> Mouse Popup Window (Requirement 9)
+                if (g_mouse_settings_open) {
+                    SDL_Rect *wr = &g_mouse_win_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 30) {
+                        if (mx >= wx + ww - 28) {
+                            g_mouse_settings_open = false;
+                        } else {
+                            g_mouse_win_dragging = true;
+                            g_mouse_drag_off_x = mx - wx;
+                            g_mouse_drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+                    if (mx >= wx && mx <= wx + ww && my >= wy + 30 && my <= wy + wh) {
+                        if (my >= wy + 88 && my <= wy + 120 && mx >= wx + 18 && mx <= wx + ww - 18) {
+                            g_mouse_click_empty_moves_playhead = !g_mouse_click_empty_moves_playhead;
+                            save_themes_settings_json();
+                            record_project_change(g_mouse_click_empty_moves_playhead
+                                ? "Mouse: Click on empty space moves playhead [ON]"
+                                : "Mouse: Click on empty space moves playhead [OFF]", false);
+                        } else if (my >= wy + 130 && my <= wy + 162 && mx >= wx + 18 && mx <= wx + ww - 18) {
+                            g_mouse_click_universal_moves_playhead = !g_mouse_click_universal_moves_playhead;
+                            save_themes_settings_json();
+                            record_project_change(g_mouse_click_universal_moves_playhead
+                                ? "Mouse: Click universal moves playhead [ON]"
+                                : "Mouse: Click universal moves playhead [OFF]", false);
+                        }
+                        int by = wy + wh - 40;
+                        if (my >= by && my <= by + 28 && mx >= wx + ww - 102 && mx <= wx + ww - 18) {
+                            g_mouse_settings_open = false;
+                        }
+                        continue;
+                    }
+                    continue;
+                }
 
                 if (g_track_delete_prompt_open) {
                     int dia_w = 390, dia_h = 140;
@@ -7285,13 +8031,53 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // ================= SELECTED CLIP PROPERTY DETAILS WINDOW (CTRL+I) INTERACTIONS =================
+                // ================= SELECTED CLIP PROPERTY DETAILS WINDOW (CTRL+I, EXPANDABLE) INTERACTIONS =================
                 if (g_clip_props.is_open) {
                     SDL_Rect *wr = &g_clip_props.win_rect;
                     int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    VideoResizeEdge cp_edge = hit_test_video_resize_edge(wr, mx, my);
+                    if (cp_edge != VID_RESIZE_NONE) {
+                        g_clip_props.resize_edge = (int)cp_edge;
+                        g_clip_props.resize_start_mx = mx;
+                        g_clip_props.resize_start_my = my;
+                        g_clip_props.resize_orig_rect = *wr;
+                        continue;
+                    }
                     if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 30) {
                         if (mx >= wx + ww - 28) {
                             g_clip_props.is_open = false;
+                        } else if (mx >= wx + ww - 56 && mx < wx + ww - 28) {
+                            // [+] / [-] Expand / Restore window width & height
+                            if (!g_clip_props.is_expanded) {
+                                g_clip_props.saved_norm_rect = *wr;
+                                g_clip_props.is_expanded = true;
+                                int nw = (win_w - 60 > 960) ? 960 : (win_w - 40);
+                                int nh = (win_h - 60 > 520) ? 520 : (win_h - 40);
+                                if (nw < 650) nw = 650;
+                                if (nh < 448) nh = 448;
+                                wr->w = nw;
+                                wr->h = nh;
+                                wr->x = (win_w - nw) / 2;
+                                wr->y = (win_h - nh) / 2;
+                            } else {
+                                g_clip_props.is_expanded = false;
+                                if (g_clip_props.saved_norm_rect.w >= 520) {
+                                    *wr = g_clip_props.saved_norm_rect;
+                                } else {
+                                    *wr = (SDL_Rect){ (win_w - 650) / 2, (win_h - 448) / 2, 650, 448 };
+                                }
+                            }
+                        } else if (e.button.clicks >= 2) {
+                            g_clip_props.is_expanded = !g_clip_props.is_expanded;
+                            if (g_clip_props.is_expanded) {
+                                g_clip_props.saved_norm_rect = *wr;
+                                wr->w = (win_w - 60 > 960) ? 960 : (win_w - 40);
+                                wr->h = (win_h - 60 > 520) ? 520 : (win_h - 40);
+                                wr->x = (win_w - wr->w) / 2;
+                                wr->y = (win_h - wr->h) / 2;
+                            } else if (g_clip_props.saved_norm_rect.w >= 520) {
+                                *wr = g_clip_props.saved_norm_rect;
+                            }
                         } else {
                             g_clip_props.is_dragging = true;
                             g_clip_props.drag_off_x = mx - wx;
@@ -7326,6 +8112,7 @@ int main(int argc, char *argv[]) {
                         }
                         continue;
                     }
+                    continue;
                 }
 
                 // ================= REPOSITION ITEMS POPUP INTERACTIONS =================
@@ -7798,8 +8585,8 @@ int main(int argc, char *argv[]) {
                             int clicked_row = (my - (list_y + 4) + g_theme.saved_scroll_y) / 28;
                             if (clicked_row >= 0 && clicked_row < g_theme.num_saved) {
                                 int row_right = rx + 4 + (rw - 22);
-                                if (mx >= row_right - 24 && mx <= row_right) {
-                                    // Clicked per-row [x] delete button
+                                if (clicked_row >= NUM_INBUILT_THEMES && mx >= row_right - 24 && mx <= row_right) {
+                                    // Clicked per-row [x] delete button (only on manually added themes)
                                     delete_saved_theme_at_index(clicked_row);
                                 } else {
                                     SavedThemeEntry *st = &g_theme.saved[clicked_row];
@@ -7877,9 +8664,8 @@ int main(int argc, char *argv[]) {
 
                 // ================= REAPER-STYLE ACTIONS & KEYBOARD SHORTCUTS WINDOW INTERACTIONS =================
                 if (g_action_win.is_open) {
-                    if (handle_action_window_mouse_down(p, ren, win, mx, my, e.button.clicks)) {
-                        continue;
-                    }
+                    handle_action_window_mouse_down(p, ren, win, mx, my, e.button.clicks);
+                    continue;
                 }
 
                 // ================= PROJECT HISTORY POPUP WINDOW INTERACTIONS (100 ITEMS) =================
@@ -7990,8 +8776,17 @@ int main(int argc, char *argv[]) {
                         my >= p->video.rect.y && my <= p->video.rect.y + p->video.rect.h) {
                         if (mx >= p->video.rect.x + p->video.rect.w - 24 && my <= p->video.rect.y + 24) {
                             g_video_fullscreen[v_tab] = false;
+                            if (g_video_pinned_global) {
+                                g_video_pinned_global = false;
+                                destroy_external_pinned_video_window();
+                            }
                             p->video.is_open = false;
-                        } else if (mx >= p->video.rect.x + p->video.rect.w - 50 &&
+                        } else if (mx >= p->video.rect.x + p->video.rect.w - 72 &&
+                                   mx <  p->video.rect.x + p->video.rect.w - 48 &&
+                                   my <= p->video.rect.y + 24) {
+                            // Requirement 7: Pin Symbol button on Video Monitor (Pin Active = Globally visible outside app)
+                            toggle_video_global_pin_state(p, win);
+                        } else if (mx >= p->video.rect.x + p->video.rect.w - 48 &&
                                    mx <  p->video.rect.x + p->video.rect.w - 24 &&
                                    my <= p->video.rect.y + 24) {
                             // Full Screen / Minimize (Restore) button near X
@@ -8268,26 +9063,17 @@ int main(int argc, char *argv[]) {
 
                 if (g_daw.menu_action_open) {
                     int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-                    if (mx >= 60 && mx <= 238 && my >= m_start && my <= m_start + 108) {
+                    if (mx >= 60 && mx <= 238 && my >= m_start && my <= m_start + 81) {
                         if (my >= m_start && my < m_start + 27) {
-                            // Submenu 1: Keyboard Shortcut -> Opens REAPER-style Actions & Keyboard Shortcuts popup window
-                            scan_scripts_directory_to_actions(&g_daw);
-                            save_keyboard_shortcuts_json();
-                            g_action_win.is_open = true;
-                            g_action_win.win_rect.x = (win_w - g_action_win.win_rect.w) / 2;
-                            g_action_win.win_rect.y = (win_h - g_action_win.win_rect.h) / 2;
-                            g_daw.menu_action_open = false;
-                            continue;
-                        } else if (my >= m_start + 27 && my < m_start + 54) {
-                            // Submenu 2: Scripts -> Opens unified Lua & Python Script Manager popup window
+                            // Action Submenu 1: Scripts -> Opens unified Lua & Python Script Manager popup window
                             scan_scripts_directory_to_actions(&g_daw);
                             save_keyboard_shortcuts_json();
                             refresh_filtered_scripts();
                             g_daw.script_manager_open = true;
                             g_daw.menu_action_open = false;
                             continue;
-                        } else if (my >= m_start + 54 && my < m_start + 81) {
-                            // Submenu 3: Dynamic split -> Opens simple box-based Dynamic split popup window
+                        } else if (my >= m_start + 27 && my < m_start + 54) {
+                            // Action Submenu 2: Dynamic split -> Opens simple box-based Dynamic split popup window
                             g_dyn_split.is_open = true;
                             g_dyn_split.win_rect.x = (win_w - g_dyn_split.win_rect.w) / 2;
                             g_dyn_split.win_rect.y = (win_h - g_dyn_split.win_rect.h) / 2;
@@ -8295,8 +9081,8 @@ int main(int argc, char *argv[]) {
                             g_dyn_split.dragging_slider_id = 0;
                             g_daw.menu_action_open = false;
                             continue;
-                        } else if (my >= m_start + 81 && my <= m_start + 108) {
-                            // Submenu 4: Reposition -> Opens Reposition Items popup window
+                        } else if (my >= m_start + 54 && my <= m_start + 81) {
+                            // Action Submenu 3: Reposition -> Opens Reposition Items popup window
                             g_reposition.is_open = true;
                             g_reposition.win_rect.x = (win_w - g_reposition.win_rect.w) / 2;
                             g_reposition.win_rect.y = (win_h - g_reposition.win_rect.h) / 2;
@@ -8305,15 +9091,14 @@ int main(int argc, char *argv[]) {
                             g_daw.menu_action_open = false;
                             continue;
                         }
-                    } else if (my > TABBAR_HEIGHT + TOPBAR_HEIGHT || mx < 60 || mx > 260) {
-                        g_daw.menu_action_open = false;
-                        continue;
                     }
+                    g_daw.menu_action_open = false;
+                    continue;
                 }
 
                 if (g_menu_tools_open) {
                     int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-                    if (mx >= 126 && mx <= 282 && my >= m_start && my <= m_start + 135) {
+                    if (mx >= 126 && mx <= 282 && my >= m_start && my <= m_start + 81) {
                         if (my >= m_start && my < m_start + 27) {
                             // Tools Submenu 1: Marker
                             push_undo_state();
@@ -8329,34 +9114,17 @@ int main(int argc, char *argv[]) {
                             g_menu_tools_open = false;
                             g_submenu_tools_record_open = false;
                             continue;
-                        } else if (my >= m_start + 54 && my < m_start + 81) {
-                            // Tools Submenu 3: Themes
-                            init_default_saved_themes();
-                            sync_theme_code_string();
-                            g_theme.is_open = true;
-                            g_theme.win_rect.x = (win_w - g_theme.win_rect.w) / 2;
-                            g_theme.win_rect.y = (win_h - g_theme.win_rect.h) / 2;
-                            g_menu_tools_open = false;
-                            g_submenu_tools_record_open = false;
-                            continue;
-                        } else if (my >= m_start + 81 && my < m_start + 108) {
-                            // Tools Submenu 4: Record (Browse option removed; directly starts/stops recording)
-                            g_menu_tools_open = false;
-                            g_submenu_tools_record_open = false;
-                            start_or_stop_recording(p, ren, win);
-                            continue;
-                        } else if (my >= m_start + 108 && my <= m_start + 135) {
-                            // Tools Submenu 5: Clip properties
+                        } else if (my >= m_start + 54 && my <= m_start + 81) {
+                            // Tools Submenu 3: Clip properties
                             g_menu_tools_open = false;
                             g_submenu_tools_record_open = false;
                             open_clip_properties_window(p, win_w, win_h);
                             continue;
                         }
-                    } else if (my > TABBAR_HEIGHT + TOPBAR_HEIGHT || mx < 126 || mx > 286) {
-                        g_menu_tools_open = false;
-                        g_submenu_tools_record_open = false;
-                        continue;
                     }
+                    g_menu_tools_open = false;
+                    g_submenu_tools_record_open = false;
+                    continue;
                 }
 
                 if (g_menu_edit_open) {
@@ -8377,7 +9145,7 @@ int main(int argc, char *argv[]) {
                             open_color_picker_dialog(1);
                             continue;
                         } else if (my >= m_start + 54 && my < m_start + 81) {
-                            // Edit Submenu 3: Peaks Color
+                            // Edit Submenu 3: Peaks Color (Universal Software Peaks Color)
                             g_menu_edit_open = false;
                             g_color_picker.win_rect.x = (win_w - g_color_picker.win_rect.w) / 2;
                             g_color_picker.win_rect.y = (win_h - g_color_picker.win_rect.h) / 2;
@@ -8389,49 +9157,134 @@ int main(int argc, char *argv[]) {
                             execute_join_glue_selected_items(p, ren, win);
                             continue;
                         }
-                    } else if (my > TABBAR_HEIGHT + TOPBAR_HEIGHT || mx < 190 || mx > 380) {
-                        g_menu_edit_open = false;
-                        continue;
                     }
+                    g_menu_edit_open = false;
+                    continue;
+                }
+
+                if (g_menu_settings_open) {
+                    int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+                    if (mx >= 250 && mx <= 426 && my >= m_start && my <= m_start + 81) {
+                        if (my >= m_start && my < m_start + 27) {
+                            // Settings Submenu 1: Keyboard Shortcut
+                            scan_scripts_directory_to_actions(&g_daw);
+                            save_keyboard_shortcuts_json();
+                            g_action_win.is_open = true;
+                            g_action_win.win_rect.x = (win_w - g_action_win.win_rect.w) / 2;
+                            g_action_win.win_rect.y = (win_h - g_action_win.win_rect.h) / 2;
+                            g_menu_settings_open = false;
+                            continue;
+                        } else if (my >= m_start + 27 && my < m_start + 54) {
+                            // Settings Submenu 2: Themes
+                            init_default_saved_themes();
+                            sync_theme_code_string();
+                            g_theme.is_open = true;
+                            g_theme.win_rect.x = (win_w - g_theme.win_rect.w) / 2;
+                            g_theme.win_rect.y = (win_h - g_theme.win_rect.h) / 2;
+                            g_menu_settings_open = false;
+                            continue;
+                        } else if (my >= m_start + 54 && my <= m_start + 81) {
+                            // Settings Submenu 3: Mouse
+                            g_mouse_settings_open = true;
+                            g_mouse_win_rect.x = (win_w - g_mouse_win_rect.w) / 2;
+                            g_mouse_win_rect.y = (win_h - g_mouse_win_rect.h) / 2;
+                            g_menu_settings_open = false;
+                            continue;
+                        }
+                    }
+                    g_menu_settings_open = false;
+                    continue;
+                }
+
+                // Requirement 3: If any popup window is open, keep mouse clicks strictly focused on that popup window
+                if (is_any_popup_or_dropdown_open()) {
+                    continue;
                 }
 
                 if (my >= TABBAR_HEIGHT && my <= TABBAR_HEIGHT + TOPBAR_HEIGHT) {
-                    // Left-side top menu: File | Action | Tools | Edit | Video
+                    int left_menu_end = 400;
+                    int right_menu_start = win_w - 380;
+                    int clock_x = left_menu_end + ((right_menu_start - left_menu_end) / 2) - 80;
+                    if (clock_x < left_menu_end + 42) clock_x = left_menu_end + 42;
+                    int play_btn_x  = clock_x - 46;
+                    int clock_box_x = clock_x - 10;
+                    int rec_btn_x   = clock_box_x + 128 + 6;
+                    int rec_onoff_x = rec_btn_x + 72;
+
+                    // Left-side top menu: File | Action | Tools | Edit | Settings | Video
                     if (mx >= 8 && mx <= 54) {
                         g_daw.menu_file_open = !g_daw.menu_file_open;
                         g_daw.menu_action_open = false;
                         g_menu_tools_open = false;
-                        g_submenu_tools_record_open = false;
                         g_menu_edit_open = false;
+                        g_menu_settings_open = false;
                     }
                     else if (mx >= 60 && mx <= 120) {
                         g_daw.menu_action_open = !g_daw.menu_action_open;
                         g_daw.menu_file_open = false;
                         g_menu_tools_open = false;
-                        g_submenu_tools_record_open = false;
                         g_menu_edit_open = false;
+                        g_menu_settings_open = false;
                     }
                     else if (mx >= 126 && mx <= 184) {
                         g_menu_tools_open = !g_menu_tools_open;
-                        if (!g_menu_tools_open) g_submenu_tools_record_open = false;
                         g_daw.menu_file_open = false;
                         g_daw.menu_action_open = false;
                         g_menu_edit_open = false;
+                        g_menu_settings_open = false;
                     }
                     else if (mx >= 190 && mx <= 244) {
                         g_menu_edit_open = !g_menu_edit_open;
                         g_daw.menu_file_open = false;
                         g_daw.menu_action_open = false;
                         g_menu_tools_open = false;
-                        g_submenu_tools_record_open = false;
+                        g_menu_settings_open = false;
                     }
-                    else if (mx >= 250 && mx <= 310) {
-                        p->video.is_open = !p->video.is_open;
+                    else if (mx >= 250 && mx <= 326) {
+                        g_menu_settings_open = !g_menu_settings_open;
                         g_daw.menu_file_open = false;
                         g_daw.menu_action_open = false;
                         g_menu_tools_open = false;
-                        g_submenu_tools_record_open = false;
                         g_menu_edit_open = false;
+                    }
+                    else if (mx >= 332 && mx <= 392) {
+                        p->video.is_open = !p->video.is_open;
+                        if (!p->video.is_open && g_video_pinned_global) {
+                            g_video_pinned_global = false;
+                            destroy_external_pinned_video_window();
+                        }
+                        g_daw.menu_file_open = false;
+                        g_daw.menu_action_open = false;
+                        g_menu_tools_open = false;
+                        g_menu_edit_open = false;
+                        g_menu_settings_open = false;
+                    }
+                    // Requirement 12: Play/Pause symbol button near left side of Time Clock
+                    else if (mx >= play_btn_x && mx <= play_btn_x + 32) {
+                        if (g_rec.is_recording) start_or_stop_recording(p, ren, win);
+                        else p->is_playing = !p->is_playing;
+                    }
+                    // Requirement 14: Double-click on Time Clock opens tiny manual timings entry popup
+                    else if (mx >= clock_box_x && mx <= clock_box_x + 128) {
+                        if (e.button.clicks >= 2) {
+                            open_time_jump_popup(p, win_w, win_h);
+                        }
+                    }
+                    // Requirement 4: Record button near next to Time Clock (only records when ON/OFF switch is ON)
+                    else if (mx >= rec_btn_x && mx <= rec_btn_x + 68) {
+                        if (g_rec_master_enabled) {
+                            start_or_stop_recording(p, ren, win);
+                        } else {
+                            record_project_change("Record is OFF (Turn ON switch next to Record)", false);
+                        }
+                    }
+                    // Requirement 4: ON/OFF button next to Record menu (default OFF)
+                    else if (mx >= rec_onoff_x && mx <= rec_onoff_x + 42) {
+                        g_rec_master_enabled = !g_rec_master_enabled;
+                        if (!g_rec_master_enabled && g_rec.is_recording) {
+                            start_or_stop_recording(p, ren, win);
+                        }
+                        record_project_change(g_rec_master_enabled ? "Record Switch: ON" : "Record Switch: OFF", false);
                     }
                     // Right-side top menu: [Undo Symbol] | [Redo Symbol] | Range | Crossfade | Hide | Save
                     else if (mx >= win_w - 372 && mx <= win_w - 332) { perform_undo(); record_project_change("Undo Action", true); }
@@ -8456,17 +9309,19 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // Requirement 13: Corner Header (+ Track, Master M, Master S)
                 int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
                 if (mx < g_daw.tcp_width && my > corner_y && my <= corner_y + RULER_HEIGHT + m_lane_h) {
-                    if (mx >= 8 && mx <= 88 && p->num_tracks < MAX_TRACKS) {
+                    if (mx >= 8 && mx <= 84 && p->num_tracks < MAX_TRACKS) {
                         push_undo_state();
                         p->track_heights[p->num_tracks] = 84;
                         snprintf(p->track_names[p->num_tracks], 64, "Track %d", p->num_tracks + 1);
                         p->num_tracks++;
                         record_project_change("Added New Track", true);
-                    } else if (mx >= 94 && mx <= 174) {
-                        if (g_rec.is_recording) start_or_stop_recording(p, ren, win);
-                        else p->is_playing = !p->is_playing;
+                    } else if (mx >= 90 && mx <= 116) {
+                        toggle_master_mute_all_tracks(p);
+                    } else if (mx >= 122 && mx <= 148) {
+                        toggle_master_solo_all_tracks(p);
                     }
                     continue;
                 }
@@ -8622,7 +9477,9 @@ int main(int argc, char *argv[]) {
                                     }
                                 }
                             } else {
-                                if (!p->track_selected[t]) {
+                                // Requirement 5: Clicking any single track header without Shift releases multiple selection and selects clicked track only
+                                bool on_grip = (mx >= g_daw.tcp_width - 28 && mx <= g_daw.tcp_width - 6);
+                                if (!on_grip || !p->track_selected[t]) {
                                     for (int tr = 0; tr < p->num_tracks; tr++) p->track_selected[tr] = false;
                                     p->track_selected[t] = true;
                                 }
@@ -8668,6 +9525,9 @@ int main(int argc, char *argv[]) {
                     int hit_idx = hit_test_clip_interaction(p, mx, my, &hit_tl, &hit_tr, &hit_fi, &hit_fo);
 
                     if (hit_idx >= 0) {
+                        if (g_mouse_click_universal_moves_playhead && e.button.button == SDL_BUTTON_LEFT) {
+                            daw_set_playhead_seconds(p, fmax(0.0, click_time));
+                        }
                         AudioItem *it = &p->items[hit_idx];
                         push_undo_state();
                         if (ctrl_pressed) {
@@ -8725,6 +9585,10 @@ int main(int argc, char *argv[]) {
                         dragging_fade_in    = hit_fi;
                         dragging_fade_out   = hit_fo;
                     } else {
+                        if ((g_mouse_click_empty_moves_playhead || g_mouse_click_universal_moves_playhead) &&
+                            e.button.button == SDL_BUTTON_LEFT) {
+                            daw_set_playhead_seconds(p, fmax(0.0, click_time));
+                        }
                         if (!ctrl_pressed && !shift_pressed) {
                             for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
                         }
@@ -8770,6 +9634,9 @@ int main(int argc, char *argv[]) {
                 g_reposition.is_dragging = false;
                 g_color_picker.is_dragging = false;
                 g_clip_props.is_dragging = false;
+                g_clip_props.resize_edge = 0;
+                g_mouse_win_dragging = false;
+                g_time_jump_dragging = false;
                 g_script_popup.is_dragging = false;
                 g_script_popup.dragging_slider_idx = -1;
                 if (dragging_item_idx != -1) {
@@ -8826,6 +9693,45 @@ int main(int argc, char *argv[]) {
                     g_color_picker.win_rect.x = mx - g_color_picker.drag_off_x;
                     g_color_picker.win_rect.y = my - g_color_picker.drag_off_y;
                     SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_time_jump_open && g_time_jump_dragging) {
+                    g_time_jump_rect.x = mx - g_time_jump_drag_off_x;
+                    g_time_jump_rect.y = my - g_time_jump_drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_mouse_settings_open && g_mouse_win_dragging) {
+                    g_mouse_win_rect.x = mx - g_mouse_drag_off_x;
+                    g_mouse_win_rect.y = my - g_mouse_drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_clip_props.is_open && g_clip_props.resize_edge != 0) {
+                    int dx = mx - g_clip_props.resize_start_mx;
+                    int dy = my - g_clip_props.resize_start_my;
+                    SDL_Rect nr = g_clip_props.resize_orig_rect;
+                    if (g_clip_props.resize_edge == VID_RESIZE_RIGHT || g_clip_props.resize_edge == VID_RESIZE_BOTTOM_RIGHT) {
+                        nr.w = g_clip_props.resize_orig_rect.w + dx;
+                        if (nr.w < 520) nr.w = 520;
+                        if (nr.w > win_w - 20) nr.w = win_w - 20;
+                    }
+                    if (g_clip_props.resize_edge == VID_RESIZE_LEFT || g_clip_props.resize_edge == VID_RESIZE_BOTTOM_LEFT) {
+                        int nw = g_clip_props.resize_orig_rect.w - dx;
+                        if (nw < 520) nw = 520;
+                        if (nw > win_w - 20) nw = win_w - 20;
+                        nr.x = (g_clip_props.resize_orig_rect.x + g_clip_props.resize_orig_rect.w) - nw;
+                        nr.w = nw;
+                    }
+                    if (g_clip_props.resize_edge == VID_RESIZE_BOTTOM ||
+                        g_clip_props.resize_edge == VID_RESIZE_BOTTOM_LEFT ||
+                        g_clip_props.resize_edge == VID_RESIZE_BOTTOM_RIGHT) {
+                        nr.h = g_clip_props.resize_orig_rect.h + dy;
+                        if (nr.h < 400) nr.h = 400;
+                        if (nr.h > win_h - 20) nr.h = win_h - 20;
+                    }
+                    g_clip_props.win_rect = nr;
+                    SDL_SetCursor((g_clip_props.resize_edge == VID_RESIZE_BOTTOM) ? g_cursor_size_ns : g_cursor_size_we);
                     continue;
                 }
                 if (g_clip_props.is_open && g_clip_props.is_dragging) {
@@ -9519,7 +10425,7 @@ int main(int argc, char *argv[]) {
         SDL_RenderFillRect(ren, &topbar);
         draw_brown_border_rect(ren, &topbar, false, true);
 
-        // Left-side top menu: File | Action | Tools | Video
+        // Left-side top menu: File | Action | Tools | Edit | Settings | Video
         SDL_Rect btn_file = { 8, TABBAR_HEIGHT + 5, 46, 26 };
         SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
         SDL_RenderFillRect(ren, &btn_file);
@@ -9532,51 +10438,85 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &btn_act, g_daw.menu_action_open, false);
         draw_text(ren, "Action", 66, TABBAR_HEIGHT + 13, c_white);
 
-        bool tools_active = g_menu_tools_open || g_history_popup_open || g_theme.is_open || p->show_marker_lane;
+        bool tools_active = g_menu_tools_open || g_history_popup_open || g_clip_props.is_open || p->show_marker_lane;
         SDL_Rect btn_tools = { 126, TABBAR_HEIGHT + 5, 58, 26 };
         SDL_SetRenderDrawColor(ren, tools_active ? 62 : 40, tools_active ? 46 : 40, tools_active ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &btn_tools);
         draw_brown_border_rect(ren, &btn_tools, g_menu_tools_open, false);
         draw_text(ren, "Tools", 135, TABBAR_HEIGHT + 13, c_white);
 
-        bool edit_active = g_menu_edit_open || g_color_picker.is_open || g_clip_props.is_open;
+        bool edit_active = g_menu_edit_open || g_color_picker.is_open;
         SDL_Rect btn_edit = { 190, TABBAR_HEIGHT + 5, 54, 26 };
         SDL_SetRenderDrawColor(ren, edit_active ? 62 : 40, edit_active ? 46 : 40, edit_active ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &btn_edit);
         draw_brown_border_rect(ren, &btn_edit, g_menu_edit_open, false);
         draw_text(ren, "Edit", 201, TABBAR_HEIGHT + 13, c_white);
 
-        SDL_Rect v_menu = { 250, TABBAR_HEIGHT + 5, 60, 26 };
+        bool settings_active = g_menu_settings_open || g_action_win.is_open || g_theme.is_open || g_mouse_settings_open;
+        SDL_Rect btn_settings = { 250, TABBAR_HEIGHT + 5, 76, 26 };
+        SDL_SetRenderDrawColor(ren, settings_active ? 62 : 40, settings_active ? 46 : 40, settings_active ? 32 : 40, 255);
+        SDL_RenderFillRect(ren, &btn_settings);
+        draw_brown_border_rect(ren, &btn_settings, g_menu_settings_open, false);
+        draw_text(ren, "Settings", 256, TABBAR_HEIGHT + 13, c_white);
+
+        SDL_Rect v_menu = { 332, TABBAR_HEIGHT + 5, 60, 26 };
         SDL_SetRenderDrawColor(ren, p->video.is_open ? 62 : 40, p->video.is_open ? 46 : 40, p->video.is_open ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &v_menu);
         draw_brown_border_rect(ren, &v_menu, p->video.is_open, false);
-        draw_text(ren, "Video", 260, TABBAR_HEIGHT + 13, c_white);
+        draw_text(ren, "Video", 342, TABBAR_HEIGHT + 13, c_white);
 
-        // Center Timecode Display + Red Round Recording Indicator Dot Near Time Clock
+        // Center Transport & Time Clock Group:
+        // [Play/Pause Symbol] [ Time Clock (Double-click to Jump) ] [ Record ] [ ON/OFF ]
         char clock_buf[32];
         format_timecode(p->playhead_seconds, clock_buf, sizeof(clock_buf));
-        int left_menu_end = 322;
-        int right_menu_start = win_w - 526;
-        int clock_x = left_menu_end + ((right_menu_start - left_menu_end) / 2) - 54;
-        if (clock_x < left_menu_end) clock_x = left_menu_end;
-        SDL_Rect clock_bg = { clock_x - 10, TABBAR_HEIGHT + 4, 128, 28 };
+        int left_menu_end = 400;
+        int right_menu_start = win_w - 380;
+        int clock_x = left_menu_end + ((right_menu_start - left_menu_end) / 2) - 80;
+        if (clock_x < left_menu_end + 42) clock_x = left_menu_end + 42;
+        int play_btn_x  = clock_x - 46;
+        int clock_box_x = clock_x - 10;
+        int rec_btn_x   = clock_box_x + 128 + 6;
+        int rec_onoff_x = rec_btn_x + 72;
+
+        // Requirement 12: Play/Pause symbol-only button near left side of Time Clock
+        SDL_Rect btn_play_sym = { play_btn_x, TABBAR_HEIGHT + 5, 32, 26 };
+        SDL_SetRenderDrawColor(ren, p->is_playing ? 68 : 42, p->is_playing ? 50 : 40, p->is_playing ? 34 : 38, 255);
+        SDL_RenderFillRect(ren, &btn_play_sym);
+        draw_brown_border_rect(ren, &btn_play_sym, p->is_playing, false);
+        draw_play_pause_symbol_icon(ren, play_btn_x + 8, TABBAR_HEIGHT + 10, p->is_playing, c_white);
+
+        // Center Time Clock (Requirement 14: Double-click opens manual timings entry popup)
+        SDL_Rect clock_bg = { clock_box_x, TABBAR_HEIGHT + 4, 128, 28 };
         SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
         SDL_RenderFillRect(ren, &clock_bg);
-        draw_brown_border_rect(ren, &clock_bg, g_rec.is_recording, false);
+        draw_brown_border_rect(ren, &clock_bg, g_rec.is_recording || g_time_jump_open, false);
         draw_text(ren, clock_buf, clock_x - 4, TABBAR_HEIGHT + 12, c_white);
 
-        if (g_rec.is_recording) {
-            // Bright red round dot right near the time clock (pulses subtly while recording)
-            int dot_cx = clock_bg.x + clock_bg.w + 14;
-            int dot_cy = TABBAR_HEIGHT + 18;
-            draw_filled_circle_sdl(ren, dot_cx, dot_cy, 8, 95, 18, 18, 255);
-            draw_filled_circle_sdl(ren, dot_cx, dot_cy, 6, 242, 32, 32, 255);
-            if (((SDL_GetTicks() / 350) % 2) == 0) {
-                draw_filled_circle_sdl(ren, dot_cx - 2, dot_cy - 2, 2, 255, 145, 145, 255);
-            }
-        }
+        // Requirement 4: Record button near next to Time Clock + ON/OFF toggle button (default OFF)
+        SDL_Rect btn_rec_top = { rec_btn_x, TABBAR_HEIGHT + 5, 68, 26 };
+        SDL_SetRenderDrawColor(ren,
+            g_rec.is_recording ? 120 : (g_rec_master_enabled ? 58 : 34),
+            g_rec.is_recording ? 26  : (g_rec_master_enabled ? 36 : 32),
+            g_rec.is_recording ? 26  : 30, 255);
+        SDL_RenderFillRect(ren, &btn_rec_top);
+        draw_brown_border_rect(ren, &btn_rec_top, g_rec.is_recording || g_rec_master_enabled, !g_rec_master_enabled);
+        draw_filled_circle_sdl(ren, rec_btn_x + 10, TABBAR_HEIGHT + 18, 4,
+            g_rec.is_recording ? 255 : (g_rec_master_enabled ? 230 : 120),
+            g_rec.is_recording ? 45  : (g_rec_master_enabled ? 45  : 60),
+            g_rec.is_recording ? 45  : 60, 255);
+        draw_text(ren, "Record", rec_btn_x + 18, TABBAR_HEIGHT + 13, g_rec_master_enabled ? c_white : c_muted);
 
-        // Right-side top menu: [Undo Symbol] | [Redo Symbol] | Range | Crossfade | Hide | Save (Zoom- / Zoom+ removed)
+        SDL_Rect btn_rec_onoff = { rec_onoff_x, TABBAR_HEIGHT + 5, 42, 26 };
+        SDL_SetRenderDrawColor(ren,
+            g_rec_master_enabled ? 36  : 48,
+            g_rec_master_enabled ? 118 : 34,
+            g_rec_master_enabled ? 48  : 32, 255);
+        SDL_RenderFillRect(ren, &btn_rec_onoff);
+        draw_brown_border_rect(ren, &btn_rec_onoff, g_rec_master_enabled, false);
+        draw_text(ren, g_rec_master_enabled ? "ON" : "OFF",
+                  rec_onoff_x + (g_rec_master_enabled ? 13 : 9), TABBAR_HEIGHT + 13, c_white);
+
+        // Right-side top menu: [Undo Symbol] | [Redo Symbol] | Range | Crossfade | Hide | Save
         SDL_Rect btn_undo = { win_w - 372, TABBAR_HEIGHT + 5, 40, 26 };
         SDL_SetRenderDrawColor(ren, 42, 42, 42, 255);
         SDL_RenderFillRect(ren, &btn_undo);
@@ -9616,26 +10556,39 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &save_btn, p->is_dirty, false);
         draw_text(ren, "Save", win_w - 50, TABBAR_HEIGHT + 13, c_white);
 
-        // 3. Corner Header (+ Track and Play/Stop; Recording & Browse moved to Tools -> Record submenu)
+        // 3. Corner Header (+ Track and Master M / S buttons next to + Track, Requirement 13)
         int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
         SDL_Rect corner_area = { 0, corner_y, g_daw.tcp_width, RULER_HEIGHT + m_lane_h };
         SDL_SetRenderDrawColor(ren, 32, 32, 32, 255);
         SDL_RenderFillRect(ren, &corner_area);
         draw_brown_border_rect(ren, &corner_area, false, true);
 
-        SDL_Rect btn_corner_add = { 8, corner_y + 8, 76, 24 };
+        SDL_Rect btn_corner_add = { 8, corner_y + 2, 76, 24 };
         SDL_SetRenderDrawColor(ren, 48, 48, 48, 255);
         SDL_RenderFillRect(ren, &btn_corner_add);
         draw_brown_border_rect(ren, &btn_corner_add, false, false);
-        draw_text(ren, "+ Track", 18, corner_y + 15, c_white);
+        draw_text(ren, "+ Track", 18, corner_y + 9, c_white);
 
-        SDL_Rect btn_corner_play = { 94, corner_y + 8, 76, 24 };
-        SDL_SetRenderDrawColor(ren, p->is_playing ? 68 : 48, p->is_playing ? 50 : 48, p->is_playing ? 34 : 48, 255);
-        SDL_RenderFillRect(ren, &btn_corner_play);
-        draw_brown_border_rect(ren, &btn_corner_play, p->is_playing, false);
-        draw_text(ren, p->is_playing ? "Stop" : "Play", 116, corner_y + 15, c_white);
+        bool all_trks_muted = (p->num_tracks > 0);
+        bool all_trks_soloed = (p->num_tracks > 0);
+        for (int t = 0; t < p->num_tracks; t++) {
+            if (!p->tracks[t].mute) all_trks_muted = false;
+            if (!p->tracks[t].solo) all_trks_soloed = false;
+        }
 
-        // 4. Time Ruler & Logic Pro Yellow Cycle Range Strip
+        SDL_Rect btn_master_m = { 90, corner_y + 2, 26, 24 };
+        SDL_SetRenderDrawColor(ren, all_trks_muted ? 185 : 44, all_trks_muted ? 42 : 44, 44, 255);
+        SDL_RenderFillRect(ren, &btn_master_m);
+        draw_brown_border_rect(ren, &btn_master_m, all_trks_muted, false);
+        draw_text(ren, "M", 99, corner_y + 9, c_white);
+
+        SDL_Rect btn_master_s = { 122, corner_y + 2, 26, 24 };
+        SDL_SetRenderDrawColor(ren, all_trks_soloed ? 185 : 44, all_trks_soloed ? 142 : 44, 44, 255);
+        SDL_RenderFillRect(ren, &btn_master_s);
+        draw_brown_border_rect(ren, &btn_master_s, all_trks_soloed, false);
+        draw_text(ren, "S", 131, corner_y + 9, c_white);
+
+        // 4. Time Ruler & Logic Pro Yellow Cycle Range Strip (Requirement 10: Bright & Center-Aligned Over Vertical Tick Mark)
         SDL_Rect ruler = { g_daw.tcp_width, corner_y, view_w, RULER_HEIGHT };
         SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
         SDL_RenderFillRect(ren, &ruler);
@@ -9653,6 +10606,7 @@ int main(int argc, char *argv[]) {
         double start_tick = floor(p->scroll_x_sec / chosen_step) * chosen_step;
         double end_tick = p->scroll_x_sec + (double)view_w / p->pixels_per_second + chosen_step;
 
+        SDL_RenderSetClipRect(ren, &ruler);
         for (double t = start_tick; t <= end_tick; t += chosen_step) {
             int rx = g_daw.tcp_width + (int)((t - p->scroll_x_sec) * p->pixels_per_second);
             if (rx < g_daw.tcp_width || rx > g_daw.tcp_width + view_w) continue;
@@ -9667,10 +10621,18 @@ int main(int argc, char *argv[]) {
                 int h = (int)(t / 3600); int m = (int)((t - h * 3600) / 60);
                 snprintf(t_str, sizeof(t_str), "%02d:%02d:00", h, m);
             }
-            draw_text(ren, t_str, rx + 4, corner_y + 4, c_muted);
-            SDL_SetRenderDrawColor(ren, 118, 78, 46, 255);
-            SDL_RenderDrawLine(ren, rx, corner_y + 15, rx, corner_y + RULER_HEIGHT);
+
+            // Center-align time number horizontally over vertical tick mark rx, bright as standard button text (c_white)
+            int tw = (int)strlen(t_str) * 8;
+            int tx = rx - (tw / 2);
+            if (tx < g_daw.tcp_width + 2) tx = g_daw.tcp_width + 2;
+            draw_text(ren, t_str, tx, corner_y + 3, c_white);
+
+            // Bright vertical tick mark centered right below the time number
+            SDL_SetRenderDrawColor(ren, c_white.r, c_white.g, c_white.b, 255);
+            SDL_RenderDrawLine(ren, rx, corner_y + 16, rx, corner_y + RULER_HEIGHT - 1);
         }
+        SDL_RenderSetClipRect(ren, NULL);
 
         // Render Logic Pro Yellow Cycle Strip in the Time Ruler when Range is active
         if (range_on) {
@@ -9923,14 +10885,8 @@ int main(int argc, char *argv[]) {
                     if (y2 > iy + ih - 2) y2 = iy + ih - 2;
                     if (y1 == y2) y2 += 1;
 
-                    int pk_c = g_item_peak_color_idx[cur_tab_w][i] % NUM_STUDIO_COLORS;
+                    int pk_c = g_universal_peak_color_idx % NUM_STUDIO_COLORS;
                     if (pk_c < 0) pk_c = 0;
-                    if (pk_c == 0 && it->track_idx >= 0 && it->track_idx < MAX_TRACKS && g_track_peak_color_idx[cur_tab_w][it->track_idx] > 0) {
-                        pk_c = g_track_peak_color_idx[cur_tab_w][it->track_idx] % NUM_STUDIO_COLORS;
-                    }
-                    if (pk_c == 0 && g_tab_peak_color_idx[cur_tab_w] > 0) {
-                        pk_c = g_tab_peak_color_idx[cur_tab_w] % NUM_STUDIO_COLORS;
-                    }
                     uint8_t pkr = g_studio_pal_peak[pk_c][0];
                     uint8_t pkg = g_studio_pal_peak[pk_c][1];
                     uint8_t pkb = g_studio_pal_peak[pk_c][2];
@@ -10354,17 +11310,16 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Delete Marker", g_marker_context_x + 12, g_marker_context_y + 8, c_white);
         }
 
-        // 7. Action Menu (Submenus: Keyboard Shortcut, Scripts, Dynamic split, Reposition)
+        // 7. Action Menu (Submenus: Scripts, Dynamic split, Reposition)
         if (g_daw.menu_action_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect a_box = { 60, m_start, 178, 108 };
+            SDL_Rect a_box = { 60, m_start, 178, 81 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &a_box);
             draw_brown_border_rect(ren, &a_box, true, false);
-            draw_text(ren, "Keyboard Shortcut", 68, m_start + 7, c_white);
-            draw_text(ren, "Scripts", 68, m_start + 34, c_white);
-            draw_text(ren, "Dynamic split", 68, m_start + 61, c_white);
-            draw_text(ren, "Reposition", 68, m_start + 88, c_white);
+            draw_text(ren, "Scripts", 68, m_start + 7, c_white);
+            draw_text(ren, "Dynamic split", 68, m_start + 34, c_white);
+            draw_text(ren, "Reposition", 68, m_start + 61, c_white);
         }
 
         // Unified Script Manager (Lua & Python Scripts, Edge-Draggable Resize, Vertical Scrollbar, Refresh Script & Run Script)
@@ -10523,24 +11478,17 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Tools Menu (Submenus: Marker, History, Themes, Record [no Browse], Clip properties)
+        // Tools Menu (Submenus: Marker, History, Clip properties)
         if (g_menu_tools_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect t_box = { 126, m_start, 156, 135 };
+            SDL_Rect t_box = { 126, m_start, 156, 81 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &t_box);
             draw_brown_border_rect(ren, &t_box, true, false);
 
             draw_text(ren, p->show_marker_lane ? "Marker [ON]" : "Marker", 136, m_start + 7, c_white);
             draw_text(ren, "History", 136, m_start + 34, c_white);
-            draw_text(ren, "Themes", 136, m_start + 61, c_white);
-            draw_filled_circle_sdl(ren, 141, m_start + 94, 5,
-                                   g_rec.is_recording ? 245 : 195,
-                                   g_rec.is_recording ? 32  : 42,
-                                   g_rec.is_recording ? 32  : 42, 255);
-            draw_text(ren, g_rec.is_recording ? "Record [STOP]" : "Record", 152, m_start + 88,
-                      g_rec.is_recording ? get_theme_accent_sdl_color() : c_white);
-            draw_text(ren, "Clip properties", 136, m_start + 115, c_white);
+            draw_text(ren, "Clip properties", 136, m_start + 61, c_white);
         }
 
         // Edit Menu (Submenus: Track color, Clip color, Peaks Color, Join (Glue))
@@ -10555,6 +11503,19 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Clip color", 200, m_start + 34, c_white);
             draw_text(ren, "Peaks Color", 200, m_start + 61, c_white);
             draw_text(ren, "Join (Glue)", 200, m_start + 88, c_white);
+        }
+
+        // Settings Menu (Requirement 8 & 9: Submenus: Keyboard Shortcut, Themes, Mouse)
+        if (g_menu_settings_open) {
+            int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
+            SDL_Rect s_box = { 250, m_start, 176, 81 };
+            SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
+            SDL_RenderFillRect(ren, &s_box);
+            draw_brown_border_rect(ren, &s_box, true, false);
+
+            draw_text(ren, "Keyboard Shortcut", 260, m_start + 7, c_white);
+            draw_text(ren, "Themes", 260, m_start + 34, c_white);
+            draw_text(ren, "Mouse", 260, m_start + 61, c_white);
         }
 
         // File Menu (Import Project, Export Project, Project Save As, Import Media, Export Media)
@@ -10593,7 +11554,19 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &v_bar);
             draw_brown_border_rect(ren, &v_bar, false, false);
 
-            draw_text(ren, "Video Monitor", p->video.rect.x + 8, p->video.rect.y + 7, c_white);
+            draw_text(ren, g_video_pinned_global ? "Video Monitor [PINNED GLOBALLY]" : "Video Monitor",
+                      p->video.rect.x + 8, p->video.rect.y + 7,
+                      g_video_pinned_global ? get_theme_accent_sdl_color() : c_white);
+
+            // Requirement 7: Pin Symbol Button on Video Monitor (Pin Active = visible globally outside app)
+            int pin_btn_x = p->video.rect.x + p->video.rect.w - 68;
+            int pin_btn_y = p->video.rect.y + 3;
+            SDL_Rect pin_btn = { pin_btn_x, pin_btn_y, 18, 18 };
+            SDL_SetRenderDrawColor(ren, g_video_pinned_global ? 78 : 48, g_video_pinned_global ? 54 : 40, 34, 255);
+            SDL_RenderFillRect(ren, &pin_btn);
+            draw_brown_border_rect(ren, &pin_btn, g_video_pinned_global, false);
+            draw_pin_symbol_icon(ren, pin_btn_x + 4, pin_btn_y + 2, g_video_pinned_global,
+                                 g_video_pinned_global ? get_theme_accent_sdl_color() : c_white);
 
             // Full Screen / Minimize (Restore) Symbol Button right near X
             int fs_btn_x = p->video.rect.x + p->video.rect.w - 46;
@@ -11364,6 +12337,19 @@ int main(int argc, char *argv[]) {
             render_script_popup_window(ren);
         }
 
+        // Settings -> Mouse Popup Window (Requirement 9)
+        if (g_mouse_settings_open) {
+            render_mouse_settings_window(ren);
+        }
+
+        // Double-Click Time Clock Manual Timings Entry Popup (Requirement 14)
+        if (g_time_jump_open) {
+            render_time_jump_popup_window(ren);
+        }
+
+        // Sync & render Global Pinned Video Monitor window if active (Requirement 7)
+        sync_and_render_external_pinned_video_window(p);
+
         // 8. Save Confirmation Dialog Modal (with Brown Borders)
         if (g_daw.save_prompt_open) {
             SDL_Rect dim_overlay = { 0, 0, win_w, win_h };
@@ -11481,6 +12467,7 @@ int main(int argc, char *argv[]) {
     SDL_FreeCursor(g_cursor_size_we);
     SDL_FreeCursor(g_cursor_size_ns);
     SDL_FreeCursor(g_cursor_ibeam);
+    destroy_external_pinned_video_window();
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
