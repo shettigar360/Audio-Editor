@@ -103,8 +103,68 @@ static const unsigned short FONT_BITMAP[96][12] = {
     {0,0x33,0x66,0,0,0,0,0,0,0,0,0}        // ~
 };
 
+#ifndef DAW_FAST_FONT_ATLAS_DEFINED
+#define DAW_FAST_FONT_ATLAS_DEFINED
+static SDL_Renderer *g_daw_font_atlas_ren = NULL;
+static SDL_Texture  *g_daw_font_atlas_tex = NULL;
+
+static inline void daw_ensure_font_atlas_tex(SDL_Renderer *ren) {
+    if (!ren) return;
+    if (g_daw_font_atlas_ren == ren && g_daw_font_atlas_tex != NULL) return;
+    static uint32_t atlas_px[95 * 8 * 12];
+    static bool bitmap_built = false;
+    if (!bitmap_built) {
+        for (int i = 0; i < 95 * 8 * 12; i++) atlas_px[i] = 0x00000000U;
+        for (int g = 0; g < 95; g++) {
+            for (int row = 0; row < 12; row++) {
+                unsigned short bits = FONT_BITMAP[g][row];
+                for (int col = 0; col < 8; col++) {
+                    if (bits & (0x80 >> col)) {
+                        atlas_px[row * (95 * 8) + g * 8 + col] = 0xFFFFFFFFU;
+                    }
+                }
+            }
+        }
+        bitmap_built = true;
+    }
+    if (g_daw_font_atlas_ren == NULL) {
+        SDL_Surface *surf = SDL_CreateRGBSurfaceFrom(
+            atlas_px, 95 * 8, 12, 32, (95 * 8) * 4,
+            0x00FF0000U, 0x0000FF00U, 0x000000FFU, 0xFF000000U
+        );
+        if (surf) {
+            SDL_Texture *tex = SDL_CreateTextureFromSurface(ren, surf);
+            SDL_FreeSurface(surf);
+            if (tex) {
+                SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+                g_daw_font_atlas_ren = ren;
+                g_daw_font_atlas_tex = tex;
+            }
+        }
+    }
+}
+#endif
+
 static inline void draw_text(SDL_Renderer *ren, const char *str, int x, int y, SDL_Color color) {
     if (!str || !ren) return;
+    if (!g_daw_font_atlas_tex) {
+        daw_ensure_font_atlas_tex(ren);
+    }
+    if (g_daw_font_atlas_tex && g_daw_font_atlas_ren == ren) {
+        SDL_SetTextureColorMod(g_daw_font_atlas_tex, color.r, color.g, color.b);
+        SDL_SetTextureAlphaMod(g_daw_font_atlas_tex, color.a);
+        int cur_x = x;
+        while (*str) {
+            unsigned char ch = (unsigned char)*str++;
+            if (ch > 32 && ch <= 126) {
+                SDL_Rect src_r = { ((int)ch - 32) * 8, 0, 8, 12 };
+                SDL_Rect dst_r = { cur_x, y, 8, 12 };
+                SDL_RenderCopy(ren, g_daw_font_atlas_tex, &src_r, &dst_r);
+            }
+            cur_x += 8;
+        }
+        return;
+    }
     SDL_SetRenderDrawColor(ren, color.r, color.g, color.b, color.a);
     int cur_x = x;
     while (*str) {
