@@ -10,6 +10,10 @@
 static inline bool open_generic_dialog(char *out_path, int max_len, const char *filter, bool is_save) {
     OPENFILENAMEA ofn;
     char szFile[MAX_PATH] = {0};
+    if (out_path && out_path[0]) {
+        strncpy(szFile, out_path, sizeof(szFile) - 1);
+        szFile[sizeof(szFile) - 1] = '\0';
+    }
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.lpstrFile = szFile;
