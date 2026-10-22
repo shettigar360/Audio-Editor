@@ -116,13 +116,16 @@ static int           g_video_ext_tex_h = 0;
 
 #ifndef DAW_TRACK_LOCK_VARS_DEFINED
 #define DAW_TRACK_LOCK_VARS_DEFINED
-// Per-tab Track Lock State & Right-Click Track Lock Options Popup Window
+// Per-tab & Per-track Lock State + Main Lock Two-Section Popup Window (All Track | Selected Track)
 static bool g_track_locked[MAX_TABS][MAX_TRACKS];
-static bool g_lock_opt_full[MAX_TABS]       = { true, true, true, true, true, true, true, true };
-static bool g_lock_opt_prevent_lr[MAX_TABS] = { false };
-static bool g_lock_opt_prevent_ud[MAX_TABS] = { false };
+static bool g_track_lock_lr_only[MAX_TABS][MAX_TRACKS];
+static bool g_track_lock_ud_only[MAX_TABS][MAX_TRACKS];
+static bool g_lock_opt_full[MAX_TABS]            = { false };
+static bool g_lock_opt_complete_unlock[MAX_TABS] = { false };
+static bool g_lock_opt_prevent_lr[MAX_TABS]      = { false };
+static bool g_lock_opt_prevent_ud[MAX_TABS]      = { false };
 static bool g_lock_popup_open = false;
-static SDL_Rect g_lock_win_rect = { 390, 165, 430, 210 };
+static SDL_Rect g_lock_win_rect = { 290, 145, 700, 268 };
 static bool g_lock_win_dragging = false;
 static int  g_lock_drag_off_x = 0;
 static int  g_lock_drag_off_y = 0;
@@ -133,15 +136,15 @@ static inline bool is_track_locked_tab(int tab, int trk) {
 }
 static inline bool is_track_full_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return g_lock_opt_full[tab] || (!g_lock_opt_prevent_lr[tab] && !g_lock_opt_prevent_ud[tab]);
+    return (!g_track_lock_lr_only[tab][trk] && !g_track_lock_ud_only[tab][trk]);
 }
 static inline bool is_track_lr_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return is_track_full_locked_tab(tab, trk) || g_lock_opt_prevent_lr[tab];
+    return is_track_full_locked_tab(tab, trk) || g_track_lock_lr_only[tab][trk];
 }
 static inline bool is_track_ud_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return is_track_full_locked_tab(tab, trk) || g_lock_opt_prevent_ud[tab];
+    return is_track_full_locked_tab(tab, trk) || g_track_lock_ud_only[tab][trk];
 }
 
 // Draws a crisp Padlock symbol icon at (cx, cy)
@@ -2950,6 +2953,7 @@ static bool split_single_item_at_time(ProjectTab *p, int item_idx, double split_
     if (!p || item_idx < 0 || item_idx >= p->num_items || p->num_items >= MAX_ITEMS) return false;
     int tab = get_valid_tab_idx();
     AudioItem *it = &p->items[item_idx];
+    if (is_track_full_locked_tab(tab, it->track_idx)) return false;
     double it_s = it->start_time;
     double it_e = it->start_time + it->duration;
     if (split_t <= it_s + 0.02 || split_t >= it_e - 0.02) return false;
@@ -3048,7 +3052,7 @@ static bool split_selected_items_at_center(ProjectTab *p) {
 
     for (int i = 0; i < orig_count; i++) {
         AudioItem *it = &p->items[i];
-        if (!it->is_selected) continue;
+        if (!it->is_selected || is_track_full_locked_tab(tab, it->track_idx)) continue;
         if (it->duration <= 0.10 || p->num_items >= MAX_ITEMS) continue;
 
         if (!did_split) {
@@ -3169,7 +3173,7 @@ static void execute_dynamic_split_items(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         // Selected Track: select all clips on currently selected track(s)
         for (int i = 0; i < p->num_items; i++) {
             int tr = p->items[i].track_idx;
-            if (tr >= 0 && tr < p->num_tracks && p->track_selected[tr] && !is_track_hidden(tr)) {
+            if (tr >= 0 && tr < p->num_tracks && p->track_selected[tr] && !is_track_hidden(tr) && !is_track_full_locked_tab(get_valid_tab_idx(), tr)) {
                 p->items[i].is_selected = true;
                 target_items[num_targets++] = i;
             }
@@ -3177,14 +3181,14 @@ static void execute_dynamic_split_items(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
     } else {
         // Selected clip item (fallback to selected track's clips if no clip is explicitly selected)
         for (int i = 0; i < p->num_items; i++) {
-            if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx)) {
+            if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx) && !is_track_full_locked_tab(get_valid_tab_idx(), p->items[i].track_idx)) {
                 target_items[num_targets++] = i;
             }
         }
         if (num_targets == 0) {
             for (int i = 0; i < p->num_items; i++) {
                 int tr = p->items[i].track_idx;
-                if (tr >= 0 && tr < p->num_tracks && p->track_selected[tr] && !is_track_hidden(tr)) {
+                if (tr >= 0 && tr < p->num_tracks && p->track_selected[tr] && !is_track_hidden(tr) && !is_track_full_locked_tab(get_valid_tab_idx(), tr)) {
                     p->items[i].is_selected = true;
                     target_items[num_targets++] = i;
                 }
@@ -4628,7 +4632,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_ITEM_MOVE_UP_TRACK: {
             bool moved = false;
             for (int i = 0; i < p->num_items; i++) {
-                if (!p->items[i].is_selected) continue;
+                if (!p->items[i].is_selected || is_track_full_locked_tab(tab, p->items[i].track_idx)) continue;
                 int cur_t = p->items[i].track_idx;
                 if (is_track_ud_locked_tab(tab, cur_t)) continue;
                 int prev_t = -1;
@@ -4650,7 +4654,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_ITEM_MOVE_DOWN_TRACK: {
             bool moved = false;
             for (int i = 0; i < p->num_items; i++) {
-                if (!p->items[i].is_selected) continue;
+                if (!p->items[i].is_selected || is_track_full_locked_tab(tab, p->items[i].track_idx)) continue;
                 int cur_t = p->items[i].track_idx;
                 if (is_track_ud_locked_tab(tab, cur_t)) continue;
                 int next_t = -1;
@@ -4716,7 +4720,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             }
             if (!any_trk_sel) {
                 for (int i = 0; i < p->num_items; i++) {
-                    if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx)) {
+                    if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx) && !is_track_full_locked_tab(get_valid_tab_idx(), p->items[i].track_idx)) {
                         p->track_selected[p->items[i].track_idx] = true;
                         any_trk_sel = true;
                         break;
@@ -4761,7 +4765,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             }
             if (!any_trk_sel) {
                 for (int i = 0; i < p->num_items; i++) {
-                    if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx)) {
+                    if (p->items[i].is_selected && !is_track_hidden(p->items[i].track_idx) && !is_track_full_locked_tab(get_valid_tab_idx(), p->items[i].track_idx)) {
                         p->track_selected[p->items[i].track_idx] = true;
                         any_trk_sel = true;
                         break;
@@ -4887,7 +4891,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             push_undo_state();
             bool any_item_sel = false;
             for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].is_selected) {
+                if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx)) {
                     g_item_muted[tab][i] = !g_item_muted[tab][i];
                     any_item_sel = true;
                 }
@@ -4896,7 +4900,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                 record_project_change("Toggled Item Mute", true);
             } else {
                 for (int t = 0; t < p->num_tracks; t++) {
-                    if (p->track_selected[t]) {
+                    if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) {
                         p->tracks[t].mute = !p->tracks[t].mute;
                     }
                 }
@@ -4908,14 +4912,14 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             push_undo_state();
             bool any_item_sel = false;
             for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].is_selected) {
+                if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx)) {
                     g_item_vol_db[tab][i] = fminf(24.0f, g_item_vol_db[tab][i] + 1.0f);
                     any_item_sel = true;
                 }
             }
             if (!any_item_sel) {
                 for (int t = 0; t < p->num_tracks; t++) {
-                    if (p->track_selected[t]) p->track_db[t] = fminf(24.0f, p->track_db[t] + 1.0f);
+                    if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) p->track_db[t] = fminf(24.0f, p->track_db[t] + 1.0f);
                 }
             }
             record_project_change("Item: Nudge volume +1dB", true);
@@ -4925,14 +4929,14 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             push_undo_state();
             bool any_item_sel = false;
             for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].is_selected) {
+                if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx)) {
                     g_item_vol_db[tab][i] = fmaxf(-60.0f, g_item_vol_db[tab][i] - 1.0f);
                     any_item_sel = true;
                 }
             }
             if (!any_item_sel) {
                 for (int t = 0; t < p->num_tracks; t++) {
-                    if (p->track_selected[t]) p->track_db[t] = fmaxf(-60.0f, p->track_db[t] - 1.0f);
+                    if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) p->track_db[t] = fmaxf(-60.0f, p->track_db[t] - 1.0f);
                 }
             }
             record_project_change("Item: Nudge volume -1dB", true);
@@ -5048,7 +5052,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_ITEM_FADE_IN_TO_CURSOR: {
             push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].is_selected && p->playhead_seconds > p->items[i].start_time) {
+                if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx) && p->playhead_seconds > p->items[i].start_time) {
                     set_item_fade_in(p, i, p->playhead_seconds - p->items[i].start_time);
                 }
             }
@@ -5059,7 +5063,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
                 double ie = p->items[i].start_time + p->items[i].duration;
-                if (p->items[i].is_selected && p->playhead_seconds < ie) {
+                if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx) && p->playhead_seconds < ie) {
                     set_item_fade_out(p, i, ie - p->playhead_seconds);
                 }
             }
@@ -5069,7 +5073,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_ITEM_RESET_FADES: {
             push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].is_selected) {
+                if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx)) {
                     set_item_fade_in(p, i, 0.0);
                     set_item_fade_out(p, i, 0.0);
                 }
@@ -5080,7 +5084,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_ITEM_NORMALIZE_GAIN: {
             push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
-                if (!p->items[i].is_selected) continue;
+                if (!p->items[i].is_selected || is_track_full_locked_tab(tab, p->items[i].track_idx)) continue;
                 AudioItem *it = &p->items[i];
                 float max_pk = 0.0f;
                 if (it->peaks && it->peak_count > 0) {
@@ -5103,7 +5107,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             for (int i = 0; i < p->num_items; i++) {
                 AudioItem *it = &p->items[i];
                 double ie = it->start_time + it->duration;
-                if (it->is_selected && p->playhead_seconds > it->start_time && p->playhead_seconds < ie - 0.05) {
+                if (it->is_selected && !is_track_full_locked_tab(tab, it->track_idx) && p->playhead_seconds > it->start_time && p->playhead_seconds < ie - 0.05) {
                     double d = p->playhead_seconds - it->start_time;
                     it->start_time = p->playhead_seconds;
                     it->offset_in_file += d;
@@ -5118,7 +5122,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             for (int i = 0; i < p->num_items; i++) {
                 AudioItem *it = &p->items[i];
                 double ie = it->start_time + it->duration;
-                if (it->is_selected && p->playhead_seconds > it->start_time + 0.05 && p->playhead_seconds < ie) {
+                if (it->is_selected && !is_track_full_locked_tab(tab, it->track_idx) && p->playhead_seconds > it->start_time + 0.05 && p->playhead_seconds < ie) {
                     it->duration = p->playhead_seconds - it->start_time;
                 }
             }
@@ -5148,7 +5152,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             push_undo_state();
             bool any_sel = false;
             for (int t = 0; t < p->num_tracks; t++) {
-                if (p->track_selected[t]) {
+                if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) {
                     p->tracks[t].solo = !p->tracks[t].solo;
                     any_sel = true;
                 }
@@ -5162,7 +5166,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_TRACK_TOGGLE_MUTE_SELECTED: {
             push_undo_state();
             for (int t = 0; t < p->num_tracks; t++) {
-                if (p->track_selected[t]) p->tracks[t].mute = !p->tracks[t].mute;
+                if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) p->tracks[t].mute = !p->tracks[t].mute;
             }
             record_project_change("Track: Toggle mute for selected tracks", true);
             break;
@@ -5218,7 +5222,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_TRACK_NUDGE_VOL_UP: {
             push_undo_state();
             for (int t = 0; t < p->num_tracks; t++) {
-                if (p->track_selected[t]) p->track_db[t] = fminf(24.0f, p->track_db[t] + 1.0f);
+                if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) p->track_db[t] = fminf(24.0f, p->track_db[t] + 1.0f);
             }
             record_project_change("Track Volume +1dB", true);
             break;
@@ -5226,7 +5230,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_TRACK_NUDGE_VOL_DOWN: {
             push_undo_state();
             for (int t = 0; t < p->num_tracks; t++) {
-                if (p->track_selected[t]) p->track_db[t] = fmaxf(-60.0f, p->track_db[t] - 1.0f);
+                if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) p->track_db[t] = fmaxf(-60.0f, p->track_db[t] - 1.0f);
             }
             record_project_change("Track Volume -1dB", true);
             break;
@@ -5234,7 +5238,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_TRACK_RESET_VOL_0DB: {
             push_undo_state();
             for (int t = 0; t < p->num_tracks; t++) {
-                if (p->track_selected[t]) p->track_db[t] = 0.0f;
+                if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) p->track_db[t] = 0.0f;
             }
             record_project_change("Reset Track Volume to 0dB", true);
             break;
@@ -5400,7 +5404,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             if (g_clipboard_count > 0) {
                 push_undo_state();
                 for (int i = p->num_items - 1; i >= 0; i--) {
-                    if (p->items[i].is_selected) {
+                    if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx)) {
                         delete_item_at_index(p, i);
                     }
                 }
@@ -5544,6 +5548,9 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_FILE_EXPORT_MEDIA: {
+            g_lock_popup_open = false;
+            g_time_jump_open = false;
+            g_mouse_settings_open = false;
             g_export.is_open = true;
             g_export.win_rect.x = (win_w - g_export.win_rect.w) / 2;
             g_export.win_rect.y = (win_h - g_export.win_rect.h) / 2;
