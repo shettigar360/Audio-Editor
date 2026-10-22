@@ -216,6 +216,7 @@ static inline void perform_redo(void) {
 #include "daw_tabs.h"
 #include "project_io.h"
 
+extern void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files);
 
 void init_tab_defaults(int idx, const char *title) {
     ProjectTab *p = &g_daw.tabs[idx];
@@ -239,6 +240,7 @@ void init_tab_defaults(int idx, const char *title) {
 
 void force_close_tab(int idx) {
     if (idx < 0 || idx >= g_daw.num_tabs) return;
+    daw_cleanup_temp_media_for_tab(idx, g_daw.num_tabs <= 1);
 
     if (g_daw.num_tabs <= 1) {
         ProjectTab *p = &g_daw.tabs[0];
@@ -307,8 +309,9 @@ void handle_save_modal_choice(int choice, bool *running) {
             g_daw.tabs[t_idx].is_dirty = false;
         }
     } else if (choice == 2) {
-        // [Don't Save]: Discard and exit/close
+        // [Don't Save]: Discard and auto-delete unsaved temporary media files
         if (quit_after) {
+            daw_cleanup_temp_media_for_tab(-1, true);
             if (running) *running = false;
         } else {
             force_close_tab(t_idx);
