@@ -1978,7 +1978,7 @@ typedef struct {
 
 static ThemeManagerState g_theme = {
     false,
-    { 340, 88, 580, 420 },
+    { 340, 88, 580, 396 },
     false, 0, 0,
     205, 138, 72, 255,
     29.77f, 0.6488f, 0.8039f,
@@ -2807,12 +2807,7 @@ static void render_themes_popup_window(SDL_Renderer *ren) {
     SDL_RenderFillRect(ren, &sb_thumb);
     draw_brown_border_rect(ren, &sb_thumb, false, false);
 
-    // Footer Status Line
-    const char *st_txt = g_theme.status_msg[0]
-        ? g_theme.status_msg
-        : "Saved permanently to themes_settings.json & keyboard_shortcuts.json";
-    SDL_Rect st_clip = { wx + 18, wy + wh - 28, ww - 36, 20 };
-    draw_text_clipped(ren, st_txt, wx + 18, wy + wh - 24, c_muted, &st_clip, NULL);
+    (void)wh;
 }
 
 // Generates a 64x64 studio audio-editing app icon surface (dark studio console, glowing orange waveform, red REC badge)
@@ -2850,11 +2845,7 @@ static void set_daw_window_thumbnail_icon(SDL_Window *win) {
                         }
                     }
                 }
-                // Red round REC dot in top-right corner of the app icon (center 50, 14, radius 5)
-                int rdx = x - 50, rdy = y - 14;
-                if (rdx * rdx + rdy * rdy <= 25) {
-                    r = 240; g = 42; b = 42;
-                }
+
             }
             icon_px[y * 64 + x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
         }
@@ -2868,11 +2859,8 @@ static void set_daw_window_thumbnail_icon(SDL_Window *win) {
         SDL_FreeSurface(surf);
     }
 #ifdef _WIN32
-    // Ensure app_icon.ico exists on disk and set both ICON_BIG and ICON_SMALL on the Win32 HWND + Window Class
-    FILE *chk_ico = fopen("app_icon.ico", "rb");
-    if (chk_ico) {
-        fclose(chk_ico);
-    } else {
+    // Write clean app_icon.ico (without red recording dot) to disk and set both ICON_BIG and ICON_SMALL on the Win32 HWND + Window Class
+    if (1) {
         FILE *f_ico = fopen("app_icon.ico", "wb");
         if (f_ico) {
             uint8_t ico_hdr[22] = {
@@ -4200,7 +4188,14 @@ static void render_time_jump_popup_window(SDL_Renderer *ren) {
 }
 
 // ================= VIDEO POPUP GLOBAL PIN OUTSIDE APP (REQUIREMENT 7) =================
+static bool g_video_ext_dragging = false;
+static int  g_video_ext_drag_off_x = 0;
+static int  g_video_ext_drag_off_y = 0;
+static bool g_video_ext_maximized = false;
+
 static void destroy_external_pinned_video_window(void) {
+    g_video_ext_dragging = false;
+    g_video_ext_maximized = false;
     if (g_video_ext_tex) {
         SDL_DestroyTexture(g_video_ext_tex);
         g_video_ext_tex = NULL;
@@ -4218,40 +4213,31 @@ static void destroy_external_pinned_video_window(void) {
 }
 
 static void toggle_video_global_pin_state(ProjectTab *p, SDL_Window *main_win) {
-    (void)p;
-    (void)main_win;
     g_video_pinned_global = !g_video_pinned_global;
     if (!g_video_pinned_global) {
+        if (p && g_video_ext_win && !g_video_ext_maximized) {
+            int ew = 0, eh = 0;
+            SDL_GetWindowSize(g_video_ext_win, &ew, &eh);
+            if (ew >= 220 && eh >= 148) {
+                p->video.rect.w = ew;
+                p->video.rect.h = eh;
+            }
+        }
         destroy_external_pinned_video_window();
-        record_project_change("Video Monitor Unpinned", false);
+        record_project_change("Video Monitor Unpinned (Returned Inside App)", false);
     } else {
-        // Do NOT open a second video window while the app is open; it will appear outside automatically when the app is minimized!
-        record_project_change("Video Monitor Pinned (Shows Outside When App Minimized)", false);
+        if (p) {
+            p->video.is_dragging = false;
+            p->video.is_resizing = false;
+        }
+        record_project_change("Video Monitor Pinned (Popped Out of App View)", false);
     }
-}
-
-static bool is_main_window_minimized(SDL_Window *main_win) {
-    if (!main_win) return false;
-#if defined(_WIN32) && defined( IsIconic )
-    SDL_SysWMinfo wmInfo;
-    SDL_VERSION(&wmInfo.version);
-    if (SDL_GetWindowWMInfo(main_win, &wmInfo)) {
-        if (IsIconic(wmInfo.info.win.window)) return true;
-    }
-#endif
-#ifdef SDL_WINDOW_MINIMIZED
-    if ((SDL_GetWindowFlags(main_win) & SDL_WINDOW_MINIMIZED) != 0) return true;
-#endif
-    int mw = 0, mh = 0;
-    SDL_GetWindowSize(main_win, &mw, &mh);
-    return (mw <= 0 || mh <= 0);
+    (void)main_win;
 }
 
 static void sync_and_render_external_pinned_video_window(ProjectTab *p, SDL_Window *main_win) {
-    bool app_minimized = is_main_window_minimized(main_win);
-
-    // Only show the external OS window when Pin is active AND the main DAW app is minimized!
-    if (!p || !p->video.is_open || !g_video_pinned_global || !app_minimized) {
+    // Show the standalone always-on-top OS window immediately whenever Pin is active so it can move freely outside the app view!
+    if (!p || !p->video.is_open || !g_video_pinned_global) {
         if (g_video_ext_win) destroy_external_pinned_video_window();
         return;
     }
@@ -4259,13 +4245,22 @@ static void sync_and_render_external_pinned_video_window(ProjectTab *p, SDL_Wind
     if (!g_video_ext_win) {
         int w = (p->video.rect.w >= 240) ? p->video.rect.w : 480;
         int h = (p->video.rect.h >= 160) ? p->video.rect.h : 294;
+        int spawn_x = SDL_WINDOWPOS_CENTERED;
+        int spawn_y = SDL_WINDOWPOS_CENTERED;
+        if (main_win) {
+            int mwx = 0, mwy = 0;
+            SDL_GetWindowPosition(main_win, &mwx, &mwy);
+            spawn_x = mwx + p->video.rect.x;
+            spawn_y = mwy + p->video.rect.y;
+        }
         g_video_ext_win = SDL_CreateWindow(
-            "Video Monitor",
-            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            "Video Monitor [Pinned]",
+            spawn_x, spawn_y,
             w, h,
             SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALWAYS_ON_TOP
         );
         if (g_video_ext_win) {
+            set_daw_window_thumbnail_icon(g_video_ext_win);
             SDL_SetWindowAlwaysOnTop(g_video_ext_win, SDL_TRUE);
 #ifdef _WIN32
             SDL_SysWMinfo wmInfo;
@@ -4282,6 +4277,16 @@ static void sync_and_render_external_pinned_video_window(ProjectTab *p, SDL_Wind
     }
     if (!g_video_ext_win || !g_video_ext_ren) return;
 
+    if (g_video_ext_dragging) {
+        int gmx = 0, gmy = 0;
+        Uint32 mbuttons = SDL_GetGlobalMouseState(&gmx, &gmy);
+        if ((mbuttons & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0) {
+            SDL_SetWindowPosition(g_video_ext_win, gmx - g_video_ext_drag_off_x, gmy - g_video_ext_drag_off_y);
+        } else {
+            g_video_ext_dragging = false;
+        }
+    }
+
     int ew = 480, eh = 294;
     SDL_GetWindowSize(g_video_ext_win, &ew, &eh);
     SDL_Color c_white  = { 224, 224, 224, 255 };
@@ -4296,15 +4301,36 @@ static void sync_and_render_external_pinned_video_window(ProjectTab *p, SDL_Wind
     SDL_SetRenderDrawColor(g_video_ext_ren, 36, 36, 36, 255);
     SDL_RenderFillRect(g_video_ext_ren, &v_bar);
     draw_brown_border_rect(g_video_ext_ren, &v_bar, false, false);
-    draw_text(g_video_ext_ren, "Video Monitor [PINNED GLOBALLY]", 8, 7, c_accent);
+    draw_text(g_video_ext_ren, "Video Monitor [PINNED OUTSIDE APP]", 8, 7, c_accent);
 
-    // Pin button (active)
-    int pin_btn_x = ew - 70;
+    // Pin button (active — click to unpin back into app)
+    int pin_btn_x = ew - 68;
     SDL_Rect pin_btn = { pin_btn_x, 3, 18, 18 };
     SDL_SetRenderDrawColor(g_video_ext_ren, 78, 54, 30, 255);
     SDL_RenderFillRect(g_video_ext_ren, &pin_btn);
     draw_brown_border_rect(g_video_ext_ren, &pin_btn, true, false);
     draw_pin_symbol_icon(g_video_ext_ren, pin_btn_x + 4, 5, true, c_accent);
+
+    // Full Screen / Restore button
+    int fs_btn_x = ew - 46;
+    SDL_Rect fs_btn = { fs_btn_x, 3, 18, 18 };
+    SDL_SetRenderDrawColor(g_video_ext_ren, 48, 40, 34, 255);
+    SDL_RenderFillRect(g_video_ext_ren, &fs_btn);
+    draw_brown_border_rect(g_video_ext_ren, &fs_btn, false, false);
+    SDL_SetRenderDrawColor(g_video_ext_ren, 224, 224, 224, 255);
+    if (!g_video_ext_maximized) {
+        SDL_Rect ico_max = { fs_btn_x + 4, 7, 10, 10 };
+        SDL_RenderDrawRect(g_video_ext_ren, &ico_max);
+        SDL_RenderDrawLine(g_video_ext_ren, fs_btn_x + 4, 8, fs_btn_x + 13, 8);
+    } else {
+        SDL_Rect ico_back = { fs_btn_x + 6, 6, 8, 8 };
+        SDL_Rect ico_front = { fs_btn_x + 3, 9, 8, 8 };
+        SDL_RenderDrawRect(g_video_ext_ren, &ico_back);
+        SDL_SetRenderDrawColor(g_video_ext_ren, 48, 40, 34, 255);
+        SDL_RenderFillRect(g_video_ext_ren, &ico_front);
+        SDL_SetRenderDrawColor(g_video_ext_ren, 224, 224, 224, 255);
+        SDL_RenderDrawRect(g_video_ext_ren, &ico_front);
+    }
 
     // Close [X] button
     draw_text(g_video_ext_ren, "X", ew - 18, 7, c_white);
@@ -4365,6 +4391,7 @@ static void sync_and_render_external_pinned_video_window(ProjectTab *p, SDL_Wind
                   v_canvas.x + (v_canvas.w - 176) / 2,
                   v_canvas.y + v_canvas.h / 2 - 4, c_muted);
     }
+    draw_brown_border_rect(g_video_ext_ren, &v_canvas, false, false);
     SDL_RenderPresent(g_video_ext_ren);
 }
 
@@ -7911,7 +7938,7 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
         if (point_in_rect(mx, my, &g_daw.script_win_rect)) return true;
     }
 
-    if (p && p->video.is_open) {
+    if (p && p->video.is_open && !g_video_pinned_global) {
         VideoResizeEdge v_edge = g_video_fullscreen[get_valid_tab_idx()]
                                  ? VID_RESIZE_NONE
                                  : hit_test_video_resize_edge(&p->video.rect, mx, my);
@@ -8085,6 +8112,15 @@ int main(int argc, char *argv[]) {
         }
 
         while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_WINDOWEVENT && g_video_ext_win &&
+                e.window.windowID == SDL_GetWindowID(g_video_ext_win)) {
+                if (e.window.event == SDL_WINDOWEVENT_CLOSE) {
+                    g_video_pinned_global = false;
+                    destroy_external_pinned_video_window();
+                    p->video.is_open = false;
+                }
+                continue;
+            }
             if (e.type == SDL_QUIT) {
                 bool has_any_dirty = false;
                 for (int t = 0; t < g_daw.num_tabs; t++) {
@@ -8667,8 +8703,23 @@ int main(int argc, char *argv[]) {
                             g_video_pinned_global = false;
                             destroy_external_pinned_video_window();
                             p->video.is_open = false;
-                        } else if (mx >= ew - 72 && mx <= ew - 48) {
+                        } else if (mx >= ew - 48 && mx < ew - 24) {
+                            g_video_ext_maximized = !g_video_ext_maximized;
+                            if (g_video_ext_maximized) SDL_MaximizeWindow(g_video_ext_win);
+                            else SDL_RestoreWindow(g_video_ext_win);
+                        } else if (mx >= ew - 72 && mx < ew - 48) {
                             toggle_video_global_pin_state(p, win);
+                        } else if (e.button.clicks >= 2) {
+                            g_video_ext_maximized = !g_video_ext_maximized;
+                            if (g_video_ext_maximized) SDL_MaximizeWindow(g_video_ext_win);
+                            else SDL_RestoreWindow(g_video_ext_win);
+                        } else if (!g_video_ext_maximized) {
+                            int gmx = 0, gmy = 0, wx_p = 0, wy_p = 0;
+                            SDL_GetGlobalMouseState(&gmx, &gmy);
+                            SDL_GetWindowPosition(g_video_ext_win, &wx_p, &wy_p);
+                            g_video_ext_dragging = true;
+                            g_video_ext_drag_off_x = gmx - wx_p;
+                            g_video_ext_drag_off_y = gmy - wy_p;
                         }
                     }
                     continue;
@@ -9664,7 +9715,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                if (p->video.is_open) {
+                if (p->video.is_open && !g_video_pinned_global) {
                     int v_tab = get_valid_tab_idx();
                     VideoResizeEdge hit_edge = g_video_fullscreen[v_tab]
                                                ? VID_RESIZE_NONE
@@ -11529,10 +11580,10 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &save_btn, p->is_dirty, false);
         draw_text(ren, "Save", win_w - 50, TABBAR_HEIGHT + 13, c_white);
 
-        // 3. Corner Header (+ Track and Master Lock / M / S buttons next to + Track — semi-dark to match TCP)
+        // 3. Corner Header (+ Track and Master Lock / M / S buttons next to + Track — deep dark blue to match TCP)
         int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
         SDL_Rect corner_area = { 0, corner_y, g_daw.tcp_width, RULER_HEIGHT + m_lane_h };
-        SDL_SetRenderDrawColor(ren, 12, 22, 42, 255);
+        SDL_SetRenderDrawColor(ren, 7, 13, 28, 255);
         SDL_RenderFillRect(ren, &corner_area);
         draw_brown_border_rect(ren, &corner_area, false, true);
 
@@ -11877,11 +11928,6 @@ int main(int argc, char *argv[]) {
             SDL_Rect clip_r = { vis_x1, iy, vis_w, ih };
             SDL_SetRenderDrawColor(ren, br, bg_c, bb, 255);
             SDL_RenderFillRect(ren, &clip_r);
-
-            int hdr_h = (ih > 18) ? 18 : ih;
-            SDL_Rect hdr_r = { vis_x1, iy, vis_w, hdr_h };
-            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-            SDL_RenderFillRect(ren, &hdr_r);
         }
 
         // Pass 1B: Render Waveforms (clamped strictly to visible viewport columns for O(view_w) speed on 3-4h clips)
@@ -12077,13 +12123,7 @@ int main(int argc, char *argv[]) {
                 SDL_RenderDrawLine(ren, ix, mid_y + dy_thr, ix + iw, mid_y + dy_thr);
             }
 
-            // Full black top clip name area background
-            int hdr_h_top = (ih > 18) ? 18 : ih;
-            if (vis_x2 > vis_x1 && hdr_h_top > 0) {
-                SDL_Rect hdr_top_black = { vis_x1, iy, vis_x2 - vis_x1, hdr_h_top };
-                SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-                SDL_RenderFillRect(ren, &hdr_top_black);
-            }
+
 
             // Brown clip border (thicker when clip is selected)
             SDL_Rect clip_r = { ix, iy, iw, ih };
@@ -12299,10 +12339,10 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 6. Track Header (TCP) — Dark Blue Studio Background
+        // 6. Track Header (TCP) — Deep Dark Blue Studio Background
         SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
-        SDL_SetRenderDrawColor(ren, 10, 18, 34, 255);
+        SDL_SetRenderDrawColor(ren, 5, 10, 24, 255);
         SDL_RenderFillRect(ren, &tcp_clip);
         for (int i = 0; i < p->num_tracks; i++) {
             if (is_track_hidden(i)) continue;
@@ -12313,9 +12353,9 @@ int main(int argc, char *argv[]) {
 
             int trk_col = g_track_color_idx[get_valid_tab_idx()][i] % NUM_STUDIO_COLORS;
             if (trk_col < 0) trk_col = 0;
-            uint8_t tcp_r = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][0] * 70) / 100 + (is_sel ? 14 : 0)) : (is_dragging_this_trk ? 30 : (is_sel ? 24 : 16));
-            uint8_t tcp_g = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][1] * 70) / 100 + (is_sel ? 10 : 0)) : (is_dragging_this_trk ? 52 : (is_sel ? 42 : 28));
-            uint8_t tcp_b = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][2] * 70) / 100 + (is_sel ? 8 : 0))  : (is_dragging_this_trk ? 92 : (is_sel ? 76 : 54));
+            uint8_t tcp_r = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][0] * 70) / 100 + (is_sel ? 14 : 0)) : (is_dragging_this_trk ? 18 : (is_sel ? 14 : 8));
+            uint8_t tcp_g = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][1] * 70) / 100 + (is_sel ? 10 : 0)) : (is_dragging_this_trk ? 34 : (is_sel ? 26 : 16));
+            uint8_t tcp_b = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][2] * 70) / 100 + (is_sel ? 8 : 0))  : (is_dragging_this_trk ? 74 : (is_sel ? 58 : 38));
             SDL_Rect tp = { 1, ty + 1, g_daw.tcp_width - 2, th - 2 };
             SDL_SetRenderDrawColor(ren, tcp_r, tcp_g, tcp_b, 255);
             SDL_RenderFillRect(ren, &tp);
@@ -12653,8 +12693,8 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Export Media", 16, m_start + 102, c_white);
         }
 
-        // Floating / Fullscreen Video Monitor (Aspect-Ratio Preserving & Fullscreen/Minimize Button near X)
-        if (p->video.is_open) {
+        // Floating / Fullscreen Video Monitor (when unpinned inside the app; when pinned, renders in external OS window outside app)
+        if (p->video.is_open && !g_video_pinned_global) {
             int v_tab = get_valid_tab_idx();
             if (g_video_fullscreen[v_tab]) {
                 p->video.rect.x = 0;
