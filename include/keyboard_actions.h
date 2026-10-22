@@ -88,6 +88,33 @@ static bool g_script_pinned[64] = { false };
 static int  g_script_filtered_indices[64] = { 0 };
 static int  g_script_num_filtered = 0;
 
+#ifndef DAW_14POINT_STATE_DEFINED
+#define DAW_14POINT_STATE_DEFINED
+#define NUM_INBUILT_THEMES 6
+static int  g_universal_peak_color_idx = 0;
+static bool g_rec_master_enabled = false; // Near Record menu ON/OFF button (default OFF)
+static bool g_menu_settings_open = false;
+static bool g_mouse_click_empty_moves_playhead = false;
+static bool g_mouse_click_universal_moves_playhead = false;
+static bool g_mouse_settings_open = false;
+static SDL_Rect g_mouse_win_rect = { 420, 180, 440, 220 };
+static bool g_mouse_win_dragging = false;
+static int  g_mouse_drag_off_x = 0;
+static int  g_mouse_drag_off_y = 0;
+static bool g_time_jump_open = false;
+static SDL_Rect g_time_jump_rect = { 510, 82, 268, 124 };
+static bool g_time_jump_dragging = false;
+static int  g_time_jump_drag_off_x = 0;
+static int  g_time_jump_drag_off_y = 0;
+static char g_time_jump_buf[32] = "";
+static bool g_video_pinned_global = false;
+static SDL_Window   *g_video_ext_win = NULL;
+static SDL_Renderer *g_video_ext_ren = NULL;
+static SDL_Texture  *g_video_ext_tex = NULL;
+static int           g_video_ext_tex_w = 0;
+static int           g_video_ext_tex_h = 0;
+#endif
+
 // Anchor indices for standard Shift+Click range selection on tracks and clips
 #ifndef DAW_SHARED_STABILITY_VARS_DEFINED
 #define DAW_SHARED_STABILITY_VARS_DEFINED
@@ -490,10 +517,9 @@ static void init_default_saved_themes(void) {
         return;
     }
     g_theme_defaults_initialized = true;
-    static const struct { const char *name; uint8_t r, g, b, a; } defs[] = {
+    static const struct { const char *name; uint8_t r, g, b, a; } defs[NUM_INBUILT_THEMES] = {
         { "Default Orange", 205, 138,  72, 255 },
-        { "Emerald Green",   77, 191,  59, 130 },
-        { "Forest Green",    77, 191,  59, 255 },
+        { "Emerald Green",   77, 191,  59, 255 },
         { "Studio Blue",     68, 150, 235, 255 },
         { "Royal Purple",   162,  98, 232, 255 },
         { "Crimson Red",    224,  78,  78, 255 },
@@ -675,6 +701,16 @@ typedef enum {
     ACT_TOOLS_OPEN_THEMES,
     ACT_EDIT_TRACK_COLOR,
     ACT_EDIT_PEAKS_COLOR,
+    ACT_SETTINGS_OPEN_MOUSE,
+    ACT_TRANSPORT_Toggle_RECORD_ARM_ON_OFF,
+    ACT_TRANSPORT_JUMP_TO_TIME_POPUP,
+    ACT_TRACK_MASTER_MUTE_ALL,
+    ACT_TRACK_MASTER_SOLO_ALL,
+    ACT_VIDEO_TOGGLE_GLOBAL_PIN,
+    ACT_NAV_FRAME_RIGHT,
+    ACT_NAV_FRAME_LEFT,
+    ACT_NAV_5SEC_RIGHT,
+    ACT_NAV_5SEC_LEFT,
 
     // User-imported custom script action (dynamic)
     ACT_USER_IMPORTED_SCRIPT
@@ -763,6 +799,11 @@ static void daw_set_playhead_seconds(ProjectTab *p, double new_sec);
 static float get_min_zoom_pps(ProjectTab *p, int view_w);
 static void open_clip_properties_window(ProjectTab *p, int win_w, int win_h);
 static void open_color_picker_dialog(int target_mode);
+static double get_project_step_fps(ProjectTab *p);
+static void toggle_master_mute_all_tracks(ProjectTab *p);
+static void toggle_master_solo_all_tracks(ProjectTab *p);
+static void toggle_video_global_pin_state(ProjectTab *p, SDL_Window *main_win);
+static void open_time_jump_popup(ProjectTab *p, int win_w, int win_h);
 static void request_open_project_with_save_prompt(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
 static void scan_scripts_directory_to_actions(DawEngine *daw);
 static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win, int act_idx);
@@ -1091,6 +1132,7 @@ static void write_shortcuts_json_to_stream(FILE *f) {
             (int)g_theme.r, (int)g_theme.g, (int)g_theme.b, (double)g_theme.a / 255.0);
     fprintf(f, "    \"argb_hex\": \"#%02X%02X%02X%02X\",\n",
             (unsigned int)g_theme.a, (unsigned int)g_theme.r, (unsigned int)g_theme.g, (unsigned int)g_theme.b);
+    fprintf(f, "    \"universal_peak_color_idx\": %d,\n", g_universal_peak_color_idx);
     fprintf(f, "    \"saved_themes\": [\n");
     for (int t = 0; t < g_theme.num_saved; t++) {
         char esc_tname[128];
@@ -1159,7 +1201,10 @@ static void write_shortcuts_json_to_stream(FILE *f) {
     fprintf(f, "    \"export_format\": %d,\n", (int)g_export.format);
     fprintf(f, "    \"export_wav_bits\": %d,\n", g_export.wav_bit_depth);
     fprintf(f, "    \"export_mp3_kbps\": %d,\n", g_export.mp3_bitrate);
-    fprintf(f, "    \"export_two_pass\": %s\n", g_export.two_pass_render ? "true" : "false");
+    fprintf(f, "    \"export_two_pass\": %s,\n", g_export.two_pass_render ? "true" : "false");
+    fprintf(f, "    \"universal_peak_color_idx\": %d,\n", g_universal_peak_color_idx);
+    fprintf(f, "    \"mouse_click_empty_moves_playhead\": %s,\n", g_mouse_click_empty_moves_playhead ? "true" : "false");
+    fprintf(f, "    \"mouse_click_universal_moves_playhead\": %s\n", g_mouse_click_universal_moves_playhead ? "true" : "false");
     fprintf(f, "  }\n");
     fprintf(f, "}\n");
 }
@@ -1199,6 +1244,7 @@ static void write_themes_json_to_stream(FILE *f) {
             (int)g_theme.r, (int)g_theme.g, (int)g_theme.b, (double)g_theme.a / 255.0);
     fprintf(f, "  \"argb_hex\": \"#%02X%02X%02X%02X\",\n",
             (unsigned int)g_theme.a, (unsigned int)g_theme.r, (unsigned int)g_theme.g, (unsigned int)g_theme.b);
+    fprintf(f, "  \"universal_peak_color_idx\": %d,\n", g_universal_peak_color_idx);
     fprintf(f, "  \"saved_themes\": [\n");
     for (int t = 0; t < g_theme.num_saved; t++) {
         char esc_tname[128];
@@ -1444,15 +1490,21 @@ static void parse_theme_json_block(const char *blk_start, const char *blk_end) {
     g_theme.a = (uint8_t)a;
     theme_rgb_to_hsv(g_theme.r, g_theme.g, g_theme.b, &g_theme.h, &g_theme.s, &g_theme.v);
     sync_theme_code_string();
+    int upk = json_extract_int_field(blk_start, blk_end, "universal_peak_color_idx", g_universal_peak_color_idx);
+    if (upk >= 0 && upk < NUM_STUDIO_COLORS) g_universal_peak_color_idx = upk;
+
+    // Always keep the 6 inbuilt themes locked at indices 0..5, and append any extra custom saved themes at >= 6
+    g_theme_defaults_initialized = false;
+    g_theme.num_saved = 0;
+    init_default_saved_themes();
 
     const char *st_sec = strstr(blk_start, "\"saved_themes\"");
     if (st_sec && st_sec < blk_end) {
         const char *arr_o = strchr(st_sec, '[');
         const char *arr_c = arr_o ? strchr(arr_o, ']') : NULL;
         if (arr_o && arr_c && arr_c <= blk_end) {
-            int loaded_cnt = 0;
             const char *cur = arr_o + 1;
-            while (cur < arr_c && loaded_cnt < MAX_SAVED_THEMES) {
+            while (cur < arr_c && g_theme.num_saved < MAX_SAVED_THEMES) {
                 const char *os = strchr(cur, '{');
                 if (!os || os >= arr_c) break;
                 const char *oe = strchr(os, '}');
@@ -1464,18 +1516,25 @@ static void parse_theme_json_block(const char *blk_start, const char *blk_end) {
                 int tb = json_extract_int_field(os, oe, "b", 72);
                 int ta = json_extract_int_field(os, oe, "a", 255);
                 if (tname[0] != '\0') {
-                    SavedThemeEntry * dst = &g_theme.saved[loaded_cnt++];
-                    strncpy(dst->name, tname, sizeof(dst->name) - 1);
-                    dst->name[sizeof(dst->name) - 1] = '\0';
-                    dst->r = (uint8_t)(tr < 0 ? 0 : (tr > 255 ? 255 : tr));
-                    dst->g = (uint8_t)(tg < 0 ? 0 : (tg > 255 ? 255 : tg));
-                    dst->b = (uint8_t)(tb < 0 ? 0 : (tb > 255 ? 255 : tb));
-                    dst->a = (uint8_t)(ta < 0 ? 0 : (ta > 255 ? 255 : ta));
+                    bool is_inbuilt = false;
+                    for (int ib = 0; ib < NUM_INBUILT_THEMES; ib++) {
+                        if (strcmp(g_theme.saved[ib].name, tname) == 0 ||
+                            strcmp(tname, "Forest Green") == 0) {
+                            is_inbuilt = true;
+                            break;
+                        }
+                    }
+                    if (!is_inbuilt) {
+                        SavedThemeEntry *dst = &g_theme.saved[g_theme.num_saved++];
+                        strncpy(dst->name, tname, sizeof(dst->name) - 1);
+                        dst->name[sizeof(dst->name) - 1] = '\0';
+                        dst->r = (uint8_t)(tr < 0 ? 0 : (tr > 255 ? 255 : tr));
+                        dst->g = (uint8_t)(tg < 0 ? 0 : (tg > 255 ? 255 : tg));
+                        dst->b = (uint8_t)(tb < 0 ? 0 : (tb > 255 ? 255 : tb));
+                        dst->a = (uint8_t)(ta < 0 ? 0 : (ta > 255 ? 255 : ta));
+                    }
                 }
                 cur = oe + 1;
-            }
-            if (loaded_cnt > 0) {
-                g_theme.num_saved = loaded_cnt;
             }
         }
     }
@@ -1707,6 +1766,10 @@ static bool load_keyboard_shortcuts_json(void) {
         g_export.wav_bit_depth   = json_extract_int_field(app_sec, app_end, "export_wav_bits", g_export.wav_bit_depth);
         g_export.mp3_bitrate     = json_extract_int_field(app_sec, app_end, "export_mp3_kbps", g_export.mp3_bitrate);
         g_export.two_pass_render = json_extract_bool_field(app_sec, app_end, "export_two_pass", g_export.two_pass_render);
+        int app_upk = json_extract_int_field(app_sec, app_end, "universal_peak_color_idx", g_universal_peak_color_idx);
+        if (app_upk >= 0 && app_upk < NUM_STUDIO_COLORS) g_universal_peak_color_idx = app_upk;
+        g_mouse_click_empty_moves_playhead = json_extract_bool_field(app_sec, app_end, "mouse_click_empty_moves_playhead", g_mouse_click_empty_moves_playhead);
+        g_mouse_click_universal_moves_playhead = json_extract_bool_field(app_sec, app_end, "mouse_click_universal_moves_playhead", g_mouse_click_universal_moves_playhead);
         char exp_dir[512] = {0}, exp_fn[128] = {0};
         if (json_extract_string_field(app_sec, app_end, "export_directory", exp_dir, sizeof(exp_dir)) && exp_dir[0]) {
             strncpy(g_export.directory, exp_dir, sizeof(g_export.directory) - 1);
@@ -2207,11 +2270,23 @@ static void init_keyboard_actions_system(void) {
 
     // ---- TRANSPORT & EDITING (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_TRANSPORT_PLAY_STOP,
-        "Transport: Play/stop",
+        "Transport: Play/Pause (near left of Time Clock)",
         "Space", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TRANSPORT_RECORD,
-        "Tools: Record (Transport: Record)",
+        "Transport: Record (requires Record ON/OFF switch ON)",
         "R", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_NAV_FRAME_RIGHT,
+        "View: Move cursor right one frame",
+        "Right", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_NAV_FRAME_LEFT,
+        "View: Move cursor left one frame",
+        "Left", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_NAV_5SEC_RIGHT,
+        "View: Move cursor right 5 seconds",
+        "Ctrl+Right", NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_NAV_5SEC_LEFT,
+        "View: Move cursor left 5 seconds",
+        "Ctrl+Left", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TRANSPORT_GO_TO_START,
         "Transport: Go to start of project",
         "Home", NULL, NULL, NULL, false, false);
@@ -2240,7 +2315,7 @@ static void init_keyboard_actions_system(void) {
         "Edit: Select all",
         "Ctrl+A", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_VIEW_SHOW_ACTION_LIST,
-        "Action: Keyboard Shortcut (Show action list)",
+        "Settings: Keyboard Shortcut (Show action list)",
         "Shift+?", NULL, NULL, NULL, false, false);
 
     // ---- ALL MENU, SUBMENU, BUTTON & TIMELINE ACTIONS (No default shortcut added unless already assigned; user can add manually) ----
@@ -2273,8 +2348,13 @@ static void init_keyboard_actions_system(void) {
     register_builtin_action(ACT_VIEW_SHOW_HISTORY_WINDOW,
         "Tools: History (Project History)",
         NULL, NULL, NULL, NULL, false, false);
+
+    // Settings Menu (Keyboard Shortcut, Themes, Mouse)
     register_builtin_action(ACT_TOOLS_OPEN_THEMES,
-        "Tools: Themes (ARGB Color Settings)",
+        "Settings: Themes (ARGB Color Settings)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_SETTINGS_OPEN_MOUSE,
+        "Settings: Mouse (Playhead Click Behavior)",
         NULL, NULL, NULL, NULL, false, false);
 
     // Edit Menu
@@ -2282,7 +2362,24 @@ static void init_keyboard_actions_system(void) {
         "Edit: Track color",
         NULL, NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_EDIT_PEAKS_COLOR,
-        "Edit: Peaks Color",
+        "Edit: Peaks Color (Universal Software Peaks Color)",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Top Bar Record ON/OFF, Time Clock Jump, Video Global Pin, Master M/S
+    register_builtin_action(ACT_TRANSPORT_Toggle_RECORD_ARM_ON_OFF,
+        "Transport: Toggle Record ON/OFF Switch",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRANSPORT_JUMP_TO_TIME_POPUP,
+        "Transport: Jump to Time Popup (Double-click Time Clock)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIDEO_TOGGLE_GLOBAL_PIN,
+        "Video: Toggle Pin Video Window Globally (Outside App)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_MASTER_MUTE_ALL,
+        "Track: Master Mute All Tracks (M next to + Track)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_MASTER_SOLO_ALL,
+        "Track: Master Solo All Tracks (S next to + Track)",
         NULL, NULL, NULL, NULL, false, false);
 
     // Top Bar & Corner Header Buttons
@@ -5141,7 +5238,65 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_TRANSPORT_RECORD: {
-            start_or_stop_recording(p, ren, win);
+            if (g_rec_master_enabled) {
+                start_or_stop_recording(p, ren, win);
+            } else {
+                record_project_change("Record is OFF (Turn ON switch next to Record)", false);
+            }
+            break;
+        }
+        case ACT_TRANSPORT_Toggle_RECORD_ARM_ON_OFF: {
+            g_rec_master_enabled = !g_rec_master_enabled;
+            if (!g_rec_master_enabled && g_rec.is_recording) {
+                start_or_stop_recording(p, ren, win);
+            }
+            record_project_change(g_rec_master_enabled ? "Record Switch: ON" : "Record Switch: OFF", false);
+            break;
+        }
+        case ACT_TRANSPORT_JUMP_TO_TIME_POPUP: {
+            open_time_jump_popup(p, win_w, win_h);
+            break;
+        }
+        case ACT_SETTINGS_OPEN_MOUSE: {
+            g_mouse_settings_open = !g_mouse_settings_open;
+            if (g_mouse_settings_open) {
+                g_mouse_win_rect.x = (win_w - g_mouse_win_rect.w) / 2;
+                g_mouse_win_rect.y = (win_h - g_mouse_win_rect.h) / 2;
+            }
+            break;
+        }
+        case ACT_VIDEO_TOGGLE_GLOBAL_PIN: {
+            toggle_video_global_pin_state(p, win);
+            break;
+        }
+        case ACT_TRACK_MASTER_MUTE_ALL: {
+            toggle_master_mute_all_tracks(p);
+            break;
+        }
+        case ACT_TRACK_MASTER_SOLO_ALL: {
+            toggle_master_solo_all_tracks(p);
+            break;
+        }
+        case ACT_NAV_FRAME_RIGHT: {
+            double fps = get_project_step_fps(p);
+            daw_set_playhead_seconds(p, p->playhead_seconds + (1.0 / fps));
+            ensure_playhead_visible_in_viewport(p, view_w);
+            break;
+        }
+        case ACT_NAV_FRAME_LEFT: {
+            double fps = get_project_step_fps(p);
+            daw_set_playhead_seconds(p, fmax(0.0, p->playhead_seconds - (1.0 / fps)));
+            ensure_playhead_visible_in_viewport(p, view_w);
+            break;
+        }
+        case ACT_NAV_5SEC_RIGHT: {
+            daw_set_playhead_seconds(p, p->playhead_seconds + 5.0);
+            ensure_playhead_visible_in_viewport(p, view_w);
+            break;
+        }
+        case ACT_NAV_5SEC_LEFT: {
+            daw_set_playhead_seconds(p, fmax(0.0, p->playhead_seconds - 5.0));
+            ensure_playhead_visible_in_viewport(p, view_w);
             break;
         }
         case ACT_TRANSPORT_GO_TO_START: {
