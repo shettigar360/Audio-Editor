@@ -19,6 +19,200 @@
 #include <sys/stat.h>
 #endif
 
+#ifndef DAW_TEXT_EDIT_HELPER_DEFINED
+#define DAW_TEXT_EDIT_HELPER_DEFINED
+typedef struct {
+    char *active_buf;
+    int cursor_pos;
+    bool select_all;
+} DawTextEditState;
+
+static DawTextEditState g_text_edit = { NULL, 0, false };
+
+static inline void daw_text_edit_focus_buf(char *buf, bool select_all_init) {
+    if (!buf) {
+        g_text_edit.active_buf = NULL;
+        g_text_edit.cursor_pos = 0;
+        g_text_edit.select_all = false;
+        return;
+    }
+    g_text_edit.active_buf = buf;
+    g_text_edit.cursor_pos = (int)strlen(buf);
+    g_text_edit.select_all = select_all_init;
+}
+
+static inline void daw_text_edit_sync_buf(char *buf) {
+    if (!buf) return;
+    int len = (int)strlen(buf);
+    if (g_text_edit.active_buf != buf) {
+        g_text_edit.active_buf = buf;
+        g_text_edit.cursor_pos = len;
+        g_text_edit.select_all = false;
+    } else {
+        if (g_text_edit.cursor_pos < 0) g_text_edit.cursor_pos = 0;
+        if (g_text_edit.cursor_pos > len) g_text_edit.cursor_pos = len;
+    }
+}
+
+static inline void daw_text_edit_click_cursor(char *buf, int mx, int text_start_x) {
+    if (!buf) return;
+    int len = (int)strlen(buf);
+    g_text_edit.active_buf = buf;
+    g_text_edit.select_all = false;
+    int pos = (mx - text_start_x + 4) / 8;
+    if (pos < 0) pos = 0;
+    if (pos > len) pos = len;
+    g_text_edit.cursor_pos = pos;
+}
+
+static inline void daw_text_edit_insert_text(char *buf, size_t max_len, const char *ins) {
+    if (!buf || !ins || max_len == 0) return;
+    daw_text_edit_sync_buf(buf);
+    if (g_text_edit.select_all) {
+        buf[0] = '\0';
+        g_text_edit.cursor_pos = 0;
+        g_text_edit.select_all = false;
+    }
+    size_t cur_len = strlen(buf);
+    size_t add_len = strlen(ins);
+    if (add_len == 0) return;
+    if ((size_t)g_text_edit.cursor_pos > cur_len) g_text_edit.cursor_pos = (int)cur_len;
+    if (cur_len >= max_len) return;
+    if (cur_len + add_len > max_len) {
+        add_len = max_len - cur_len;
+    }
+    memmove(buf + g_text_edit.cursor_pos + add_len,
+            buf + g_text_edit.cursor_pos,
+            cur_len - (size_t)g_text_edit.cursor_pos + 1);
+    memcpy(buf + g_text_edit.cursor_pos, ins, add_len);
+    g_text_edit.cursor_pos += (int)add_len;
+}
+
+static inline bool daw_text_edit_handle_keydown(char *buf, size_t max_len, SDL_Keycode sym, SDL_Keymod mod) {
+    if (!buf || max_len == 0) return false;
+    daw_text_edit_sync_buf(buf);
+    int len = (int)strlen(buf);
+    bool ctrl = (mod & KMOD_CTRL) != 0;
+
+    if (ctrl) {
+        if (sym == SDLK_a) {
+            g_text_edit.select_all = true;
+            g_text_edit.cursor_pos = len;
+            return true;
+        }
+        if (sym == SDLK_c) {
+            SDL_SetClipboardText(buf);
+            return true;
+        }
+        if (sym == SDLK_x) {
+            SDL_SetClipboardText(buf);
+            buf[0] = '\0';
+            g_text_edit.cursor_pos = 0;
+            g_text_edit.select_all = false;
+            return true;
+        }
+        if (sym == SDLK_v) {
+            if (SDL_HasClipboardText()) {
+                char *clip = SDL_GetClipboardText();
+                if (clip) {
+                    char clean[512];
+                    size_t j = 0;
+                    for (size_t i = 0; clip[i] != '\0' && j + 1 < sizeof(clean); i++) {
+                        if (clip[i] != '\r' && clip[i] != '\n') {
+                            clean[j++] = clip[i];
+                        }
+                    }
+                    clean[j] = '\0';
+                    daw_text_edit_insert_text(buf, max_len, clean);
+                    SDL_free(clip);
+                }
+            }
+            return true;
+        }
+    }
+
+    if (sym == SDLK_LEFT) {
+        if (g_text_edit.select_all) {
+            g_text_edit.select_all = false;
+            g_text_edit.cursor_pos = 0;
+        } else if (g_text_edit.cursor_pos > 0) {
+            g_text_edit.cursor_pos--;
+        }
+        return true;
+    }
+    if (sym == SDLK_RIGHT) {
+        if (g_text_edit.select_all) {
+            g_text_edit.select_all = false;
+            g_text_edit.cursor_pos = len;
+        } else if (g_text_edit.cursor_pos < len) {
+            g_text_edit.cursor_pos++;
+        }
+        return true;
+    }
+    if (sym == SDLK_HOME) {
+        g_text_edit.select_all = false;
+        g_text_edit.cursor_pos = 0;
+        return true;
+    }
+    if (sym == SDLK_END) {
+        g_text_edit.select_all = false;
+        g_text_edit.cursor_pos = len;
+        return true;
+    }
+    if (sym == SDLK_BACKSPACE) {
+        if (g_text_edit.select_all) {
+            buf[0] = '\0';
+            g_text_edit.cursor_pos = 0;
+            g_text_edit.select_all = false;
+        } else if (g_text_edit.cursor_pos > 0 && len > 0) {
+            memmove(buf + g_text_edit.cursor_pos - 1,
+                    buf + g_text_edit.cursor_pos,
+                    (size_t)(len - g_text_edit.cursor_pos + 1));
+            g_text_edit.cursor_pos--;
+        }
+        return true;
+    }
+    if (sym == SDLK_DELETE) {
+        if (g_text_edit.select_all) {
+            buf[0] = '\0';
+            g_text_edit.cursor_pos = 0;
+            g_text_edit.select_all = false;
+        } else if (g_text_edit.cursor_pos < len) {
+            memmove(buf + g_text_edit.cursor_pos,
+                    buf + g_text_edit.cursor_pos + 1,
+                    (size_t)(len - g_text_edit.cursor_pos));
+        }
+        return true;
+    }
+    return false;
+}
+
+static inline void daw_draw_text_edit_overlay(SDL_Renderer *ren, char *buf, int text_x, int box_y, int box_h, int max_x) {
+    if (!ren || !buf) return;
+    daw_text_edit_sync_buf(buf);
+    int len = (int)strlen(buf);
+    if (g_text_edit.select_all && len > 0) {
+        int sel_w = len * 8 + 2;
+        if (text_x + sel_w > max_x) sel_w = max_x - text_x;
+        if (sel_w > 0) {
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+            SDL_Rect sel_r = { text_x - 1, box_y + 3, sel_w, box_h - 6 };
+            SDL_SetRenderDrawColor(ren, 55, 125, 225, 110);
+            SDL_RenderFillRect(ren, &sel_r);
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        }
+    }
+    if ((SDL_GetTicks() / 450) % 2 == 0) {
+        int cx = text_x + g_text_edit.cursor_pos * 8;
+        if (cx > max_x) cx = max_x;
+        if (cx >= text_x) {
+            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+            SDL_RenderDrawLine(ren, cx, box_y + 4, cx, box_y + box_h - 4);
+        }
+    }
+}
+#endif // DAW_TEXT_EDIT_HELPER_DEFINED
+
 #ifndef DAW_THEME_STATE_DEFINED
 #define DAW_THEME_STATE_DEFINED
 
@@ -4566,7 +4760,12 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_VIEW_TOGGLE_VIDEO_WINDOW: {
-            p->video.is_open = !p->video.is_open;
+            if (p->video.is_open) {
+                close_video(&p->video);
+                p->video.is_open = false;
+            } else {
+                p->video.is_open = true;
+            }
             break;
         }
         case ACT_VIEW_TOGGLE_MARKER_LANE: {
@@ -5643,23 +5842,19 @@ static bool handle_action_window_keydown(ProjectTab *p, SDL_Renderer *ren, SDL_W
         return true;
     }
 
-    // 3. Filter text box typing focus
+    // 3. Filter text box typing focus (supports Ctrl+A/C/X/V, Left/Right/Home/End, Backspace/Delete)
     if (g_action_win.filter_focused) {
-        if (sym == SDLK_ESCAPE || sym == SDLK_RETURN) {
+        if (sym == SDLK_ESCAPE || sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
             g_action_win.filter_focused = false;
             SDL_StopTextInput();
             return true;
         }
-        if (sym == SDLK_BACKSPACE) {
-            size_t l = strlen(g_action_win.filter_text);
-            if (l > 0) {
-                g_action_win.filter_text[l - 1] = '\0';
-                g_action_win.scroll_y = 0;
-                refresh_filtered_actions();
-                if (g_action_win.num_filtered > 0) {
-                    g_action_win.selected_action_idx = g_action_win.filtered_indices[0];
-                    g_action_win.selected_shortcut_sub = 0;
-                }
+        if (daw_text_edit_handle_keydown(g_action_win.filter_text, sizeof(g_action_win.filter_text) - 1, sym, mod)) {
+            g_action_win.scroll_y = 0;
+            refresh_filtered_actions();
+            if (g_action_win.num_filtered > 0) {
+                g_action_win.selected_action_idx = g_action_win.filtered_indices[0];
+                g_action_win.selected_shortcut_sub = 0;
             }
             return true;
         }
@@ -5727,6 +5922,7 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
     if (my >= wy + 38 && my <= wy + 64) {
         if (mx >= wx + 58 && mx <= wx + 366) {
             g_action_win.filter_focused = true;
+            daw_text_edit_click_cursor(g_action_win.filter_text, mx, wx + 64);
             SDL_StartTextInput();
         } else if (mx >= wx + 372 && mx <= wx + 434) {
             // [Clear]
@@ -5898,14 +6094,10 @@ static void render_action_window(SDL_Renderer *ren) {
     draw_brown_border_rect(ren, &flt_box, g_action_win.filter_focused, false);
 
     SDL_Rect flt_clip = { flt_box.x + 4, flt_box.y + 2, flt_box.w - 8, flt_box.h - 4 };
-    draw_text_clipped(ren, g_action_win.filter_text, flt_box.x + 6, wy + 45, c_white, &flt_clip, NULL);
-    if (g_action_win.filter_focused && ((SDL_GetTicks() / 450) % 2 == 0)) {
-        int cx = flt_box.x + 6 + (int)strlen(g_action_win.filter_text) * 8;
-        if (cx < flt_box.x + flt_box.w - 4) {
-            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-            SDL_RenderDrawLine(ren, cx, wy + 43, cx, wy + 59);
-        }
+    if (g_action_win.filter_focused) {
+        daw_draw_text_edit_overlay(ren, g_action_win.filter_text, flt_box.x + 6, flt_box.y, flt_box.h, flt_box.x + flt_box.w - 4);
     }
+    draw_text_clipped(ren, g_action_win.filter_text, flt_box.x + 6, wy + 45, c_white, &flt_clip, NULL);
 
     SDL_Rect btn_clear = { wx + 372, wy + 38, 62, 26 };
     SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
