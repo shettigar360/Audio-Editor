@@ -202,7 +202,7 @@ static RecordingEngineState g_rec = {
     0, -1, 0.0, 0, 0,
     NULL, NULL,
     "", "",
-    "Recordings",
+    "Temporary Media",
     0.0f, 0.0f, 0, 0, 0,
     false
 };
@@ -217,22 +217,22 @@ static inline void init_default_recording_folder(void) {
             base[--blen] = '\0';
         }
 #ifdef _WIN32
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Recordings", base);
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Temporary Media", base);
         CreateDirectoryA(g_rec.folder_path, NULL);
-        CreateDirectoryA("Recordings", NULL);
+        CreateDirectoryA("Temporary Media", NULL);
 #else
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s/Recordings", base);
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s/Temporary Media", base);
         mkdir(g_rec.folder_path, 0777);
-        mkdir("Recordings", 0777);
+        mkdir("Temporary Media", 0777);
 #endif
         SDL_free(base);
     } else {
         if (base) SDL_free(base);
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "Recordings");
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "Temporary Media");
 #ifdef _WIN32
-        CreateDirectoryA("Recordings", NULL);
+        CreateDirectoryA("Temporary Media", NULL);
 #else
-        mkdir("Recordings", 0777);
+        mkdir("Temporary Media", 0777);
 #endif
     }
 }
@@ -483,8 +483,13 @@ static inline SDL_Color get_theme_accent_sdl_color(void) {
     SDL_Color c = { (Uint8)ar, (Uint8)ag, (Uint8)ab, 255 };
     return c;
 }
+static bool g_theme_defaults_initialized = false;
 static void init_default_saved_themes(void) {
-    if (g_theme.num_saved > 0) return;
+    if (g_theme_defaults_initialized || g_theme.num_saved > 0) {
+        g_theme_defaults_initialized = true;
+        return;
+    }
+    g_theme_defaults_initialized = true;
     static const struct { const char *name; uint8_t r, g, b, a; } defs[] = {
         { "Default Orange", 205, 138,  72, 255 },
         { "Emerald Green",   77, 191,  59, 130 },
@@ -666,6 +671,10 @@ typedef enum {
     ACT_FILE_SAVE_PROJECT_AS,
     ACT_FILE_IMPORT_MEDIA,
     ACT_FILE_EXPORT_MEDIA,
+    ACT_ACTION_OPEN_SCRIPTS,
+    ACT_TOOLS_OPEN_THEMES,
+    ACT_EDIT_TRACK_COLOR,
+    ACT_EDIT_PEAKS_COLOR,
 
     // User-imported custom script action (dynamic)
     ACT_USER_IMPORTED_SCRIPT
@@ -2135,7 +2144,7 @@ static void init_keyboard_actions_system(void) {
         "Item: Nudge items volume -1dB",
         "Ctrl+Shift+-", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_ITEM_SET_CUSTOM_COLOR,
-        "Item: Set to custom color...",
+        "Edit: Clip color (Item: Set to custom color...)",
         "Ctrl+Alt+Shift+C", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_ITEM_MOVE_UP_TRACK,
         "Item: Move selected clip(s) up one track",
@@ -2144,13 +2153,13 @@ static void init_keyboard_actions_system(void) {
         "Item: Move selected clip(s) down one track",
         "2", "Num 2", NULL, NULL, false, false);
     register_builtin_action(ACT_ITEM_DYNAMIC_SPLIT,
-        "Item: Dynamic split items...",
+        "Action: Dynamic split (Item: Dynamic split items...)",
         "Ctrl+D", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_ITEM_JOIN_GLUE,
-        "Item: Join (glue) selected items",
+        "Edit: Join (Glue) selected items",
         "J", "Ctrl+J", NULL, NULL, false, false);
     register_builtin_action(ACT_ITEM_SHOW_PROPERTIES,
-        "Item: Show selected clip properties...",
+        "Tools: Clip properties",
         "Ctrl+I", "Ctrl+=", NULL, NULL, false, false);
 
     // ---- TRACK CONTROLS & TAB MANAGEMENT (Basic Shortcut.pdf) ----
@@ -2169,7 +2178,7 @@ static void init_keyboard_actions_system(void) {
 
     // ---- SWS & CUSTOM LUA SCRIPTS (Basic Shortcut.pdf) ----
     register_builtin_action(ACT_SWS_REPOSITION_ITEMS,
-        "Xenakios/SWS: Reposition selected items...",
+        "Action: Reposition (Xenakios/SWS: Reposition selected items...)",
         "W", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_SWS_SCROLL_TRACK_VIEW_DOWN_PAGE,
         "Xenakios/SWS: Scroll track view down (page)",
@@ -2201,7 +2210,7 @@ static void init_keyboard_actions_system(void) {
         "Transport: Play/stop",
         "Space", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TRANSPORT_RECORD,
-        "Transport: Record",
+        "Tools: Record (Transport: Record)",
         "R", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TRANSPORT_GO_TO_START,
         "Transport: Go to start of project",
@@ -2231,8 +2240,184 @@ static void init_keyboard_actions_system(void) {
         "Edit: Select all",
         "Ctrl+A", NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_VIEW_SHOW_ACTION_LIST,
-        "View: Show action list",
+        "Action: Keyboard Shortcut (Show action list)",
         "Shift+?", NULL, NULL, NULL, false, false);
+
+    // ---- ALL MENU, SUBMENU, BUTTON & TIMELINE ACTIONS (No default shortcut added unless already assigned; user can add manually) ----
+    // File Menu
+    register_builtin_action(ACT_FILE_OPEN_PROJECT,
+        "File: Import Project (.ehs)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_FILE_SAVE_PROJECT,
+        "File: Export Project (.ehs) / Save Project",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_FILE_SAVE_PROJECT_AS,
+        "File: Project Save As",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_FILE_IMPORT_MEDIA,
+        "File: Import Media",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_FILE_EXPORT_MEDIA,
+        "File: Export Media",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Action Menu
+    register_builtin_action(ACT_ACTION_OPEN_SCRIPTS,
+        "Action: Scripts (Script Manager)",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Tools Menu
+    register_builtin_action(ACT_VIEW_TOGGLE_MARKER_LANE,
+        "Tools: Marker (Toggle Marker Lane)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIEW_SHOW_HISTORY_WINDOW,
+        "Tools: History (Project History)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TOOLS_OPEN_THEMES,
+        "Tools: Themes (ARGB Color Settings)",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Edit Menu
+    register_builtin_action(ACT_EDIT_TRACK_COLOR,
+        "Edit: Track color",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_EDIT_PEAKS_COLOR,
+        "Edit: Peaks Color",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Top Bar & Corner Header Buttons
+    register_builtin_action(ACT_VIEW_TOGGLE_VIDEO_WINDOW,
+        "Video: Toggle Video Monitor",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRANSPORT_TOGGLE_REPEAT_RANGE,
+        "Range: Toggle Cycle Range",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_TOGGLE_CROSSFADE_MODE,
+        "Crossfade: Toggle Crossfade Mode",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIEW_SHOW_HIDE_TRACKS_WINDOW,
+        "Hide: Hide Tracks Window",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_INSERT_NEW,
+        "Track: Add New Track (+ Track)",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Track Control Panel (TCP) Buttons & Track Actions
+    register_builtin_action(ACT_TRACK_TOGGLE_MUTE_SELECTED,
+        "Track: Toggle mute for selected tracks (M)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_NUDGE_VOL_UP,
+        "Track: Nudge track volume +1dB (+)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_NUDGE_VOL_DOWN,
+        "Track: Nudge track volume -1dB (-)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_RESET_VOL_0DB,
+        "Track: Reset selected track volume to 0.0 dB",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_DUPLICATE_SELECTED,
+        "Track: Duplicate selected track",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_REMOVE_SELECTED,
+        "Track: Remove selected track(s)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_SELECT_ALL,
+        "Track: Select all tracks",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_UNSELECT_ALL,
+        "Track: Unselect all tracks",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Clip / Item Editing & Fade Actions
+    register_builtin_action(ACT_ITEM_DUPLICATE_ITEMS,
+        "Item: Duplicate selected items",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_FADE_IN_TO_CURSOR,
+        "Item: Fade in to cursor",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_FADE_OUT_FROM_CURSOR,
+        "Item: Fade out from cursor",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_RESET_FADES,
+        "Item: Reset item fades to 0",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_NORMALIZE_GAIN,
+        "Item: Normalize item gain",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_TRIM_LEFT_TO_CURSOR,
+        "Item: Trim left edge to cursor",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_TRIM_RIGHT_TO_CURSOR,
+        "Item: Trim right edge to cursor",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_SELECT_ALL_ON_TRACK,
+        "Item: Select all items on selected track(s)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_ITEM_UNSELECT_ALL,
+        "Item: Unselect all items",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Marker Actions
+    register_builtin_action(ACT_MARKER_INSERT_AT_CURSOR,
+        "Markers: Insert marker at current position",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_MARKER_NEXT,
+        "Markers: Go to next marker",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_MARKER_PREV,
+        "Markers: Go to previous marker",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_MARKER_DELETE_NEAREST,
+        "Markers: Delete selected or nearest marker",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Cycle Range / Loop Actions
+    register_builtin_action(ACT_LOOP_SET_START_AT_CURSOR,
+        "Range: Set cycle range start at cursor",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_LOOP_SET_END_AT_CURSOR,
+        "Range: Set cycle range end at cursor",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_LOOP_SET_TO_SELECTED_ITEMS,
+        "Range: Set cycle range to selected items",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_LOOP_CLEAR,
+        "Range: Clear cycle range",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // View & Zoom Actions
+    register_builtin_action(ACT_VIEW_ZOOM_SELECTED_ITEMS,
+        "View: Zoom to selected items",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIEW_ZOOM_OUT_PROJECT,
+        "View: Zoom out to full project",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIEW_ZOOM_TIME_SELECTION,
+        "View: Zoom to cycle range selection",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIEW_TRACK_ZOOM_DEFAULT,
+        "View: Reset all track heights to default",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIEW_TRACK_ZOOM_MAX_OVER,
+        "View: Toggle maximum track height",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIEW_TRACK_ZOOM_MIN,
+        "View: Toggle minimum track height",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_VIEW_ALT_TCP_WIDTH,
+        "View: Toggle Track Control Panel (TCP) width",
+        NULL, NULL, NULL, NULL, false, false);
+
+    // Project Tab Actions
+    register_builtin_action(ACT_TAB_SWITCH_PREV,
+        "Project tabs: Switch to previous project tab",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TAB_NEW_PROJECT_TAB,
+        "Project tabs: New Project Tab (+)",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TAB_CLOSE_CURRENT_TAB,
+        "Project tabs: Close Current Tab",
+        NULL, NULL, NULL, NULL, false, false);
 
     if (zv_out_idx >= 0) {
         g_action_win.selected_action_idx = zv_out_idx;
@@ -3897,6 +4082,7 @@ static void execute_script_action_entry(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             }
         }
         if (sel_cnt > 0) {
+            push_undo_state();
             if (all_same_nonzero_grp) {
                 for (int i = 0; i < p->num_items; i++) {
                     if (p->items[i].is_selected || g_item_group_id[tab][i] == first_grp) {
@@ -4543,6 +4729,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_ITEM_TOGGLE_MUTE_FOCUS: {
+            push_undo_state();
             bool any_item_sel = false;
             for (int i = 0; i < p->num_items; i++) {
                 if (p->items[i].is_selected) {
@@ -4563,6 +4750,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_ITEM_NUDGE_VOL_UP_1DB: {
+            push_undo_state();
             bool any_item_sel = false;
             for (int i = 0; i < p->num_items; i++) {
                 if (p->items[i].is_selected) {
@@ -4579,6 +4767,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_ITEM_NUDGE_VOL_DOWN_1DB: {
+            push_undo_state();
             bool any_item_sel = false;
             for (int i = 0; i < p->num_items; i++) {
                 if (p->items[i].is_selected) {
@@ -4594,8 +4783,33 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             record_project_change("Item: Nudge volume -1dB", true);
             break;
         }
+        case ACT_EDIT_TRACK_COLOR: {
+            open_color_picker_dialog(0);
+            break;
+        }
         case ACT_ITEM_SET_CUSTOM_COLOR: {
             open_color_picker_dialog(1);
+            break;
+        }
+        case ACT_EDIT_PEAKS_COLOR: {
+            open_color_picker_dialog(2);
+            break;
+        }
+        case ACT_ACTION_OPEN_SCRIPTS: {
+            scan_scripts_directory_to_actions(&g_daw);
+            save_keyboard_shortcuts_json();
+            refresh_filtered_scripts();
+            g_daw.script_manager_open = !g_daw.script_manager_open;
+            break;
+        }
+        case ACT_TOOLS_OPEN_THEMES: {
+            init_default_saved_themes();
+            sync_theme_code_string();
+            g_theme.is_open = !g_theme.is_open;
+            if (g_theme.is_open) {
+                g_theme.win_rect.x = (win_w - g_theme.win_rect.w) / 2;
+                g_theme.win_rect.y = (win_h - g_theme.win_rect.h) / 2;
+            }
             break;
         }
         case ACT_ITEM_SPLIT_AT_CURSOR: {
@@ -4676,6 +4890,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_ITEM_FADE_IN_TO_CURSOR: {
+            push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
                 if (p->items[i].is_selected && p->playhead_seconds > p->items[i].start_time) {
                     set_item_fade_in(p, i, p->playhead_seconds - p->items[i].start_time);
@@ -4685,6 +4900,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_ITEM_FADE_OUT_FROM_CURSOR: {
+            push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
                 double ie = p->items[i].start_time + p->items[i].duration;
                 if (p->items[i].is_selected && p->playhead_seconds < ie) {
@@ -4695,6 +4911,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_ITEM_RESET_FADES: {
+            push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
                 if (p->items[i].is_selected) {
                     set_item_fade_in(p, i, 0.0);
@@ -4705,6 +4922,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_ITEM_NORMALIZE_GAIN: {
+            push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
                 if (!p->items[i].is_selected) continue;
                 AudioItem *it = &p->items[i];
@@ -4771,6 +4989,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
 
         // ---- TRACK CONTROLS & TAB MANAGEMENT ----
         case ACT_TRACK_TOGGLE_SOLO_SELECTED: {
+            push_undo_state();
             bool any_sel = false;
             for (int t = 0; t < p->num_tracks; t++) {
                 if (p->track_selected[t]) {
@@ -4785,6 +5004,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_TRACK_TOGGLE_MUTE_SELECTED: {
+            push_undo_state();
             for (int t = 0; t < p->num_tracks; t++) {
                 if (p->track_selected[t]) p->tracks[t].mute = !p->tracks[t].mute;
             }
@@ -4840,6 +5060,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_TRACK_NUDGE_VOL_UP: {
+            push_undo_state();
             for (int t = 0; t < p->num_tracks; t++) {
                 if (p->track_selected[t]) p->track_db[t] = fminf(24.0f, p->track_db[t] + 1.0f);
             }
@@ -4847,6 +5068,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_TRACK_NUDGE_VOL_DOWN: {
+            push_undo_state();
             for (int t = 0; t < p->num_tracks; t++) {
                 if (p->track_selected[t]) p->track_db[t] = fmaxf(-60.0f, p->track_db[t] - 1.0f);
             }
@@ -4854,6 +5076,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             break;
         }
         case ACT_TRACK_RESET_VOL_0DB: {
+            push_undo_state();
             for (int t = 0; t < p->num_tracks; t++) {
                 if (p->track_selected[t]) p->track_db[t] = 0.0f;
             }
