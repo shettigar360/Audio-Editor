@@ -1,0 +1,31 @@
+// Windows Executable Icon & Version Info Resource for Audio Track DAW
+1 ICON "app_icon.ico"
+IDI_ICON1 ICON "app_icon.ico"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Audio Track Studio\0"
+            VALUE "FileDescription", "Audio Track\0"
+            VALUE "FileVersion", "1.0.0.0\0"
+            VALUE "InternalName", "Audio Track\0"
+            VALUE "OriginalFilename", "Audio Track.exe\0"
+            VALUE "ProductName", "Audio Track\0"
+            VALUE "ProductVersion", "1.0.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
