@@ -11,6 +11,7 @@
 
 #include <SDL2/SDL.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -220,7 +221,9 @@ extern void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_fil
 
 void init_tab_defaults(int idx, const char *title) {
     ProjectTab *p = &g_daw.tabs[idx];
-    memset(p, 0, sizeof(ProjectTab));
+    memset(p, 0, offsetof(ProjectTab, undo_mgr));
+    p->undo_mgr.head = -1;
+    p->undo_mgr.count = 0;
     snprintf(p->project_name, sizeof(p->project_name), "%s", title);
     p->num_tracks = 4;
     p->pixels_per_second = 80.0f;
