@@ -9,16 +9,306 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <math.h>
 #include <time.h>
 #include <ctype.h>
 
 #include "font.h"
+#ifndef DAW_FAST_FONT_ATLAS_DEFINED
+#define DAW_FAST_FONT_ATLAS_DEFINED
+static SDL_Renderer *g_daw_font_atlas_ren = NULL;
+static SDL_Texture  *g_daw_font_atlas_tex = NULL;
+
+static inline void daw_ensure_font_atlas_tex(SDL_Renderer *ren) {
+    if (!ren) return;
+    if (g_daw_font_atlas_ren == ren && g_daw_font_atlas_tex != NULL) return;
+    static uint32_t atlas_px[95 * 8 * 12];
+    static bool bitmap_built = false;
+    if (!bitmap_built) {
+        for (int i = 0; i < 95 * 8 * 12; i++) atlas_px[i] = 0x00000000U;
+        for (int g = 0; g < 95; g++) {
+            for (int row = 0; row < 12; row++) {
+                unsigned short bits = FONT_BITMAP[g][row];
+                for (int col = 0; col < 8; col++) {
+                    if (bits & (0x80 >> col)) {
+                        atlas_px[row * (95 * 8) + g * 8 + col] = 0xFFFFFFFFU;
+                    }
+                }
+            }
+        }
+        bitmap_built = true;
+    }
+    if (g_daw_font_atlas_ren == NULL) {
+        SDL_Surface *surf = SDL_CreateRGBSurfaceFrom(
+            atlas_px, 95 * 8, 12, 32, (95 * 8) * 4,
+            0x00FF0000U, 0x0000FF00U, 0x000000FFU, 0xFF000000U
+        );
+        if (surf) {
+            SDL_Texture *tex = SDL_CreateTextureFromSurface(ren, surf);
+            SDL_FreeSurface(surf);
+            if (tex) {
+                SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+                g_daw_font_atlas_ren = ren;
+                g_daw_font_atlas_tex = tex;
+            }
+        }
+    }
+}
+
+static inline void daw_fast_draw_text(SDL_Renderer *ren, const char *str, int x, int y, SDL_Color color) {
+    if (!str || !ren) return;
+    if (!g_daw_font_atlas_tex) {
+        daw_ensure_font_atlas_tex(ren);
+    }
+    if (g_daw_font_atlas_tex && g_daw_font_atlas_ren == ren) {
+        SDL_SetTextureColorMod(g_daw_font_atlas_tex, color.r, color.g, color.b);
+        SDL_SetTextureAlphaMod(g_daw_font_atlas_tex, color.a);
+        int cur_x = x;
+        while (*str) {
+            unsigned char ch = (unsigned char)*str++;
+            if (ch > 32 && ch <= 126) {
+                SDL_Rect src_r = { ((int)ch - 32) * 8, 0, 8, 12 };
+                SDL_Rect dst_r = { cur_x, y, 8, 12 };
+                SDL_RenderCopy(ren, g_daw_font_atlas_tex, &src_r, &dst_r);
+            }
+            cur_x += 8;
+        }
+        return;
+    }
+    draw_text(ren, str, x, y, color);
+}
+#define draw_text daw_fast_draw_text
+#endif
+
+#ifndef DAW_TEXT_EDIT_HELPER_DEFINED
+#define DAW_TEXT_EDIT_HELPER_DEFINED
+typedef struct {
+    char *active_buf;
+    int cursor_pos;
+    bool select_all;
+} DawTextEditState;
+
+static DawTextEditState g_text_edit = { NULL, 0, false };
+
+static inline void daw_text_edit_focus_buf(char *buf, bool select_all_init) {
+    if (!buf) {
+        g_text_edit.active_buf = NULL;
+        g_text_edit.cursor_pos = 0;
+        g_text_edit.select_all = false;
+        return;
+    }
+    g_text_edit.active_buf = buf;
+    g_text_edit.cursor_pos = (int)strlen(buf);
+    g_text_edit.select_all = select_all_init;
+}
+
+static inline void daw_text_edit_sync_buf(char *buf) {
+    if (!buf) return;
+    int len = (int)strlen(buf);
+    if (g_text_edit.active_buf != buf) {
+        g_text_edit.active_buf = buf;
+        g_text_edit.cursor_pos = len;
+        g_text_edit.select_all = false;
+    } else {
+        if (g_text_edit.cursor_pos < 0) g_text_edit.cursor_pos = 0;
+        if (g_text_edit.cursor_pos > len) g_text_edit.cursor_pos = len;
+    }
+}
+
+static inline void daw_text_edit_click_cursor(char *buf, int mx, int text_start_x) {
+    if (!buf) return;
+    int len = (int)strlen(buf);
+    g_text_edit.active_buf = buf;
+    g_text_edit.select_all = false;
+    int pos = (mx - text_start_x + 4) / 8;
+    if (pos < 0) pos = 0;
+    if (pos > len) pos = len;
+    g_text_edit.cursor_pos = pos;
+}
+
+static inline void daw_text_edit_insert_text(char *buf, size_t max_len, const char *ins) {
+    if (!buf || !ins || max_len == 0) return;
+    daw_text_edit_sync_buf(buf);
+    if (g_text_edit.select_all) {
+        buf[0] = '\0';
+        g_text_edit.cursor_pos = 0;
+        g_text_edit.select_all = false;
+    }
+    size_t cur_len = strlen(buf);
+    size_t add_len = strlen(ins);
+    if (add_len == 0) return;
+    if ((size_t)g_text_edit.cursor_pos > cur_len) g_text_edit.cursor_pos = (int)cur_len;
+    if (cur_len >= max_len) return;
+    if (cur_len + add_len > max_len) {
+        add_len = max_len - cur_len;
+    }
+    memmove(buf + g_text_edit.cursor_pos + add_len,
+            buf + g_text_edit.cursor_pos,
+            cur_len - (size_t)g_text_edit.cursor_pos + 1);
+    memcpy(buf + g_text_edit.cursor_pos, ins, add_len);
+    g_text_edit.cursor_pos += (int)add_len;
+}
+
+static inline bool daw_text_edit_handle_keydown(char *buf, size_t max_len, SDL_Keycode sym, SDL_Keymod mod) {
+    if (!buf || max_len == 0) return false;
+    daw_text_edit_sync_buf(buf);
+    int len = (int)strlen(buf);
+    bool ctrl = (mod & KMOD_CTRL) != 0;
+
+    if (ctrl) {
+        if (sym == SDLK_a) {
+            g_text_edit.select_all = true;
+            g_text_edit.cursor_pos = len;
+            return true;
+        }
+        if (sym == SDLK_c) {
+            SDL_SetClipboardText(buf);
+            return true;
+        }
+        if (sym == SDLK_x) {
+            SDL_SetClipboardText(buf);
+            buf[0] = '\0';
+            g_text_edit.cursor_pos = 0;
+            g_text_edit.select_all = false;
+            return true;
+        }
+        if (sym == SDLK_v) {
+            if (SDL_HasClipboardText()) {
+                char *clip = SDL_GetClipboardText();
+                if (clip) {
+                    char clean[512];
+                    size_t j = 0;
+                    for (size_t i = 0; clip[i] != '\0' && j + 1 < sizeof(clean); i++) {
+                        if (clip[i] != '\r' && clip[i] != '\n') {
+                            clean[j++] = clip[i];
+                        }
+                    }
+                    clean[j] = '\0';
+                    daw_text_edit_insert_text(buf, max_len, clean);
+                    SDL_free(clip);
+                }
+            }
+            return true;
+        }
+    }
+
+    if (sym == SDLK_LEFT) {
+        if (g_text_edit.select_all) {
+            g_text_edit.select_all = false;
+            g_text_edit.cursor_pos = 0;
+        } else if (g_text_edit.cursor_pos > 0) {
+            g_text_edit.cursor_pos--;
+        }
+        return true;
+    }
+    if (sym == SDLK_RIGHT) {
+        if (g_text_edit.select_all) {
+            g_text_edit.select_all = false;
+            g_text_edit.cursor_pos = len;
+        } else if (g_text_edit.cursor_pos < len) {
+            g_text_edit.cursor_pos++;
+        }
+        return true;
+    }
+    if (sym == SDLK_HOME) {
+        g_text_edit.select_all = false;
+        g_text_edit.cursor_pos = 0;
+        return true;
+    }
+    if (sym == SDLK_END) {
+        g_text_edit.select_all = false;
+        g_text_edit.cursor_pos = len;
+        return true;
+    }
+    if (sym == SDLK_BACKSPACE) {
+        if (g_text_edit.select_all) {
+            buf[0] = '\0';
+            g_text_edit.cursor_pos = 0;
+            g_text_edit.select_all = false;
+        } else if (g_text_edit.cursor_pos > 0 && len > 0) {
+            memmove(buf + g_text_edit.cursor_pos - 1,
+                    buf + g_text_edit.cursor_pos,
+                    (size_t)(len - g_text_edit.cursor_pos + 1));
+            g_text_edit.cursor_pos--;
+        }
+        return true;
+    }
+    if (sym == SDLK_DELETE) {
+        if (g_text_edit.select_all) {
+            buf[0] = '\0';
+            g_text_edit.cursor_pos = 0;
+            g_text_edit.select_all = false;
+        } else if (g_text_edit.cursor_pos < len) {
+            memmove(buf + g_text_edit.cursor_pos,
+                    buf + g_text_edit.cursor_pos + 1,
+                    (size_t)(len - g_text_edit.cursor_pos));
+        }
+        return true;
+    }
+    return false;
+}
+
+static inline void daw_draw_text_edit_overlay(SDL_Renderer *ren, char *buf, int text_x, int box_y, int box_h, int max_x) {
+    if (!ren || !buf) return;
+    daw_text_edit_sync_buf(buf);
+    int len = (int)strlen(buf);
+    if (g_text_edit.select_all && len > 0) {
+        int sel_w = len * 8 + 2;
+        if (text_x + sel_w > max_x) sel_w = max_x - text_x;
+        if (sel_w > 0) {
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+            SDL_Rect sel_r = { text_x - 1, box_y + 3, sel_w, box_h - 6 };
+            SDL_SetRenderDrawColor(ren, 55, 125, 225, 110);
+            SDL_RenderFillRect(ren, &sel_r);
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        }
+    }
+    if ((SDL_GetTicks() / 450) % 2 == 0) {
+        int cx = text_x + g_text_edit.cursor_pos * 8;
+        if (cx > max_x) cx = max_x;
+        if (cx >= text_x) {
+            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+            SDL_RenderDrawLine(ren, cx, box_y + 4, cx, box_y + box_h - 4);
+        }
+    }
+}
+#endif // DAW_TEXT_EDIT_HELPER_DEFINED
 #include "video_player.h"
 #include "audio_engine.h"
 #include "daw_types.h"
 #include "daw_tabs.h"
 #include "project_io.h"
+#ifndef SDL_TEXTUREACCESS_TARGET
+#define SDL_TEXTUREACCESS_TARGET 2
+#endif
+#ifdef _WIN32
+#ifndef WM_SETICON
+#define WM_SETICON 0x0080
+#endif
+#ifndef ICON_SMALL
+#define ICON_SMALL 0
+#endif
+#ifndef ICON_BIG
+#define ICON_BIG 1
+#endif
+#ifndef IMAGE_ICON
+#define IMAGE_ICON 1
+#endif
+#ifndef LR_DEFAULTCOLOR
+#define LR_DEFAULTCOLOR 0x00000000
+#endif
+#ifndef LR_LOADFROMFILE
+#define LR_LOADFROMFILE 0x00000010
+#endif
+#ifndef GCLP_HICON
+#define GCLP_HICON (-14)
+#endif
+#ifndef GCLP_HICONSM
+#define GCLP_HICONSM (-34)
+#endif
+#endif
+
 
 #ifndef OFN_ALLOWMULTISELECT
 #define OFN_ALLOWMULTISELECT 0x00000200
@@ -56,6 +346,14 @@ static inline int daw_fseek64(FILE *fp, int64_t offset, int origin) {
     return _fseeki64(fp, (int64_t)offset, origin);
 #else
     return fseeko(fp, (off_t)offset, origin);
+#endif
+}
+static inline int64_t daw_ftell64(FILE *fp) {
+    if (!fp) return -1;
+#ifdef _WIN32
+    return _ftelli64(fp);
+#else
+    return (int64_t)ftello(fp);
 #endif
 }
 static inline FILE* daw_fopen_LockFreeRead(const char *path) {
@@ -349,7 +647,7 @@ static bool g_lock_opt_complete_unlock[MAX_TABS] = { false };
 static bool g_lock_opt_prevent_lr[MAX_TABS]      = { false };
 static bool g_lock_opt_prevent_ud[MAX_TABS]      = { false };
 static bool g_lock_popup_open = false;
-static SDL_Rect g_lock_win_rect = { 290, 145, 700, 268 };
+static SDL_Rect g_lock_win_rect = { 290, 155, 700, 232 };
 static bool g_lock_win_dragging = false;
 static int  g_lock_drag_off_x = 0;
 static int  g_lock_drag_off_y = 0;
@@ -937,14 +1235,14 @@ static bool g_last_copied_is_track = false;
 typedef struct {
     int num_items;
     int num_tracks;
-    AudioItem items[MAX_ITEMS];
-    double fade_in[MAX_ITEMS];
-    double fade_out[MAX_ITEMS];
-    float  vol_db[MAX_ITEMS];
-    bool   muted[MAX_ITEMS];
-    int    color_idx[MAX_ITEMS];
-    int    peak_color_idx[MAX_ITEMS];
-    int    group_id[MAX_ITEMS];
+    AudioItem *items;
+    double *fade_in;
+    double *fade_out;
+    float  *vol_db;
+    bool   *muted;
+    int    *color_idx;
+    int    *peak_color_idx;
+    int    *group_id;
 
     Track  tracks[MAX_TRACKS];
     char   track_names[MAX_TRACKS][64];
@@ -981,10 +1279,14 @@ static bool g_deep_undo_has_redo_tip[MAX_TABS] = { false };
 
 static void free_deep_undo_entry_peaks(DeepUndoEntry *ent) {
     if (!ent) return;
-    for (int i = 0; i < ent->num_items; i++) {
-        ent->items[i].peaks = NULL;
-        ent->items[i].raw_file_handle = NULL;
-    }
+    if (ent->items)          { free(ent->items);          ent->items = NULL; }
+    if (ent->fade_in)        { free(ent->fade_in);        ent->fade_in = NULL; }
+    if (ent->fade_out)       { free(ent->fade_out);       ent->fade_out = NULL; }
+    if (ent->vol_db)         { free(ent->vol_db);         ent->vol_db = NULL; }
+    if (ent->muted)          { free(ent->muted);          ent->muted = NULL; }
+    if (ent->color_idx)      { free(ent->color_idx);      ent->color_idx = NULL; }
+    if (ent->peak_color_idx) { free(ent->peak_color_idx); ent->peak_color_idx = NULL; }
+    if (ent->group_id)       { free(ent->group_id);       ent->group_id = NULL; }
     ent->num_items = 0;
 }
 
@@ -1007,6 +1309,22 @@ static void capture_tab_into_deep_entry(ProjectTab *p, int tab, DeepUndoEntry *e
 
     ent->num_items  = p->num_items;
     ent->num_tracks = p->num_tracks;
+    if (p->num_items > 0) {
+        size_t n_it = (size_t)p->num_items;
+        ent->items          = (AudioItem *)calloc(n_it, sizeof(AudioItem));
+        ent->fade_in        = (double *)calloc(n_it, sizeof(double));
+        ent->fade_out       = (double *)calloc(n_it, sizeof(double));
+        ent->vol_db         = (float *)calloc(n_it, sizeof(float));
+        ent->muted          = (bool *)calloc(n_it, sizeof(bool));
+        ent->color_idx      = (int *)calloc(n_it, sizeof(int));
+        ent->peak_color_idx = (int *)calloc(n_it, sizeof(int));
+        ent->group_id       = (int *)calloc(n_it, sizeof(int));
+        if (!ent->items || !ent->fade_in || !ent->fade_out || !ent->vol_db ||
+            !ent->muted || !ent->color_idx || !ent->peak_color_idx || !ent->group_id) {
+            free_deep_undo_entry_peaks(ent);
+            return;
+        }
+    }
     for (int i = 0; i < p->num_items; i++) {
         if (p->items[i].peak_count > 0 && p->items[i].peaks) {
             p->items[i].peaks = daw_register_shared_peaks(
@@ -1724,7 +2042,7 @@ static bool g_lock_opt_complete_unlock[MAX_TABS] = { false };
 static bool g_lock_opt_prevent_lr[MAX_TABS]      = { false };
 static bool g_lock_opt_prevent_ud[MAX_TABS]      = { false };
 static bool g_lock_popup_open = false;
-static SDL_Rect g_lock_win_rect = { 290, 145, 700, 268 };
+static SDL_Rect g_lock_win_rect = { 290, 155, 700, 232 };
 static bool g_lock_win_dragging = false;
 static int  g_lock_drag_off_x = 0;
 static int  g_lock_drag_off_y = 0;
@@ -2379,14 +2697,10 @@ static void render_themes_popup_window(SDL_Renderer *ren) {
     draw_brown_border_rect(ren, &code_box, g_theme.code_focused, false);
 
     SDL_Rect code_clip = { code_box.x + 4, code_box.y + 2, code_box.w - 8, code_box.h - 4 };
-    draw_text_clipped(ren, g_theme.code_buf, code_box.x + 8, code_y + 9, c_white, &code_clip, NULL);
-    if (g_theme.code_focused && ((SDL_GetTicks() / 450) % 2 == 0)) {
-        int cx = code_box.x + 8 + (int)strlen(g_theme.code_buf) * 8;
-        if (cx < code_box.x + code_box.w - 4) {
-            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-            SDL_RenderDrawLine(ren, cx, code_y + 6, cx, code_y + 24);
-        }
+    if (g_theme.code_focused) {
+        daw_draw_text_edit_overlay(ren, g_theme.code_buf, code_box.x + 8, code_box.y, code_box.h, code_box.x + code_box.w - 4);
     }
+    draw_text_clipped(ren, g_theme.code_buf, code_box.x + 8, code_y + 9, c_white, &code_clip, NULL);
 
     // Live Color Swatch next to rgba() code box
     SDL_Rect swatch_box = { p_x + 218, code_y, 38, 30 };
@@ -2553,6 +2867,59 @@ static void set_daw_window_thumbnail_icon(SDL_Window *win) {
         SDL_SetWindowIcon(win, surf);
         SDL_FreeSurface(surf);
     }
+#ifdef _WIN32
+    // Ensure app_icon.ico exists on disk and set both ICON_BIG and ICON_SMALL on the Win32 HWND + Window Class
+    FILE *chk_ico = fopen("app_icon.ico", "rb");
+    if (chk_ico) {
+        fclose(chk_ico);
+    } else {
+        FILE *f_ico = fopen("app_icon.ico", "wb");
+        if (f_ico) {
+            uint8_t ico_hdr[22] = {
+                0, 0, 1, 0, 1, 0,
+                64, 64, 0, 0, 1, 0, 32, 0,
+                0x28, 0x42, 0x00, 0x00, // 40 + 64*64*4 + 64*8 = 16936 bytes (0x4228)
+                22, 0, 0, 0
+            };
+            uint8_t bmp_hdr[40] = {
+                40, 0, 0, 0,
+                64, 0, 0, 0,
+                128, 0, 0, 0, // 2 * 64 height for XOR + AND mask
+                1, 0, 32, 0,
+                0, 0, 0, 0,
+                0x00, 0x42, 0x00, 0x00,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0
+            };
+            fwrite(ico_hdr, 1, sizeof(ico_hdr), f_ico);
+            fwrite(bmp_hdr, 1, sizeof(bmp_hdr), f_ico);
+            for (int row = 63; row >= 0; row--) {
+                fwrite(&icon_px[row * 64], sizeof(uint32_t), 64, f_ico);
+            }
+            uint8_t mask_zero[64 * 8] = {0};
+            fwrite(mask_zero, 1, sizeof(mask_zero), f_ico);
+            fclose(f_ico);
+        }
+    }
+    SDL_SysWMinfo wmInfo;
+    SDL_VERSION(&wmInfo.version);
+    if (SDL_GetWindowWMInfo(win, &wmInfo)) {
+        HWND hwnd = wmInfo.info.win.window;
+        HINSTANCE hInst = GetModuleHandleA(NULL);
+        HICON hIconBig = (HICON)LoadImageA(hInst, MAKEINTRESOURCEA(1), IMAGE_ICON, 64, 64, LR_DEFAULTCOLOR);
+        HICON hIconSm  = (HICON)LoadImageA(hInst, MAKEINTRESOURCEA(1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+        if (!hIconBig) hIconBig = (HICON)LoadImageA(NULL, "app_icon.ico", IMAGE_ICON, 64, 64, LR_LOADFROMFILE);
+        if (!hIconSm)  hIconSm  = (HICON)LoadImageA(NULL, "app_icon.ico", IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+        if (hIconBig) {
+            SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIconBig);
+            SetClassLongPtrA(hwnd, GCLP_HICON, (LONG_PTR)hIconBig);
+        }
+        if (hIconSm) {
+            SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSm);
+            SetClassLongPtrA(hwnd, GCLP_HICONSM, (LONG_PTR)hIconSm);
+        }
+    }
+#endif
 }
 
 // Renders the "Processing, please wait..." stability popup window and pumps SDL events so the app never freezes
@@ -2712,14 +3079,10 @@ static void render_dynamic_split_window(SDL_Renderer *ren) {
         SDL_RenderFillRect(ren, &bx);
         draw_brown_border_rect(ren, &bx, is_ed, false);
         const char *txt = is_ed ? g_dyn_split.edit_buf : rows[r].val;
-        draw_text(ren, txt, bx.x + 8, ry + 5, is_ed ? c_accent : c_white);
-        if (is_ed && ((SDL_GetTicks() / 450) % 2 == 0)) {
-            int cx = bx.x + 8 + (int)strlen(txt) * 8;
-            if (cx < bx.x + bx.w - 4) {
-                SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                SDL_RenderDrawLine(ren, cx, ry + 4, cx, ry + 20);
-            }
+        if (is_ed) {
+            daw_draw_text_edit_overlay(ren, g_dyn_split.edit_buf, bx.x + 8, bx.y, bx.h, bx.x + bx.w - 4);
         }
+        draw_text(ren, txt, bx.x + 8, ry + 5, is_ed ? c_accent : c_white);
         draw_text(ren, rows[r].unit, unit_x, ry + 5, c_muted);
     }
 
@@ -2862,14 +3225,10 @@ static void render_reposition_window(SDL_Renderer *ren) {
     SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
     SDL_RenderFillRect(ren, &ti_box);
     draw_brown_border_rect(ren, &ti_box, g_reposition.interval_focused, false);
-    draw_text(ren, g_reposition.interval_str, ti_box.x + 8, ti_y + 5, c_white);
-    if (g_reposition.interval_focused && ((SDL_GetTicks() / 450) % 2 == 0)) {
-        int cx = ti_box.x + 8 + (int)strlen(g_reposition.interval_str) * 8;
-        if (cx < ti_box.x + ti_box.w - 4) {
-            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-            SDL_RenderDrawLine(ren, cx, ti_y + 4, cx, ti_y + 20);
-        }
+    if (g_reposition.interval_focused) {
+        daw_draw_text_edit_overlay(ren, g_reposition.interval_str, ti_box.x + 8, ti_box.y, ti_box.h, ti_box.x + ti_box.w - 4);
     }
+    draw_text(ren, g_reposition.interval_str, ti_box.x + 8, ti_y + 5, c_white);
     draw_text(ren, "seconds", wx + 226, ti_y + 5, c_muted);
 
     // Bottom Buttons: [ OK ]  [ Cancel ]
@@ -3525,14 +3884,13 @@ static void render_track_lock_popup_window(SDL_Renderer *ren) {
     draw_brown_border_rect(ren, &left_box, false, true);
     draw_text(ren, "All Track", left_x + 12, box_y + 8, c_accent);
 
-    struct { bool val; const char *lbl; int y; } all_opts[4] = {
-        { g_lock_opt_full[tab],            "1. All Track Complete Lock",          box_y + 30 },
-        { g_lock_opt_complete_unlock[tab], "2. All Track Complete Unlock",        box_y + 66 },
-        { g_lock_opt_prevent_lr[tab],      "3. Lock only clip item Left Right move", box_y + 102 },
-        { g_lock_opt_prevent_ud[tab],      "4. Lock only clip item Up Down move",    box_y + 138 }
+    struct { bool val; const char *lbl; int y; } all_opts[3] = {
+        { g_lock_opt_full[tab],       "1. All Track Complete Lock",             box_y + 30 },
+        { g_lock_opt_prevent_lr[tab], "2. Lock only clip item Left Right move", box_y + 66 },
+        { g_lock_opt_prevent_ud[tab], "3. Lock only clip item Up Down move",    box_y + 102 }
     };
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 3; i++) {
         int ry = all_opts[i].y;
         bool chk = all_opts[i].val;
         SDL_Rect row_r = { left_x + 8, ry, col_w - 16, 30 };
@@ -3824,14 +4182,8 @@ static void render_time_jump_popup_window(SDL_Renderer *ren) {
     SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
     SDL_RenderFillRect(ren, &tbox);
     draw_brown_border_rect(ren, &tbox, true, false);
+    daw_draw_text_edit_overlay(ren, g_time_jump_buf, tbox.x + 8, tbox.y, tbox.h, tbox.x + tbox.w - 4);
     draw_text(ren, g_time_jump_buf, tbox.x + 8, tbox.y + 7, c_accent);
-    if (((SDL_GetTicks() / 450) % 2) == 0) {
-        int cx = tbox.x + 8 + (int)strlen(g_time_jump_buf) * 8;
-        if (cx < tbox.x + tbox.w - 4) {
-            SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-            SDL_RenderDrawLine(ren, cx, tbox.y + 5, cx, tbox.y + 21);
-        }
-    }
 
     int by = wy + wh - 36;
     SDL_Rect b_ok = { wx + ww - 166, by, 72, 26 };
@@ -3961,19 +4313,37 @@ static void sync_and_render_external_pinned_video_window(ProjectTab *p, SDL_Wind
     SDL_SetRenderDrawColor(g_video_ext_ren, 0, 0, 0, 255);
     SDL_RenderFillRect(g_video_ext_ren, &v_canvas);
 
-    if (p->video.has_active_frame && p->video.frame_rgb && p->video.frame_rgb->data[0] &&
+    if (p->video.has_active_frame && p->video.frame &&
         p->video.width > 0 && p->video.height > 0) {
+        #ifdef AV_PIX_FMT_YUV420P
+        bool ext_yuv = (p->video.frame->format == AV_PIX_FMT_YUV420P
+#ifdef AV_PIX_FMT_YUVJ420P
+                        || p->video.frame->format == AV_PIX_FMT_YUVJ420P
+#endif
+                       );
+#else
+        bool ext_yuv = false;
+#endif
         if (!g_video_ext_tex || g_video_ext_tex_w != p->video.width || g_video_ext_tex_h != p->video.height) {
             if (g_video_ext_tex) SDL_DestroyTexture(g_video_ext_tex);
             g_video_ext_tex = SDL_CreateTexture(
-                g_video_ext_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING,
-                p->video.width, p->video.height
+                g_video_ext_ren, ext_yuv ? SDL_PIXELFORMAT_IYUV : SDL_PIXELFORMAT_RGB24,
+                SDL_TEXTUREACCESS_STREAMING, p->video.width, p->video.height
             );
             g_video_ext_tex_w = p->video.width;
             g_video_ext_tex_h = p->video.height;
         }
         if (g_video_ext_tex) {
-            SDL_UpdateTexture(g_video_ext_tex, NULL, p->video.frame_rgb->data[0], p->video.frame_rgb->linesize[0]);
+            if (ext_yuv && p->video.frame->data[0] && p->video.frame->data[1] && p->video.frame->data[2]) {
+                SDL_UpdateYUVTexture(
+                    g_video_ext_tex, NULL,
+                    p->video.frame->data[0], p->video.frame->linesize[0],
+                    p->video.frame->data[1], p->video.frame->linesize[1],
+                    p->video.frame->data[2], p->video.frame->linesize[2]
+                );
+            } else if (p->video.frame_rgb && p->video.frame_rgb->data[0]) {
+                SDL_UpdateTexture(g_video_ext_tex, NULL, p->video.frame_rgb->data[0], p->video.frame_rgb->linesize[0]);
+            }
             double v_asp = (double)p->video.width / (double)p->video.height;
             double c_asp = (v_canvas.h > 0) ? ((double)v_canvas.w / (double)v_canvas.h) : v_asp;
             SDL_Rect dst_rect = v_canvas;
@@ -4071,14 +4441,10 @@ static void render_script_popup_window(SDL_Renderer *ren) {
             SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
             SDL_RenderFillRect(ren, &ibox);
             draw_brown_border_rect(ren, &ibox, is_foc, false);
-            draw_text(ren, ctrl->str_val, ibox.x + 8, cy + 6, c_white);
-            if (is_foc && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                int cx = ibox.x + 8 + (int)strlen(ctrl->str_val) * 8;
-                if (cx < ibox.x + ibox.w - 4) {
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, cy + 4, cx, cy + 20);
-                }
+            if (is_foc) {
+                daw_draw_text_edit_overlay(ren, ctrl->str_val, ibox.x + 8, ibox.y, ibox.h, ibox.x + ibox.w - 4);
             }
+            draw_text(ren, ctrl->str_val, ibox.x + 8, cy + 6, c_white);
         }
     }
 
@@ -5323,8 +5689,14 @@ static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
         return -1;
     }
 
+    for (unsigned int s_i = 0; s_i < fmt->nb_streams; s_i++) {
+        #ifdef AVDISCARD_ALL
+        if ((int)s_i != a_idx) fmt->streams[s_i]->discard = AVDISCARD_ALL;
+#endif
+    }
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(ctx, cpar);
+    ctx->thread_count = 2;
     if (avcodec_open2(ctx, codec, NULL) < 0) {
         avcodec_free_context(&ctx);
         avformat_close_input(&fmt);
@@ -5555,6 +5927,10 @@ static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
         peak_cache[current_bin].max_val = cur_max;
         current_bin++;
     }
+    if (peak_cache && current_bin > 0 && current_bin < allocated_bins) {
+        PeakBin *shrunk = (PeakBin *)realloc(peak_cache, (size_t)current_bin * sizeof(PeakBin));
+        if (shrunk) peak_cache = shrunk;
+    }
 
     free(temp_pcm);
     fclose(f_raw);
@@ -5665,7 +6041,7 @@ static void import_single_media_item(ProjectTab *p, SDL_Renderer *ren, SDL_Windo
         g_item_color_idx[tab_i][new_idx] = 0;
         g_item_group_id[tab_i][new_idx] = 0;
         p->num_items++;
-        if (it->has_video) {
+        if (it->has_video && p->video.is_open) {
             open_video_by_path(&p->video, it->file_path, ren);
         }
         record_project_change("Imported Media Clip", true);
@@ -5733,7 +6109,7 @@ static void execute_multi_media_import(ProjectTab *p, SDL_Renderer *ren, SDL_Win
             g_item_color_idx[tab_i][new_idx] = 0;
             g_item_group_id[tab_i][new_idx] = 0;
             p->num_items++;
-            if (it->has_video) {
+            if (it->has_video && p->video.is_open) {
                 open_video_by_path(&p->video, it->file_path, ren);
             }
             p->is_dirty = true;
@@ -6636,17 +7012,19 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
         }
     }
 
-    for (int i = 0; i < p->num_items; i++) {
-        if (p->items[i].has_video) {
-            open_video_by_path(&p->video, p->items[i].file_path, ren);
-            break;
-        }
-    }
     if (has_ext4) {
         if (saved_vid_rect.w >= 200 && saved_vid_rect.h >= 120) {
             p->video.rect = saved_vid_rect;
         }
         p->video.is_open = saved_vid_open;
+    }
+    if (p->video.is_open) {
+        for (int i = 0; i < p->num_items; i++) {
+            if (p->items[i].has_video) {
+                open_video_by_path(&p->video, p->items[i].file_path, ren);
+                break;
+            }
+        }
     }
 
     // Restore exact saved playhead (cursor position) and viewport scroll position without auto-scroll override!
@@ -7213,8 +7591,30 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
             int64_t sample_offset = (int64_t)(((clip_start_t - it_s) + it->offset_in_file) * (double)SAMPLE_RATE + 0.5);
             if (sample_offset < 0) sample_offset = 0;
 
-            if (daw_fseek64(it->raw_file_handle, sample_offset * (int64_t)(sizeof(float) * 2), SEEK_SET) != 0) {
-                continue;
+            int64_t target_byte_off = sample_offset * (int64_t)(sizeof(float) * 2);
+            int64_t cur_byte_off = daw_ftell64(it->raw_file_handle);
+            if (cur_byte_off < 0 || llabs(cur_byte_off - target_byte_off) > (int64_t)(sizeof(float) * 4)) {
+                if (daw_fseek64(it->raw_file_handle, target_byte_off, SEEK_SET) != 0) {
+                    continue;
+                }
+            }
+
+            // Precheck once per buffer if this 21ms slice intersects any fade-in, fade-out, 2ms edge ramp, or crossfade overlap
+            double man_fin  = get_item_fade_in(p, i);
+            double man_fout = get_item_fade_out(p, i);
+            bool needs_env = (st < it_s + man_fin + 0.004) || (et > it_e - man_fout - 0.004);
+            if (!needs_env) {
+                for (int o = 0; o < p->num_items; o++) {
+                    if (o == i) continue;
+                    AudioItem *ot = &p->items[o];
+                    if (ot->track_idx != it->track_idx) continue;
+                    double ov_s = fmax(it_s, ot->start_time);
+                    double ov_e = fmin(it_e, ot->start_time + ot->duration);
+                    if (ov_e > ov_s + 0.0005 && et >= ov_s && st <= ov_e) {
+                        needs_env = true;
+                        break;
+                    }
+                }
             }
 
             int done = 0;
@@ -7223,13 +7623,21 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
                 if (blk > 1024) blk = 1024;
                 size_t read_frames = fread(chunk, sizeof(float) * 2, (size_t)blk, it->raw_file_handle);
                 if (read_frames == 0) break;
-                for (size_t f = 0; f < read_frames; f++) {
-                    int out_idx = f_start + done + (int)f;
-                    double sample_t = st + ((double)out_idx / (double)SAMPLE_RATE);
-                    float xfade_gain = compute_item_crossfade_gain(p, i, sample_t);
-                    float total_gain = linear_gain * xfade_gain;
-                    out[out_idx * 2]     += chunk[f * 2]     * total_gain;
-                    out[out_idx * 2 + 1] += chunk[f * 2 + 1] * total_gain;
+                if (!needs_env) {
+                    for (size_t f = 0; f < read_frames; f++) {
+                        int out_idx = (f_start + done + (int)f) * 2;
+                        out[out_idx]     += chunk[f * 2]     * linear_gain;
+                        out[out_idx + 1] += chunk[f * 2 + 1] * linear_gain;
+                    }
+                } else {
+                    for (size_t f = 0; f < read_frames; f++) {
+                        int out_idx = f_start + done + (int)f;
+                        double sample_t = st + ((double)out_idx / (double)SAMPLE_RATE);
+                        float xfade_gain = compute_item_crossfade_gain(p, i, sample_t);
+                        float total_gain = linear_gain * xfade_gain;
+                        out[out_idx * 2]     += chunk[f * 2]     * total_gain;
+                        out[out_idx * 2 + 1] += chunk[f * 2 + 1] * total_gain;
+                    }
                 }
                 done += (int)read_frames;
                 if ((int)read_frames < blk) break;
@@ -7555,7 +7963,11 @@ int main(int argc, char *argv[]) {
     g_cursor_size_ns = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZENS);
     g_cursor_ibeam   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_IBEAM);
 
-    memset(&g_daw, 0, sizeof(DawEngine));
+    for (int t_i = 0; t_i < MAX_TABS; t_i++) {
+        memset(&g_daw.tabs[t_i], 0, offsetof(ProjectTab, undo_mgr));
+        g_daw.tabs[t_i].undo_mgr.head = -1;
+        g_daw.tabs[t_i].undo_mgr.count = 0;
+    }
     memset(g_marker_full_text, 0, sizeof(g_marker_full_text));
     memset(g_editing_marker_full_buf, 0, sizeof(g_editing_marker_full_buf));
     memset(g_item_fade_in, 0, sizeof(g_item_fade_in));
@@ -7782,97 +8194,71 @@ int main(int argc, char *argv[]) {
             } else if (e.type == SDL_TEXTINPUT) {
                 if (g_daw.save_prompt_open || g_track_delete_prompt_open || g_processing_popup_open) continue;
                 if (g_time_jump_open) {
-                    for (const char *c = e.text.text; *c; c++) {
-                        if ((isdigit((unsigned char)*c) || *c == ':' || *c == '.') &&
-                            strlen(g_time_jump_buf) + 1 < sizeof(g_time_jump_buf)) {
-                            size_t l = strlen(g_time_jump_buf);
-                            g_time_jump_buf[l] = *c;
-                            g_time_jump_buf[l + 1] = '\0';
-                        }
+                    char clean_t[32] = {0};
+                    size_t j = 0;
+                    for (const char *c = e.text.text; *c && j + 1 < sizeof(clean_t); c++) {
+                        if (isdigit((unsigned char)*c) || *c == ':' || *c == '.') clean_t[j++] = *c;
                     }
+                    clean_t[j] = '\0';
+                    if (clean_t[0]) daw_text_edit_insert_text(g_time_jump_buf, sizeof(g_time_jump_buf) - 1, clean_t);
                     continue;
                 }
                 if (g_script_popup.is_open && g_script_popup.focused_ctrl_idx >= 0 &&
                     g_script_popup.focused_ctrl_idx < g_script_popup.num_controls) {
                     ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.focused_ctrl_idx];
-                    if (strlen(ctrl->str_val) + strlen(e.text.text) < sizeof(ctrl->str_val) - 1) {
-                        strcat(ctrl->str_val, e.text.text);
-                        ctrl->num_val = atof(ctrl->str_val);
-                    }
+                    daw_text_edit_insert_text(ctrl->str_val, sizeof(ctrl->str_val) - 1, e.text.text);
+                    ctrl->num_val = atof(ctrl->str_val);
                     continue;
                 }
                 if (g_reposition.is_open && g_reposition.interval_focused) {
-                    if (strlen(g_reposition.interval_str) + strlen(e.text.text) < sizeof(g_reposition.interval_str) - 1) {
-                        strcat(g_reposition.interval_str, e.text.text);
-                    }
+                    daw_text_edit_insert_text(g_reposition.interval_str, sizeof(g_reposition.interval_str) - 1, e.text.text);
                     continue;
                 }
                 if (g_dyn_split.is_open && g_dyn_split.editing_field_id > 0) {
-                    if (strlen(g_dyn_split.edit_buf) + strlen(e.text.text) < sizeof(g_dyn_split.edit_buf) - 1) {
-                        strcat(g_dyn_split.edit_buf, e.text.text);
-                    }
+                    daw_text_edit_insert_text(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf) - 1, e.text.text);
                     continue;
                 }
                 if (g_daw.script_manager_open && g_script_filter_focused) {
-                    if (strlen(g_script_filter_text) + strlen(e.text.text) < sizeof(g_script_filter_text) - 1) {
-                        strcat(g_script_filter_text, e.text.text);
-                        g_script_scroll_y = 0;
-                        refresh_filtered_scripts();
-                        if (g_script_num_filtered > 0) {
-                            g_daw.script_selected_idx = g_script_filtered_indices[0];
-                        }
+                    daw_text_edit_insert_text(g_script_filter_text, sizeof(g_script_filter_text) - 1, e.text.text);
+                    g_script_scroll_y = 0;
+                    refresh_filtered_scripts();
+                    if (g_script_num_filtered > 0) {
+                        g_daw.script_selected_idx = g_script_filtered_indices[0];
                     }
                     continue;
                 }
                 if (g_theme.is_open && g_theme.code_focused) {
-                    if (strlen(g_theme.code_buf) + strlen(e.text.text) < sizeof(g_theme.code_buf) - 1) {
-                        strcat(g_theme.code_buf, e.text.text);
-                        if (parse_theme_code_input(g_theme.code_buf)) {
-                            save_themes_settings_json();
-                        }
+                    daw_text_edit_insert_text(g_theme.code_buf, sizeof(g_theme.code_buf) - 1, e.text.text);
+                    if (parse_theme_code_input(g_theme.code_buf)) {
+                        save_themes_settings_json();
                     }
                     continue;
                 }
                 if (g_action_win.is_open && g_action_win.filter_focused &&
                     !g_action_win.capturing_add_shortcut && !g_action_win.capturing_find_shortcut) {
-                    if (strlen(g_action_win.filter_text) + strlen(e.text.text) < sizeof(g_action_win.filter_text) - 1) {
-                        strcat(g_action_win.filter_text, e.text.text);
-                        g_action_win.scroll_y = 0;
-                        refresh_filtered_actions();
-                        if (g_action_win.num_filtered > 0) {
-                            g_action_win.selected_action_idx = g_action_win.filtered_indices[0];
-                            g_action_win.selected_shortcut_sub = 0;
-                        }
+                    daw_text_edit_insert_text(g_action_win.filter_text, sizeof(g_action_win.filter_text) - 1, e.text.text);
+                    g_action_win.scroll_y = 0;
+                    refresh_filtered_actions();
+                    if (g_action_win.num_filtered > 0) {
+                        g_action_win.selected_action_idx = g_action_win.filtered_indices[0];
+                        g_action_win.selected_shortcut_sub = 0;
                     }
                     continue;
                 }
                 if (g_export.is_open && g_export.active_field != EXP_FIELD_NONE) {
                     size_t max_len = 0;
                     char *buf = get_active_export_field_buf(&max_len);
-                    if (buf && strlen(buf) + strlen(e.text.text) < max_len) {
-                        strcat(buf, e.text.text);
-                    }
+                    if (buf) daw_text_edit_insert_text(buf, max_len, e.text.text);
                     continue;
                 }
                 if (is_any_popup_or_dropdown_open()) continue;
                 if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME) {
-                    if (strlen(g_daw.editing_name_buf) + strlen(e.text.text) < 63) {
-                        strcat(g_daw.editing_name_buf, e.text.text);
-                    }
+                    daw_text_edit_insert_text(g_daw.editing_name_buf, 63, e.text.text);
                 } else if (g_daw.input_focus == INPUT_FOCUS_MARKER) {
-                    size_t cur_len = strlen(g_editing_marker_full_buf);
-                    size_t add_len = strlen(e.text.text);
-                    if (g_marker_cursor_pos < 0) g_marker_cursor_pos = 0;
-                    if ((size_t)g_marker_cursor_pos > cur_len) g_marker_cursor_pos = (int)cur_len;
-                    if (cur_len + add_len < MARKER_TEXT_MAX - 1) {
-                        memmove(g_editing_marker_full_buf + g_marker_cursor_pos + add_len,
-                                g_editing_marker_full_buf + g_marker_cursor_pos,
-                                cur_len - (size_t)g_marker_cursor_pos + 1);
-                        memcpy(g_editing_marker_full_buf + g_marker_cursor_pos, e.text.text, add_len);
-                        g_marker_cursor_pos += (int)add_len;
-                        strncpy(g_daw.editing_marker_buf, g_editing_marker_full_buf, 63);
-                        g_daw.editing_marker_buf[63] = '\0';
-                    }
+                    daw_text_edit_insert_text(g_editing_marker_full_buf, MARKER_TEXT_MAX - 1, e.text.text);
+                    g_marker_cursor_pos = g_text_edit.cursor_pos;
+                    strncpy(g_daw.editing_marker_buf, g_editing_marker_full_buf, 63);
+                    g_daw.editing_marker_buf[63] = '\0';
                 }
             } else if (e.type == SDL_DROPFILE) {
                 if (g_daw.save_prompt_open || g_export.is_open || g_multi_import.is_open) {
@@ -7910,15 +8296,15 @@ int main(int argc, char *argv[]) {
                     }
                     continue;
                 }
+                SDL_Keymod mod = SDL_GetModState();
                 if (g_time_jump_open) {
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
                         g_time_jump_open = false;
                         SDL_StopTextInput();
                     } else if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
                         commit_time_jump_popup(p, view_w);
-                    } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                        size_t l = strlen(g_time_jump_buf);
-                        if (l > 0) g_time_jump_buf[l - 1] = '\0';
+                    } else {
+                        daw_text_edit_handle_keydown(g_time_jump_buf, sizeof(g_time_jump_buf) - 1, e.key.keysym.sym, mod);
                     }
                     continue;
                 }
@@ -7957,13 +8343,11 @@ int main(int argc, char *argv[]) {
                         record_project_change(custom_msg[0] ? custom_msg : g_script_popup.title, true);
                         continue;
                     }
-                    if (e.key.keysym.sym == SDLK_BACKSPACE && g_script_popup.focused_ctrl_idx >= 0 &&
+                    if (g_script_popup.focused_ctrl_idx >= 0 &&
                         g_script_popup.focused_ctrl_idx < g_script_popup.num_controls) {
                         char *sb = g_script_popup.controls[g_script_popup.focused_ctrl_idx].str_val;
-                        size_t l = strlen(sb);
-                        if (l > 0) sb[l - 1] = '\0';
+                        daw_text_edit_handle_keydown(sb, sizeof(g_script_popup.controls[0].str_val) - 1, e.key.keysym.sym, mod);
                         g_script_popup.controls[g_script_popup.focused_ctrl_idx].num_val = atof(sb);
-                        continue;
                     }
                     continue;
                 }
@@ -7980,10 +8364,8 @@ int main(int argc, char *argv[]) {
                         execute_reposition_items_dialog(p);
                         continue;
                     }
-                    if (e.key.keysym.sym == SDLK_BACKSPACE && g_reposition.interval_focused) {
-                        size_t l = strlen(g_reposition.interval_str);
-                        if (l > 0) g_reposition.interval_str[l - 1] = '\0';
-                        continue;
+                    if (g_reposition.interval_focused) {
+                        daw_text_edit_handle_keydown(g_reposition.interval_str, sizeof(g_reposition.interval_str) - 1, e.key.keysym.sym, mod);
                     }
                     continue;
                 }
@@ -8005,26 +8387,20 @@ int main(int argc, char *argv[]) {
                         }
                         continue;
                     }
-                    if (e.key.keysym.sym == SDLK_BACKSPACE && g_dyn_split.editing_field_id > 0) {
-                        size_t l = strlen(g_dyn_split.edit_buf);
-                        if (l > 0) g_dyn_split.edit_buf[l - 1] = '\0';
-                        continue;
+                    if (g_dyn_split.editing_field_id > 0) {
+                        daw_text_edit_handle_keydown(g_dyn_split.edit_buf, sizeof(g_dyn_split.edit_buf) - 1, e.key.keysym.sym, mod);
                     }
                     continue;
                 }
                 if (g_daw.script_manager_open && g_script_filter_focused) {
-                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
                         g_script_filter_focused = false;
                         SDL_StopTextInput();
-                    } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                        size_t l = strlen(g_script_filter_text);
-                        if (l > 0) {
-                            g_script_filter_text[l - 1] = '\0';
-                            g_script_scroll_y = 0;
-                            refresh_filtered_scripts();
-                            if (g_script_num_filtered > 0) {
-                                g_daw.script_selected_idx = g_script_filtered_indices[0];
-                            }
+                    } else if (daw_text_edit_handle_keydown(g_script_filter_text, sizeof(g_script_filter_text) - 1, e.key.keysym.sym, mod)) {
+                        g_script_scroll_y = 0;
+                        refresh_filtered_scripts();
+                        if (g_script_num_filtered > 0) {
+                            g_daw.script_selected_idx = g_script_filtered_indices[0];
                         }
                     }
                     continue;
@@ -8042,9 +8418,8 @@ int main(int argc, char *argv[]) {
                         sync_theme_code_string();
                         g_theme.code_focused = false;
                         SDL_StopTextInput();
-                    } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                        size_t l = strlen(g_theme.code_buf);
-                        if (l > 0) g_theme.code_buf[l - 1] = '\0';
+                    } else {
+                        daw_text_edit_handle_keydown(g_theme.code_buf, sizeof(g_theme.code_buf) - 1, e.key.keysym.sym, mod);
                     }
                     continue;
                 }
@@ -8061,21 +8436,19 @@ int main(int argc, char *argv[]) {
                     if (g_export.active_field != EXP_FIELD_NONE) {
                         size_t max_len = 0;
                         char *buf = get_active_export_field_buf(&max_len);
-                        if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_ESCAPE) {
+                        if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER || e.key.keysym.sym == SDLK_ESCAPE) {
                             g_export.active_field = EXP_FIELD_NONE;
                             SDL_StopTextInput();
-                        } else if (e.key.keysym.sym == SDLK_BACKSPACE && buf) {
-                            size_t l = strlen(buf);
-                            if (l > 0) buf[l - 1] = '\0';
+                        } else if (buf) {
+                            daw_text_edit_handle_keydown(buf, max_len, e.key.keysym.sym, mod);
                         }
                     } else if (e.key.keysym.sym == SDLK_ESCAPE) {
                         g_export.is_open = false;
                     }
                     continue;
                 }
-                SDL_Keymod mod = SDL_GetModState();
                 if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME) {
-                    if (e.key.keysym.sym == SDLK_RETURN) {
+                    if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
                         if (strcmp(p->track_names[g_daw.editing_track_name_idx], g_daw.editing_name_buf) != 0) push_undo_state();
                         strncpy(p->track_names[g_daw.editing_track_name_idx], g_daw.editing_name_buf, 63);
                         g_daw.input_focus = INPUT_FOCUS_NONE;
@@ -8086,18 +8459,13 @@ int main(int argc, char *argv[]) {
                         g_daw.input_focus = INPUT_FOCUS_NONE;
                         g_daw.editing_track_name_idx = -1;
                         SDL_StopTextInput();
-                    } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                        size_t l = strlen(g_daw.editing_name_buf);
-                        if (l > 0) g_daw.editing_name_buf[l - 1] = '\0';
+                    } else {
+                        daw_text_edit_handle_keydown(g_daw.editing_name_buf, 63, e.key.keysym.sym, mod);
                     }
                     continue;
                 }
                 if (g_daw.input_focus == INPUT_FOCUS_MARKER) {
-                    size_t l = strlen(g_editing_marker_full_buf);
-                    if (g_marker_cursor_pos < 0) g_marker_cursor_pos = 0;
-                    if ((size_t)g_marker_cursor_pos > l) g_marker_cursor_pos = (int)l;
-
-                    if (e.key.keysym.sym == SDLK_RETURN) {
+                    if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
                         if (strcmp(get_marker_full_str(p, g_daw.editing_marker_idx), g_editing_marker_full_buf) != 0) push_undo_state();
                         set_marker_full_str(p, g_daw.editing_marker_idx, g_editing_marker_full_buf);
                         g_daw.input_focus = INPUT_FOCUS_NONE;
@@ -8108,31 +8476,11 @@ int main(int argc, char *argv[]) {
                         g_daw.input_focus = INPUT_FOCUS_NONE;
                         g_daw.editing_marker_idx = -1;
                         SDL_StopTextInput();
-                    } else if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                        if (g_marker_cursor_pos > 0 && l > 0) {
-                            memmove(g_editing_marker_full_buf + g_marker_cursor_pos - 1,
-                                    g_editing_marker_full_buf + g_marker_cursor_pos,
-                                    l - (size_t)g_marker_cursor_pos + 1);
-                            g_marker_cursor_pos--;
-                            strncpy(g_daw.editing_marker_buf, g_editing_marker_full_buf, 63);
-                            g_daw.editing_marker_buf[63] = '\0';
-                        }
-                    } else if (e.key.keysym.sym == SDLK_DELETE) {
-                        if ((size_t)g_marker_cursor_pos < l) {
-                            memmove(g_editing_marker_full_buf + g_marker_cursor_pos,
-                                    g_editing_marker_full_buf + g_marker_cursor_pos + 1,
-                                    l - (size_t)g_marker_cursor_pos);
-                            strncpy(g_daw.editing_marker_buf, g_editing_marker_full_buf, 63);
-                            g_daw.editing_marker_buf[63] = '\0';
-                        }
-                    } else if (e.key.keysym.sym == SDLK_LEFT) {
-                        if (g_marker_cursor_pos > 0) g_marker_cursor_pos--;
-                    } else if (e.key.keysym.sym == SDLK_RIGHT) {
-                        if ((size_t)g_marker_cursor_pos < l) g_marker_cursor_pos++;
-                    } else if (e.key.keysym.sym == SDLK_HOME) {
-                        g_marker_cursor_pos = 0;
-                    } else if (e.key.keysym.sym == SDLK_END) {
-                        g_marker_cursor_pos = (int)l;
+                    } else {
+                        daw_text_edit_handle_keydown(g_editing_marker_full_buf, MARKER_TEXT_MAX - 1, e.key.keysym.sym, mod);
+                        g_marker_cursor_pos = g_text_edit.cursor_pos;
+                        strncpy(g_daw.editing_marker_buf, g_editing_marker_full_buf, 63);
+                        g_daw.editing_marker_buf[63] = '\0';
                     }
                     continue;
                 }
@@ -8221,7 +8569,7 @@ int main(int argc, char *argv[]) {
                     int right_x = wx + 30 + col_w;
                     int box_y = wy + 40;
 
-                    // Left Section clicks: All Track (4 tick boxes)
+                    // Left Section clicks: All Track (3 tick boxes)
                     if (mx >= left_x + 8 && mx <= left_x + col_w - 8) {
                         if (my >= box_y + 30 && my <= box_y + 60) {
                             // 1. All Track Complete Lock
@@ -8246,22 +8594,7 @@ int main(int argc, char *argv[]) {
                                 record_project_change("All Track Complete Lock: OFF", true);
                             }
                         } else if (my >= box_y + 66 && my <= box_y + 96) {
-                            // 2. All Track Complete Unlock
-                            push_undo_state();
-                            g_lock_opt_complete_unlock[ltab] = !g_lock_opt_complete_unlock[ltab];
-                            if (g_lock_opt_complete_unlock[ltab]) {
-                                g_lock_opt_full[ltab] = false;
-                                g_lock_opt_prevent_lr[ltab] = false;
-                                g_lock_opt_prevent_ud[ltab] = false;
-                                for (int t = 0; t < p->num_tracks; t++) {
-                                    g_track_locked[ltab][t] = false;
-                                    g_track_lock_lr_only[ltab][t] = false;
-                                    g_track_lock_ud_only[ltab][t] = false;
-                                }
-                                record_project_change("All Track Complete Unlock", true);
-                            }
-                        } else if (my >= box_y + 102 && my <= box_y + 132) {
-                            // 3. Lock only clip item Left Right move (All Track)
+                            // 2. Lock only clip item Left Right move (All Track)
                             push_undo_state();
                             g_lock_opt_prevent_lr[ltab] = !g_lock_opt_prevent_lr[ltab];
                             g_lock_opt_full[ltab] = false;
@@ -8272,8 +8605,8 @@ int main(int argc, char *argv[]) {
                                 g_track_locked[ltab][t] = (g_track_lock_lr_only[ltab][t] || g_track_lock_ud_only[ltab][t]);
                             }
                             record_project_change("All Track: Lock Left/Right Clip Move", true);
-                        } else if (my >= box_y + 138 && my <= box_y + 168) {
-                            // 4. Lock only clip item Up Down move (All Track)
+                        } else if (my >= box_y + 102 && my <= box_y + 132) {
+                            // 3. Lock only clip item Up Down move (All Track)
                             push_undo_state();
                             g_lock_opt_prevent_ud[ltab] = !g_lock_opt_prevent_ud[ltab];
                             g_lock_opt_full[ltab] = false;
@@ -8366,6 +8699,7 @@ int main(int argc, char *argv[]) {
                                 SDL_StopTextInput();
                             }
                         } else {
+                            daw_text_edit_click_cursor(g_time_jump_buf, mx, wx + 70);
                             SDL_StartTextInput();
                         }
                         continue;
@@ -8505,6 +8839,7 @@ int main(int argc, char *argv[]) {
                                     }
                                 } else if (ctrl->type == SCP_CTRL_INPUT && mx >= wx + 180 && mx <= wx + ww - 20) {
                                     g_script_popup.focused_ctrl_idx = i;
+                                    daw_text_edit_click_cursor(ctrl->str_val, mx, wx + 188);
                                     SDL_StartTextInput();
                                 }
                             }
@@ -8654,6 +8989,7 @@ int main(int argc, char *argv[]) {
                             save_themes_settings_json();
                         } else if (mx >= wx + 132 && mx <= wx + 218 && my >= wy + 132 && my <= wy + 158) {
                             g_reposition.interval_focused = true;
+                            daw_text_edit_click_cursor(g_reposition.interval_str, mx, wx + 140);
                             SDL_StartTextInput();
                         }
                         int by = wy + wh - 42;
@@ -8807,6 +9143,7 @@ int main(int argc, char *argv[]) {
                         if (my >= sy_dir - 2 && my <= sy_dir + 28) {
                             if (mx >= ex + 128 && mx <= ex + 547) {
                                 g_export.active_field = EXP_FIELD_DIR;
+                                daw_text_edit_click_cursor(g_export.directory, mx, ex + 136);
                                 SDL_StartTextInput();
                             } else if (mx >= ex + 553 && mx <= ex + 664) {
                                 browse_export_directory_and_filename();
@@ -8819,6 +9156,7 @@ int main(int argc, char *argv[]) {
                         if (my >= sy_fn - 2 && my <= sy_fn + 28) {
                             if (mx >= ex + 128 && mx <= ex + 547) {
                                 g_export.active_field = EXP_FIELD_FILENAME;
+                                daw_text_edit_click_cursor(g_export.filename, mx, ex + 136);
                                 SDL_StartTextInput();
                             }
                             continue;
@@ -8882,12 +9220,15 @@ int main(int argc, char *argv[]) {
                                     }
                                 } else if (mx >= ex + 293 && mx <= ex + 367) {
                                     g_export.active_field = EXP_FIELD_MP4_WIDTH;
+                                    daw_text_edit_click_cursor(g_export.mp4_width_str, mx, ex + 303);
                                     SDL_StartTextInput();
                                 } else if (mx >= ex + 388 && mx <= ex + 462) {
                                     g_export.active_field = EXP_FIELD_MP4_HEIGHT;
+                                    daw_text_edit_click_cursor(g_export.mp4_height_str, mx, ex + 398);
                                     SDL_StartTextInput();
                                 } else if (mx >= ex + 566 && mx <= ex + 650) {
                                     g_export.active_field = EXP_FIELD_MP4_FPS;
+                                    daw_text_edit_click_cursor(g_export.mp4_fps_str, mx, ex + 576);
                                     SDL_StartTextInput();
                                 }
                                 continue;
@@ -8904,6 +9245,7 @@ int main(int argc, char *argv[]) {
                                     else strcpy(g_export.mp4_video_kbps_str, "1024");
                                 } else if (mx >= ex + 293 && mx <= ex + 398) {
                                     g_export.active_field = EXP_FIELD_MP4_V_KBPS;
+                                    daw_text_edit_click_cursor(g_export.mp4_video_kbps_str, mx, ex + 303);
                                     SDL_StartTextInput();
                                 }
                                 continue;
@@ -9067,6 +9409,7 @@ int main(int argc, char *argv[]) {
                         // 4. rgba(...) Code Input Box click
                         if (mx >= p_x && mx <= p_x + 212 && my >= code_y && my <= code_y + 30) {
                             g_theme.code_focused = true;
+                            daw_text_edit_click_cursor(g_theme.code_buf, mx, p_x + 8);
                             SDL_StartTextInput();
                             continue;
                         }
@@ -9275,6 +9618,13 @@ int main(int argc, char *argv[]) {
 
                 if (g_daw.input_focus != INPUT_FOCUS_NONE) {
                     if (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME) {
+                        int et = g_daw.editing_track_name_idx;
+                        int ty_et = (et >= 0 && et < p->num_tracks) ? get_track_y_pos(et) : -999;
+                        if (et >= 0 && mx >= 8 && mx <= g_daw.tcp_width - 10 && my >= ty_et + 6 && my <= ty_et + 28 &&
+                            e.button.button == SDL_BUTTON_LEFT) {
+                            daw_text_edit_click_cursor(g_daw.editing_name_buf, mx, 12);
+                            continue;
+                        }
                         if (strcmp(p->track_names[g_daw.editing_track_name_idx], g_daw.editing_name_buf) != 0) push_undo_state();
                         strncpy(p->track_names[g_daw.editing_track_name_idx], g_daw.editing_name_buf, 63);
                         p->is_dirty = true;
@@ -9297,6 +9647,7 @@ int main(int argc, char *argv[]) {
                                 if (char_pos < 0) char_pos = 0;
                                 if (char_pos > max_l) char_pos = max_l;
                                 g_marker_cursor_pos = char_pos;
+                                daw_text_edit_click_cursor(g_editing_marker_full_buf, mx, mk_x + 6);
                             }
                         }
                         if (clicked_inside_editing_marker) {
@@ -9474,6 +9825,7 @@ int main(int argc, char *argv[]) {
                             int pin_x = clr_x + 60;
                             if (mx >= flt_x && mx <= flt_x + flt_w) {
                                 g_script_filter_focused = true;
+                                daw_text_edit_click_cursor(g_script_filter_text, mx, flt_x + 6);
                                 SDL_StartTextInput();
                             } else if (mx >= clr_x && mx <= clr_x + 54) {
                                 g_script_filter_text[0] = '\0';
@@ -9770,7 +10122,7 @@ int main(int argc, char *argv[]) {
                     int play_btn_x  = clock_x - 46;
                     int clock_box_x = clock_x - 10;
                     int rec_btn_x   = clock_box_x + 128 + 6;
-                    int rec_onoff_x = rec_btn_x + 56;
+                    int rec_onoff_x = rec_btn_x + 52;
 
                     // Left-side top menu: File | Action | Tools | Edit | Settings | Video
                     if (mx >= 8 && mx <= 54) {
@@ -10090,6 +10442,7 @@ int main(int argc, char *argv[]) {
                                     g_daw.input_focus = INPUT_FOCUS_TRACK_NAME;
                                     g_daw.editing_track_name_idx = t;
                                     strncpy(g_daw.editing_name_buf, p->track_names[t], 63);
+                                    daw_text_edit_focus_buf(g_daw.editing_name_buf, true);
                                     SDL_StartTextInput();
                                     handled_btn = true;
                                 }
@@ -10942,7 +11295,7 @@ int main(int argc, char *argv[]) {
                 double media_internal_time = (p->playhead_seconds - v_clip->start_time) + v_clip->offset_in_file;
 
                 // Load the original media container (file_path), NOT the raw PCM audio cache (raw_audio_path)
-                if (strncmp(p->video.current_loaded_path, v_clip->file_path, sizeof(p->video.current_loaded_path)) != 0 || !p->video.texture) {
+                if (strncmp(p->video.current_loaded_path, v_clip->file_path, sizeof(p->video.current_loaded_path)) != 0) {
                     open_video_by_path(&p->video, v_clip->file_path, ren);
                 }
 
@@ -10955,6 +11308,9 @@ int main(int argc, char *argv[]) {
             } else {
                 p->video.has_active_frame = false;
             }
+        } else if (p->video.fmt_ctx != NULL || p->video.texture != NULL) {
+            close_video(&p->video);
+            p->video.is_open = false;
         }
 
         // ================= RENDERING =================
@@ -11093,7 +11449,7 @@ int main(int argc, char *argv[]) {
         int play_btn_x  = clock_x - 46;
         int clock_box_x = clock_x - 10;
         int rec_btn_x   = clock_box_x + 128 + 6;
-        int rec_onoff_x = rec_btn_x + 72;
+        int rec_onoff_x = rec_btn_x + 52;
 
         // Requirement 12: Play/Pause symbol-only button near left side of Time Clock
         SDL_Rect btn_play_sym = { play_btn_x, TABBAR_HEIGHT + 5, 32, 26 };
@@ -11176,7 +11532,7 @@ int main(int argc, char *argv[]) {
         // 3. Corner Header (+ Track and Master Lock / M / S buttons next to + Track — semi-dark to match TCP)
         int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
         SDL_Rect corner_area = { 0, corner_y, g_daw.tcp_width, RULER_HEIGHT + m_lane_h };
-        SDL_SetRenderDrawColor(ren, 16, 16, 18, 255);
+        SDL_SetRenderDrawColor(ren, 12, 22, 42, 255);
         SDL_RenderFillRect(ren, &corner_area);
         draw_brown_border_rect(ren, &corner_area, false, true);
 
@@ -11362,19 +11718,8 @@ int main(int argc, char *argv[]) {
                     SDL_RenderDrawLine(ren, m_tag.x + m_tag.w - 2, m_tag.y, m_tag.x + m_tag.w - 2, m_tag.y + m_tag.h - 1);
 
                     SDL_Rect txt_bounds = { m_tag.x + 3, m_tag.y + 1, m_tag.w - 6, m_tag.h - 2 };
+                    daw_draw_text_edit_overlay(ren, g_editing_marker_full_buf, mk_x + 6, m_tag.y, m_tag.h, m_tag.x + m_tag.w - 3);
                     draw_text_clipped(ren, disp_txt, mk_x + 6, marker_y + 6, c_white, &txt_bounds, &marker_clip);
-
-                    // Blinking Typing Cursor
-                    int cur_pos = g_marker_cursor_pos;
-                    int max_l = (int)strlen(g_editing_marker_full_buf);
-                    if (cur_pos < 0) cur_pos = 0;
-                    if (cur_pos > max_l) cur_pos = max_l;
-                    int cx = mk_x + 6 + cur_pos * 8;
-                    if ((SDL_GetTicks() / 450) % 2 == 0) {
-                        SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                        SDL_RenderDrawLine(ren, cx, marker_y + 4, cx, marker_y + MARKER_BAR_HEIGHT - 4);
-                        SDL_RenderDrawLine(ren, cx + 1, marker_y + 4, cx + 1, marker_y + MARKER_BAR_HEIGHT - 4);
-                    }
                 }
             }
 
@@ -11383,6 +11728,86 @@ int main(int argc, char *argv[]) {
 
         int header_top_y = marker_y + m_lane_h;
         SDL_Rect timeline_clip = { g_daw.tcp_width, header_top_y, view_w, view_h };
+
+        // Compute 64-bit state hash of all static timeline + waveform parameters for GPU texture caching (REAPER-style 0-1% CPU playback)
+        static SDL_Texture *g_timeline_cache_tex = NULL;
+        static int          g_timeline_cache_w = 0;
+        static int          g_timeline_cache_h = 0;
+        static uint64_t     g_timeline_cache_hash = 0;
+
+        uint64_t tl_hash = 1469598103934665603ULL;
+        #define TL_HASH_MIX(val) do { uint64_t _v = (uint64_t)(val); tl_hash ^= _v; tl_hash *= 1099511628211ULL; } while (0)
+        TL_HASH_MIX(g_daw.active_tab);
+        TL_HASH_MIX(win_w);
+        TL_HASH_MIX(win_h);
+        TL_HASH_MIX(view_w);
+        TL_HASH_MIX(view_h);
+        TL_HASH_MIX(g_daw.tcp_width);
+        TL_HASH_MIX(header_top_y);
+        TL_HASH_MIX((int64_t)(p->scroll_x_sec * 10000.0));
+        TL_HASH_MIX(p->scroll_y_px);
+        TL_HASH_MIX((int64_t)(p->pixels_per_second * 1000.0f));
+        TL_HASH_MIX(p->num_tracks);
+        TL_HASH_MIX(p->num_items);
+        TL_HASH_MIX(g_universal_peak_color_idx);
+        TL_HASH_MIX(g_theme.r); TL_HASH_MIX(g_theme.g); TL_HASH_MIX(g_theme.b); TL_HASH_MIX(g_theme.a);
+        TL_HASH_MIX(g_dyn_split.is_open ? 1 : 0);
+        TL_HASH_MIX(g_dyn_split.display_gate_threshold ? 1 : 0);
+        TL_HASH_MIX((int)(g_dyn_split.gate_threshold_db * 10.0f));
+        TL_HASH_MIX(dragging_item_idx);
+        TL_HASH_MIX(dragging_fade_in ? 1 : 0);
+        TL_HASH_MIX(dragging_fade_out ? 1 : 0);
+        TL_HASH_MIX(g_rec.is_recording ? 1 : 0);
+        TL_HASH_MIX(g_rec.rec_frames_written / 2048);
+        TL_HASH_MIX(range_on ? 1 : 0);
+        if (range_on) {
+            TL_HASH_MIX((int64_t)(get_range_start() * 1000.0));
+            TL_HASH_MIX((int64_t)(get_range_end() * 1000.0));
+        }
+        int cur_tab_tl = get_valid_tab_idx();
+        for (int t_h = 0; t_h < p->num_tracks; t_h++) {
+            TL_HASH_MIX(p->track_heights[t_h]);
+            TL_HASH_MIX((int)(p->track_db[t_h] * 20.0f));
+            TL_HASH_MIX(p->track_selected[t_h] ? 1 : 0);
+            TL_HASH_MIX(g_track_hidden[cur_tab_tl][t_h] ? 1 : 0);
+            TL_HASH_MIX(g_track_color_idx[cur_tab_tl][t_h]);
+        }
+        for (int i_h = 0; i_h < p->num_items; i_h++) {
+            AudioItem *it_h = &p->items[i_h];
+            TL_HASH_MIX(it_h->track_idx);
+            TL_HASH_MIX((int64_t)(it_h->start_time * 1000.0));
+            TL_HASH_MIX((int64_t)(it_h->offset_in_file * 1000.0));
+            TL_HASH_MIX((int64_t)(it_h->duration * 1000.0));
+            TL_HASH_MIX(it_h->peak_count);
+            TL_HASH_MIX(it_h->is_selected ? 1 : 0);
+            TL_HASH_MIX((int64_t)(g_item_fade_in[cur_tab_tl][i_h] * 1000.0));
+            TL_HASH_MIX((int64_t)(g_item_fade_out[cur_tab_tl][i_h] * 1000.0));
+            TL_HASH_MIX((int)(g_item_vol_db[cur_tab_tl][i_h] * 20.0f));
+            TL_HASH_MIX(g_item_muted[cur_tab_tl][i_h] ? 1 : 0);
+            TL_HASH_MIX(g_item_color_idx[cur_tab_tl][i_h]);
+            TL_HASH_MIX(g_item_group_id[cur_tab_tl][i_h]);
+        }
+        #undef TL_HASH_MIX
+
+        if (win_w > 0 && win_h > 0 && (!g_timeline_cache_tex || g_timeline_cache_w != win_w || g_timeline_cache_h != win_h)) {
+            if (g_timeline_cache_tex) SDL_DestroyTexture(g_timeline_cache_tex);
+            g_timeline_cache_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, win_w, win_h);
+            g_timeline_cache_w = win_w;
+            g_timeline_cache_h = win_h;
+            g_timeline_cache_hash = 0;
+        }
+
+        bool use_tl_target = false;
+        bool need_tl_redraw = true;
+        if (g_timeline_cache_tex) {
+            if (tl_hash == g_timeline_cache_hash && g_timeline_cache_hash != 0) {
+                need_tl_redraw = false;
+            } else if (SDL_SetRenderTarget(ren, g_timeline_cache_tex) == 0) {
+                use_tl_target = true;
+            }
+        }
+
+        if (need_tl_redraw) {
         SDL_RenderSetClipRect(ren, &timeline_clip);
         SDL_SetRenderDrawColor(ren, 31, 31, 33, 255);
         SDL_RenderFillRect(ren, &timeline_clip);
@@ -11455,10 +11880,7 @@ int main(int argc, char *argv[]) {
 
             int hdr_h = (ih > 18) ? 18 : ih;
             SDL_Rect hdr_r = { vis_x1, iy, vis_w, hdr_h };
-            SDL_SetRenderDrawColor(ren,
-                g_studio_pal_hdr[c_idx][0] + (it->is_selected ? 18 : 0),
-                g_studio_pal_hdr[c_idx][1] + (it->is_selected ? 12 : 0),
-                g_studio_pal_hdr[c_idx][2] + (it->is_selected ? 8 : 0), 255);
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderFillRect(ren, &hdr_r);
         }
 
@@ -11497,6 +11919,19 @@ int main(int argc, char *argv[]) {
 
                 float half_amp = (float)(ih / 2 - 5);
                 if (half_amp < 4.0f) half_amp = 4.0f;
+                int min_wave_y = iy + ((ih > 18) ? 19 : 3);
+
+                bool clip_has_xfade_or_fade = (get_item_fade_in(p, i) > 0.001) || (get_item_fade_out(p, i) > 0.001);
+                if (!clip_has_xfade_or_fade) {
+                    for (int o = 0; o < p->num_items; o++) {
+                        if (o == i) continue;
+                        AudioItem *ot = &p->items[o];
+                        if (ot->track_idx != it->track_idx) continue;
+                        double ov_s = fmax(it->start_time, ot->start_time);
+                        double ov_e = fmin(it->start_time + it->duration, ot->start_time + ot->duration);
+                        if (ov_e > ov_s + 0.0005) { clip_has_xfade_or_fade = true; break; }
+                    }
+                }
 
                 SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
                 for (int px = vis_x1; px < vis_x2; px++) {
@@ -11543,13 +11978,13 @@ int main(int argc, char *argv[]) {
                         draw_bot_v = 0.55f * draw_bot_v + 0.45f * avg_mn;
                     }
 
-                    float xfade_env = compute_item_crossfade_gain(p, i, timeline_sec);
+                    float xfade_env = clip_has_xfade_or_fade ? compute_item_crossfade_gain(p, i, timeline_sec) : 1.0f;
                     float env_gain = gain_multiplier * xfade_env;
 
                     int y_top = mid_y - (int)(draw_top_v * env_gain * half_amp + 0.5f);
                     int y_bot = mid_y - (int)(draw_bot_v * env_gain * half_amp - 0.5f);
 
-                    if (y_top < iy + 3) y_top = iy + 3;
+                    if (y_top < min_wave_y) y_top = min_wave_y;
                     if (y_bot > iy + ih - 3) y_bot = iy + ih - 3;
                     if (y_top > mid_y) y_top = mid_y;
                     if (y_bot < mid_y) y_bot = mid_y;
@@ -11640,6 +12075,14 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawColor(ren, 80, 235, 120, 220);
                 SDL_RenderDrawLine(ren, ix, mid_y - dy_thr, ix + iw, mid_y - dy_thr);
                 SDL_RenderDrawLine(ren, ix, mid_y + dy_thr, ix + iw, mid_y + dy_thr);
+            }
+
+            // Full black top clip name area background
+            int hdr_h_top = (ih > 18) ? 18 : ih;
+            if (vis_x2 > vis_x1 && hdr_h_top > 0) {
+                SDL_Rect hdr_top_black = { vis_x1, iy, vis_x2 - vis_x1, hdr_h_top };
+                SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+                SDL_RenderFillRect(ren, &hdr_top_black);
             }
 
             // Brown clip border (thicker when clip is selected)
@@ -11827,6 +12270,18 @@ int main(int argc, char *argv[]) {
             SDL_RenderDrawLine(ren, rx1 + rw - 1, header_top_y, rx1 + rw - 1, header_top_y + view_h);
         }
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        if (use_tl_target) {
+            SDL_RenderSetClipRect(ren, NULL);
+            SDL_SetRenderTarget(ren, NULL);
+            g_timeline_cache_hash = tl_hash;
+        }
+        } // end if (need_tl_redraw)
+
+        if (g_timeline_cache_tex && g_timeline_cache_hash == tl_hash) {
+            SDL_RenderSetClipRect(ren, NULL);
+            SDL_RenderCopy(ren, g_timeline_cache_tex, &timeline_clip, &timeline_clip);
+        }
+        SDL_RenderSetClipRect(ren, &timeline_clip);
 
         if (marquee_selecting) {
             int mx1 = fmin(marquee_start_x, marquee_cur_x);
@@ -11844,10 +12299,10 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 6. Track Header (TCP) — Semi-Dark Background for Clean Visual Separation from Timeline Section
+        // 6. Track Header (TCP) — Dark Blue Studio Background
         SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
-        SDL_SetRenderDrawColor(ren, 12, 12, 14, 255);
+        SDL_SetRenderDrawColor(ren, 10, 18, 34, 255);
         SDL_RenderFillRect(ren, &tcp_clip);
         for (int i = 0; i < p->num_tracks; i++) {
             if (is_track_hidden(i)) continue;
@@ -11858,9 +12313,9 @@ int main(int argc, char *argv[]) {
 
             int trk_col = g_track_color_idx[get_valid_tab_idx()][i] % NUM_STUDIO_COLORS;
             if (trk_col < 0) trk_col = 0;
-            uint8_t tcp_r = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][0] * 70) / 100 + (is_sel ? 14 : 0)) : (is_dragging_this_trk ? 34 : (is_sel ? 25 : 16));
-            uint8_t tcp_g = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][1] * 70) / 100 + (is_sel ? 10 : 0)) : (is_dragging_this_trk ? 26 : (is_sel ? 20 : 16));
-            uint8_t tcp_b = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][2] * 70) / 100 + (is_sel ? 8 : 0))  : (is_dragging_this_trk ? 20 : (is_sel ? 18 : 18));
+            uint8_t tcp_r = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][0] * 70) / 100 + (is_sel ? 14 : 0)) : (is_dragging_this_trk ? 30 : (is_sel ? 24 : 16));
+            uint8_t tcp_g = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][1] * 70) / 100 + (is_sel ? 10 : 0)) : (is_dragging_this_trk ? 52 : (is_sel ? 42 : 28));
+            uint8_t tcp_b = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][2] * 70) / 100 + (is_sel ? 8 : 0))  : (is_dragging_this_trk ? 92 : (is_sel ? 76 : 54));
             SDL_Rect tp = { 1, ty + 1, g_daw.tcp_width - 2, th - 2 };
             SDL_SetRenderDrawColor(ren, tcp_r, tcp_g, tcp_b, 255);
             SDL_RenderFillRect(ren, &tp);
@@ -11890,12 +12345,8 @@ int main(int argc, char *argv[]) {
 
             SDL_Rect name_txt_bounds = { name_box.x + 2, name_box.y + 1, name_box.w - 4, name_box.h - 2 };
             if (is_editing) {
+                daw_draw_text_edit_overlay(ren, g_daw.editing_name_buf, 12, name_box.y, name_box.h, name_box.x + name_box.w - 4);
                 draw_text_clipped(ren, g_daw.editing_name_buf, 12, ty + 10, c_white, &name_txt_bounds, &tcp_clip);
-                int text_w = (int)strlen(g_daw.editing_name_buf) * 8;
-                if ((SDL_GetTicks() / 500) % 2 == 0) {
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, 12 + text_w, ty + 8, 12 + text_w, ty + 24);
-                }
             } else {
                 draw_text_clipped(ren, p->track_names[i], 12, ty + 10, c_white, &name_txt_bounds, &tcp_clip);
             }
@@ -12039,14 +12490,10 @@ int main(int argc, char *argv[]) {
             draw_brown_border_rect(ren, &s_flt_box, g_script_filter_focused, false);
 
             SDL_Rect s_flt_clip = { s_flt_box.x + 4, s_flt_box.y + 2, s_flt_box.w - 8, s_flt_box.h - 4 };
-            draw_text_clipped(ren, g_script_filter_text, s_flt_box.x + 6, top_y + 5, c_white, &s_flt_clip, NULL);
-            if (g_script_filter_focused && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                int cx = s_flt_box.x + 6 + (int)strlen(g_script_filter_text) * 8;
-                if (cx < s_flt_box.x + s_flt_box.w - 4) {
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, top_y + 4, cx, top_y + 20);
-                }
+            if (g_script_filter_focused) {
+                daw_draw_text_edit_overlay(ren, g_script_filter_text, s_flt_box.x + 6, s_flt_box.y, s_flt_box.h, s_flt_box.x + s_flt_box.w - 4);
             }
+            draw_text_clipped(ren, g_script_filter_text, s_flt_box.x + 6, top_y + 5, c_white, &s_flt_clip, NULL);
 
             SDL_Rect b_s_clr = { clr_x, top_y, 54, 24 };
             SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
@@ -12375,14 +12822,10 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &box_dir);
             draw_brown_border_rect(ren, &box_dir, ed_dir, false);
             SDL_Rect box_dir_clip = { box_dir.x + 4, box_dir.y + 2, box_dir.w - 8, box_dir.h - 4 };
-            draw_text_clipped(ren, g_export.directory, box_dir.x + 6, sy_dir + 7, c_white, &box_dir_clip, NULL);
-            if (ed_dir && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                int cx = box_dir.x + 6 + (int)strlen(g_export.directory) * 8;
-                if (cx < box_dir.x + box_dir.w - 4) {
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, sy_dir + 5, cx, sy_dir + 21);
-                }
+            if (ed_dir) {
+                daw_draw_text_edit_overlay(ren, g_export.directory, box_dir.x + 6, box_dir.y, box_dir.h, box_dir.x + box_dir.w - 4);
             }
+            draw_text_clipped(ren, g_export.directory, box_dir.x + 6, sy_dir + 7, c_white, &box_dir_clip, NULL);
 
             SDL_Rect btn_browse = { ex + 555, sy_dir, 107, 26 };
             SDL_SetRenderDrawColor(ren, 52, 40, 30, 255);
@@ -12399,14 +12842,10 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &box_fn);
             draw_brown_border_rect(ren, &box_fn, ed_fn, false);
             SDL_Rect box_fn_clip = { box_fn.x + 4, box_fn.y + 2, box_fn.w - 8, box_fn.h - 4 };
-            draw_text_clipped(ren, g_export.filename, box_fn.x + 6, sy_fn + 7, c_white, &box_fn_clip, NULL);
-            if (ed_fn && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                int cx = box_fn.x + 6 + (int)strlen(g_export.filename) * 8;
-                if (cx < box_fn.x + box_fn.w - 4) {
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, sy_fn + 5, cx, sy_fn + 21);
-                }
+            if (ed_fn) {
+                daw_draw_text_edit_overlay(ren, g_export.filename, box_fn.x + 6, box_fn.y, box_fn.h, box_fn.x + box_fn.w - 4);
             }
+            draw_text_clipped(ren, g_export.filename, box_fn.x + 6, sy_fn + 7, c_white, &box_fn_clip, NULL);
             char ext_preview[16];
             snprintf(ext_preview, sizeof(ext_preview), ".%s", get_export_ext());
             draw_text(ren, ext_preview, ex + 555, sy_fn + 7, c_muted);
@@ -12558,12 +12997,10 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
                 SDL_RenderFillRect(ren, &box_w);
                 draw_brown_border_rect(ren, &box_w, ed_w, false);
-                draw_text(ren, g_export.mp4_width_str, box_w.x + 8, r1_y + 7, c_white);
-                if (ed_w && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                    int cx = box_w.x + 8 + (int)strlen(g_export.mp4_width_str) * 8;
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, r1_y + 5, cx, r1_y + 21);
+                if (ed_w) {
+                    daw_draw_text_edit_overlay(ren, g_export.mp4_width_str, box_w.x + 8, box_w.y, box_w.h, box_w.x + box_w.w - 4);
                 }
+                draw_text(ren, g_export.mp4_width_str, box_w.x + 8, r1_y + 7, c_white);
 
                 draw_text(ren, "x", ex + 373, r1_y + 7, c_white);
 
@@ -12572,12 +13009,10 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
                 SDL_RenderFillRect(ren, &box_h);
                 draw_brown_border_rect(ren, &box_h, ed_h, false);
-                draw_text(ren, g_export.mp4_height_str, box_h.x + 8, r1_y + 7, c_white);
-                if (ed_h && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                    int cx = box_h.x + 8 + (int)strlen(g_export.mp4_height_str) * 8;
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, r1_y + 5, cx, r1_y + 21);
+                if (ed_h) {
+                    daw_draw_text_edit_overlay(ren, g_export.mp4_height_str, box_h.x + 8, box_h.y, box_h.h, box_h.x + box_h.w - 4);
                 }
+                draw_text(ren, g_export.mp4_height_str, box_h.x + 8, r1_y + 7, c_white);
 
                 draw_text(ren, "Framerate:", ex + 476, r1_y + 7, c_white);
                 SDL_Rect box_fps = { ex + 568, r1_y, 80, 26 };
@@ -12585,12 +13020,10 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
                 SDL_RenderFillRect(ren, &box_fps);
                 draw_brown_border_rect(ren, &box_fps, ed_fps, false);
-                draw_text(ren, g_export.mp4_fps_str, box_fps.x + 8, r1_y + 7, c_white);
-                if (ed_fps && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                    int cx = box_fps.x + 8 + (int)strlen(g_export.mp4_fps_str) * 8;
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, r1_y + 5, cx, r1_y + 21);
+                if (ed_fps) {
+                    daw_draw_text_edit_overlay(ren, g_export.mp4_fps_str, box_fps.x + 8, box_fps.y, box_fps.h, box_fps.x + box_fps.w - 4);
                 }
+                draw_text(ren, g_export.mp4_fps_str, box_fps.x + 8, r1_y + 7, c_white);
 
                 // Row 2 (matching image_736e58.png):
                 // Video: [ H.264 ]   [ 2048 ] kbps
@@ -12608,12 +13041,10 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
                 SDL_RenderFillRect(ren, &box_vkbps);
                 draw_brown_border_rect(ren, &box_vkbps, ed_vk, false);
-                draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r2_y + 7, c_white);
-                if (ed_vk && ((SDL_GetTicks() / 450) % 2 == 0)) {
-                    int cx = box_vkbps.x + 8 + (int)strlen(g_export.mp4_video_kbps_str) * 8;
-                    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-                    SDL_RenderDrawLine(ren, cx, r2_y + 5, cx, r2_y + 21);
+                if (ed_vk) {
+                    daw_draw_text_edit_overlay(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, box_vkbps.y, box_vkbps.h, box_vkbps.x + box_vkbps.w - 4);
                 }
+                draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r2_y + 7, c_white);
                 draw_text(ren, "kbps", ex + 405, r2_y + 7, c_white);
 
                 // Row 3: Audio: [ AAC ]   [ 120 / 192 / 320 kbps  v ] dropdown menu
