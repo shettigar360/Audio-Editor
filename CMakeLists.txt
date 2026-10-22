@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(AudioEditor C CXX)
 
+if(WIN32)
+    enable_language(RC)
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
