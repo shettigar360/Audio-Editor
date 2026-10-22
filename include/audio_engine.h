@@ -22,8 +22,8 @@
 #define MAX_TRACKS 32
 #define MAX_ITEMS 1024
 #define SAMPLE_RATE 48000
-#define PEAK_SAMPLES_PER_BIN 16
-#define DAW_PK_CACHE_MAGIC 0x504B4339U
+#define PEAK_SAMPLES_PER_BIN 96
+#define DAW_PK_CACHE_MAGIC 0x504B433AU
 #ifndef DAW_PEAK_POOL_DEFINED
 #define DAW_PEAK_POOL_DEFINED
 #define MAX_SHARED_PEAK_ENTRIES 256
@@ -76,6 +76,14 @@ static inline int daw_fseek64(FILE *fp, int64_t offset, int origin) {
     return _fseeki64(fp, (int64_t)offset, origin);
 #else
     return fseeko(fp, (off_t)offset, origin);
+#endif
+}
+static inline int64_t daw_ftell64(FILE *fp) {
+    if (!fp) return -1;
+#ifdef _WIN32
+    return (int64_t)_ftelli64(fp);
+#else
+    return (int64_t)ftello(fp);
 #endif
 }
 
@@ -208,6 +216,10 @@ static inline PeakBin* daw_rebuild_peaks_from_raw_file(const char *raw_path, con
         cur_bin++;
     }
     fclose(fp);
+    if (cur_bin > 0 && cur_bin < alloc_bins) {
+        PeakBin *shrunk = (PeakBin *)realloc(peaks, (size_t)cur_bin * sizeof(PeakBin));
+        if (shrunk) peaks = shrunk;
+    }
 
     double actual_dur = (double)total_frames / (double)SAMPLE_RATE;
     if (pk_cache_path && pk_cache_path[0]) {
@@ -378,9 +390,14 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
         return -1;
     }
 
+    for (unsigned int s_i = 0; s_i < fmt->nb_streams; s_i++) {
+        #ifdef AVDISCARD_ALL
+        if ((int)s_i != a_idx) fmt->streams[s_i]->discard = AVDISCARD_ALL;
+#endif
+    }
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(ctx, cpar);
-    ctx->thread_count = 0;
+    ctx->thread_count = 2;
     if (avcodec_open2(ctx, codec, NULL) < 0) {
         avcodec_free_context(&ctx);
         avformat_close_input(&fmt);
@@ -596,6 +613,10 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
         peak_cache[current_bin].min_val = cur_min;
         peak_cache[current_bin].max_val = cur_max;
         current_bin++;
+    }
+    if (peak_cache && current_bin > 0 && current_bin < estimated_bins) {
+        PeakBin *shrunk = (PeakBin *)realloc(peak_cache, (size_t)current_bin * sizeof(PeakBin));
+        if (shrunk) peak_cache = shrunk;
     }
 
     free(temp_pcm);
