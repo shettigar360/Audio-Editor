@@ -22,7 +22,8 @@
 #define MAX_TRACKS 32
 #define MAX_ITEMS 1024
 #define SAMPLE_RATE 48000
-#define PEAK_SAMPLES_PER_BIN 1024
+#define PEAK_SAMPLES_PER_BIN 16
+#define DAW_PK_CACHE_MAGIC 0x504B4339U
 #ifndef DAW_PEAK_POOL_DEFINED
 #define DAW_PEAK_POOL_DEFINED
 #define MAX_SHARED_PEAK_ENTRIES 256
@@ -155,6 +156,79 @@ static inline PeakBin* daw_register_shared_peaks(const char *raw_path, PeakBin *
 #endif // DAW_PEAK_POOL_DEFINED
 
 // Simple string hash to generate distinct cache filenames
+// Rebuilds high-resolution 32-sample REAPER-style peaks directly from an existing .raw stereo float cache file
+static inline PeakBin* daw_rebuild_peaks_from_raw_file(const char *raw_path, const char *pk_cache_path,
+                                                       int *out_peak_count, double *out_total_dur, bool has_video) {
+    if (!raw_path || !raw_path[0]) return NULL;
+    FILE *fp = daw_fopen_LockFreeRead(raw_path);
+    if (!fp) return NULL;
+    int alloc_bins = 65536;
+    PeakBin *peaks = (PeakBin *)calloc((size_t)alloc_bins, sizeof(PeakBin));
+    if (!peaks) { fclose(fp); return NULL; }
+
+    float buf[4096 * 2];
+    int cur_bin = 0;
+    int samp_in_bin = 0;
+    float cur_min = 0.0f, cur_max = 0.0f;
+    int64_t total_frames = 0;
+    size_t got = 0;
+
+    while ((got = fread(buf, sizeof(float) * 2, 4096, fp)) > 0) {
+        total_frames += (int64_t)got;
+        for (size_t s = 0; s < got; s++) {
+            float mono = (buf[s * 2] + buf[s * 2 + 1]) * 0.5f;
+            if (samp_in_bin == 0) {
+                cur_min = mono;
+                cur_max = mono;
+            } else {
+                if (mono < cur_min) cur_min = mono;
+                if (mono > cur_max) cur_max = mono;
+            }
+            samp_in_bin++;
+            if (samp_in_bin >= PEAK_SAMPLES_PER_BIN) {
+                if (cur_bin >= alloc_bins) {
+                    int new_cap = alloc_bins * 2;
+                    PeakBin *grown = (PeakBin *)realloc(peaks, (size_t)new_cap * sizeof(PeakBin));
+                    if (!grown) { free(peaks); fclose(fp); return NULL; }
+                    memset(grown + alloc_bins, 0, (size_t)(new_cap - alloc_bins) * sizeof(PeakBin));
+                    peaks = grown;
+                    alloc_bins = new_cap;
+                }
+                peaks[cur_bin].min_val = cur_min;
+                peaks[cur_bin].max_val = cur_max;
+                cur_bin++;
+                samp_in_bin = 0;
+            }
+        }
+    }
+    if (total_frames <= 0) { free(peaks); fclose(fp); return NULL; }
+    if (samp_in_bin > 0 && cur_bin < alloc_bins) {
+        peaks[cur_bin].min_val = cur_min;
+        peaks[cur_bin].max_val = cur_max;
+        cur_bin++;
+    }
+    fclose(fp);
+
+    double actual_dur = (double)total_frames / (double)SAMPLE_RATE;
+    if (pk_cache_path && pk_cache_path[0]) {
+        FILE *f_pk = fopen(pk_cache_path, "wb");
+        if (f_pk) {
+            uint32_t magic = DAW_PK_CACHE_MAGIC;
+            int has_vid_i = has_video ? 1 : 0;
+            fwrite(&magic, sizeof(uint32_t), 1, f_pk);
+            fwrite(&actual_dur, sizeof(double), 1, f_pk);
+            fwrite(&has_vid_i, sizeof(int), 1, f_pk);
+            fwrite(&cur_bin, sizeof(int), 1, f_pk);
+            if (cur_bin > 0) fwrite(peaks, sizeof(PeakBin), (size_t)cur_bin, f_pk);
+            fclose(f_pk);
+        }
+    }
+    peaks = daw_register_shared_peaks(raw_path, peaks, cur_bin, actual_dur, has_video);
+    if (out_peak_count) *out_peak_count = cur_bin;
+    if (out_total_dur)  *out_total_dur  = actual_dur;
+    return peaks;
+}
+
 static inline unsigned int hash_path(const char *str) {
     unsigned int hash = 5381;
     int c;
@@ -198,6 +272,32 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
             item->is_selected = false;
             item->has_video = pooled_vid;
             item->raw_file_handle = f_existing;
+            return 0;
+        }
+    }
+
+    char pk_cache_path[512];
+    snprintf(pk_cache_path, sizeof(pk_cache_path), ".cache/%u.pk", h);
+    FILE *chk_raw = daw_fopen_LockFreeRead(item->raw_audio_path);
+    if (chk_raw) {
+        fclose(chk_raw);
+        bool has_vid_guess = false;
+        const char *ext_c = strrchr(filepath, '.');
+        if (ext_c && strstr(".mp4.MP4.mov.MOV.mkv.MKV.avi.AVI.webm.WEBM", ext_c) != NULL) {
+            has_vid_guess = true;
+        }
+        int rb_cnt = 0;
+        double rb_dur = 0.0;
+        PeakBin *rb_pk = daw_rebuild_peaks_from_raw_file(item->raw_audio_path, pk_cache_path, &rb_cnt, &rb_dur, has_vid_guess);
+        if (rb_pk && rb_dur > 0.0) {
+            item->has_video = has_vid_guess;
+            item->peaks = rb_pk;
+            item->peak_count = rb_cnt;
+            item->file_total_duration = rb_dur;
+            item->duration = rb_dur;
+            item->offset_in_file = 0.0;
+            item->is_selected = false;
+            item->raw_file_handle = daw_fopen_LockFreeRead(item->raw_audio_path);
             return 0;
         }
     }
@@ -384,8 +484,13 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
 
                         for (int s = 0; s < converted; s++) {
                             float mono = (temp_pcm[s * 2] + temp_pcm[s * 2 + 1]) * 0.5f;
-                            if (mono < cur_min) cur_min = mono;
-                            if (mono > cur_max) cur_max = mono;
+                            if (samples_in_bin == 0) {
+                                cur_min = mono;
+                                cur_max = mono;
+                            } else {
+                                if (mono < cur_min) cur_min = mono;
+                                if (mono > cur_max) cur_max = mono;
+                            }
                             samples_in_bin++;
 
                             if (samples_in_bin >= PEAK_SAMPLES_PER_BIN) {
