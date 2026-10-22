@@ -4,6 +4,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifndef SDL_PIXELFORMAT_IYUV
+#define SDL_PIXELFORMAT_IYUV 0x56555949U
+#endif
+
 static int64_t get_stream_start_pts(SimpleVideoPlayer *player) {
     if (!player || !player->fmt_ctx || player->video_stream_idx < 0 ||
         (unsigned int)player->video_stream_idx >= player->fmt_ctx->nb_streams) {
@@ -25,12 +29,50 @@ static double get_frame_pts_sec(SimpleVideoPlayer *player, double fallback_sec) 
 }
 
 static void upload_frame_to_texture(SimpleVideoPlayer *player) {
-    if (!player || !player->frame || !player->frame_rgb || !player->texture) return;
+    if (!player || !player->frame || !player->texture) return;
+
+    enum AVPixelFormat src_fmt = (player->frame->format != AV_PIX_FMT_NONE)
+                                 ? (enum AVPixelFormat)player->frame->format
+                                 : player->codec_ctx->pix_fmt;
+
+#if defined(AV_PIX_FMT_YUV420P) && SDL_VERSION_ATLEAST(2, 0, 1)
+    // Fast Zero-Copy GPU YUV420P upload (like REAPER): skips CPU sws_scale + skips 6MB RGB buffer
+#ifdef AV_PIX_FMT_YUVJ420P
+    bool is_yuv420 = (src_fmt == AV_PIX_FMT_YUV420P || src_fmt == AV_PIX_FMT_YUVJ420P);
+#else
+    bool is_yuv420 = (src_fmt == AV_PIX_FMT_YUV420P);
+#endif
+    if (is_yuv420 &&
+        player->frame->data[0] && player->frame->data[1] && player->frame->data[2]) {
+        SDL_UpdateYUVTexture(
+            player->texture,
+            NULL,
+            player->frame->data[0], player->frame->linesize[0],
+            player->frame->data[1], player->frame->linesize[1],
+            player->frame->data[2], player->frame->linesize[2]
+        );
+        player->has_active_frame = true;
+        return;
+    }
+#endif
+
+    // Fallback for non-YUV420P formats: allocate RGB buffer on demand
+    if (!player->frame_rgb) {
+        player->frame_rgb = av_frame_alloc();
+        int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, player->width, player->height, 1);
+        player->rgb_buffer = (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t));
+        av_image_fill_arrays(
+            player->frame_rgb->data,
+            player->frame_rgb->linesize,
+            player->rgb_buffer,
+            AV_PIX_FMT_RGB24,
+            player->width,
+            player->height,
+            1
+        );
+    }
 
     if (!player->sws_ctx) {
-        enum AVPixelFormat src_fmt = (player->frame->format != AV_PIX_FMT_NONE)
-                                     ? (enum AVPixelFormat)player->frame->format
-                                     : player->codec_ctx->pix_fmt;
         if (src_fmt == AV_PIX_FMT_NONE) return;
         player->sws_ctx = sws_getContext(
             player->width,
@@ -74,9 +116,8 @@ int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Rend
     close_video(player);
     player->is_open = was_open;
 
-    // Record attempted path so audio-only clips do not re-trigger open_video_by_path every frame
     strncpy(player->current_loaded_path, filepath, sizeof(player->current_loaded_path) - 1);
-    player->current_loaded_path[sizeof(player->current_loaded_path) - 1] = '\0';
+    player->current_loaded_path[sizeof(player->current_loaded_path) - 1] = 0;
 
     player->video_stream_idx = -1;
     player->fmt_ctx = NULL;
@@ -116,6 +157,15 @@ int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Rend
         return -1;
     }
 
+#ifdef AVDISCARD_ALL
+    // Discard all non-video packets at the demuxer level to save CPU & RAM
+    for (unsigned int i = 0; i < player->fmt_ctx->nb_streams; i++) {
+        if ((int)i != player->video_stream_idx) {
+            player->fmt_ctx->streams[i]->discard = AVDISCARD_ALL;
+        }
+    }
+#endif
+
     player->codec_ctx = avcodec_alloc_context3(codec);
     if (!player->codec_ctx) {
         avformat_close_input(&player->fmt_ctx);
@@ -131,7 +181,8 @@ int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Rend
         return -1;
     }
 
-    player->codec_ctx->thread_count = 0;
+    // Use 2 threads instead of 0 (all cores): prevents FFmpeg from allocating 16x 1080p frame pools (~180 MB RAM saved!)
+    player->codec_ctx->thread_count = 2;
     player->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
     if (avcodec_open2(player->codec_ctx, codec, NULL) < 0) {
@@ -153,39 +204,27 @@ int open_video_by_path(SimpleVideoPlayer *player, const char *filepath, SDL_Rend
     player->time_base = av_q2d(stream->time_base);
 
     player->frame = av_frame_alloc();
-    player->frame_rgb = av_frame_alloc();
+    player->frame_rgb = NULL;
+    player->rgb_buffer = NULL;
+    player->sws_ctx = NULL;
 
-    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, player->width, player->height, 1);
-    player->rgb_buffer = (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t));
-
-    av_image_fill_arrays(
-        player->frame_rgb->data,
-        player->frame_rgb->linesize,
-        player->rgb_buffer,
-        AV_PIX_FMT_RGB24,
-        player->width,
-        player->height,
-        1
-    );
-
-    if (player->codec_ctx->pix_fmt != AV_PIX_FMT_NONE) {
-        player->sws_ctx = sws_getContext(
-            player->width,
-            player->height,
-            player->codec_ctx->pix_fmt,
-            player->width,
-            player->height,
-            AV_PIX_FMT_RGB24,
-            SWS_FAST_BILINEAR,
-            NULL,
-            NULL,
-            NULL
-        );
+    Uint32 tex_fmt = SDL_PIXELFORMAT_RGB24;
+#ifdef AV_PIX_FMT_YUV420P
+#ifdef AV_PIX_FMT_YUVJ420P
+    if (player->codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P ||
+        player->codec_ctx->pix_fmt == AV_PIX_FMT_YUVJ420P) {
+        tex_fmt = SDL_PIXELFORMAT_IYUV;
     }
+#else
+    if (player->codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P) {
+        tex_fmt = SDL_PIXELFORMAT_IYUV;
+    }
+#endif
+#endif
 
     player->texture = SDL_CreateTexture(
         renderer,
-        SDL_PIXELFORMAT_RGB24,
+        tex_fmt,
         SDL_TEXTUREACCESS_STREAMING,
         player->width,
         player->height
@@ -235,7 +274,7 @@ void close_video(SimpleVideoPlayer *player) {
     player->current_pts_sec = -1.0;
     player->is_open = false;
     player->has_active_frame = false;
-    player->current_loaded_path[0] = '\0';
+    player->current_loaded_path[0] = 0;
 }
 
 void seek_video(SimpleVideoPlayer *player, double seconds) {
@@ -243,7 +282,6 @@ void seek_video(SimpleVideoPlayer *player, double seconds) {
 
     if (seconds < 0.0) seconds = 0.0;
 
-    // Avoid redundant seeks when playhead is stationary at the already-decoded timestamp
     if (player->has_active_frame && player->current_pts_sec >= 0.0 && fabs(seconds - player->current_pts_sec) < 0.015) {
         return;
     }
@@ -259,9 +297,8 @@ void seek_video(SimpleVideoPlayer *player, double seconds) {
     bool got_frame = false;
     bool reached_target = false;
     int decoded_steps = 0;
-    const int max_sync_decode_frames = 16; // Fast non-blocking seek budget
+    const int max_sync_decode_frames = 16;
 
-    // Skip non-reference B-frames during post-seek fast-forward for instant scrubbing even on 4-hour videos
     player->codec_ctx->skip_frame = AVDISCARD_NONREF;
 
     while (!reached_target && decoded_steps < max_sync_decode_frames && av_read_frame(player->fmt_ctx, packet) >= 0) {
@@ -287,7 +324,6 @@ void seek_video(SimpleVideoPlayer *player, double seconds) {
 
     player->codec_ctx->skip_frame = AVDISCARD_DEFAULT;
 
-    // Flush delayed frames if EOF was reached before any frame was decoded
     if (!got_frame) {
         avcodec_send_packet(player->codec_ctx, NULL);
         while (avcodec_receive_frame(player->codec_ctx, player->frame) == 0) {
@@ -317,7 +353,6 @@ void sync_video_to_audio_clock(SimpleVideoPlayer *player, double target_sec, boo
         return;
     }
 
-    // If user jumped backward or skipped forward by > 0.65s (e.g. 15m -> 40m), immediately seek to keyframe
     if (!player->has_active_frame || player->current_pts_sec < 0.0 ||
         target_sec < player->current_pts_sec - 0.06 ||
         (target_sec - player->current_pts_sec) > 0.65) {
@@ -328,7 +363,6 @@ void sync_video_to_audio_clock(SimpleVideoPlayer *player, double target_sec, boo
     AVPacket *packet = av_packet_alloc();
     if (!packet) return;
 
-    // If video is slightly behind audio (> 0.12s), skip non-reference B-frames to catch up smoothly
     if (target_sec - player->current_pts_sec > 0.12) {
         player->codec_ctx->skip_frame = AVDISCARD_NONREF;
     } else {
@@ -337,7 +371,7 @@ void sync_video_to_audio_clock(SimpleVideoPlayer *player, double target_sec, boo
 
     bool decoded_new_frame = false;
     int frames_this_tick = 0;
-    const int max_frames_per_tick = 5;
+    const int max_frames_per_tick = 4;
 
     while (player->current_pts_sec < target_sec &&
            frames_this_tick < max_frames_per_tick &&
