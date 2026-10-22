@@ -18,12 +18,11 @@ file(GLOB_RECURSE SRC_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
 )
 
-# Auto-generate app_icon.ico if it was not uploaded to the repository so windres never fails in CI/GitHub Actions
+# Generate clean studio waveform app_icon.ico (without top-right red recording dot) so windres always succeeds
 if(WIN32)
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app_icon.ico")
-        find_package(Python3 COMPONENTS Interpreter QUIET)
-        if(Python3_FOUND)
-            execute_process(COMMAND "${Python3_EXECUTABLE}" -c "
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+        execute_process(COMMAND "${Python3_EXECUTABLE}" -c "
 import math, struct
 px = []
 for y in range(64):
@@ -43,8 +42,6 @@ for y in range(64):
                 h = int(math.sin(u * math.pi) * abs(math.sin(u * 18.85) * 0.7 + math.cos(u * 9.42) * 0.3) * 20.0) + 2
                 if abs(y - 34) <= h:
                     r, g, b = (255, 185, 75) if abs(y - 34) <= h // 2 else (215, 125, 45)
-            if (x - 50)**2 + (y - 14)**2 <= 25:
-                r, g, b = 240, 42, 42
         px.append((a << 24) | (r << 16) | (g << 8) | b)
 with open(r'${CMAKE_CURRENT_SOURCE_DIR}/app_icon.ico', 'wb') as f:
     f.write(bytes([0,0,1,0,1,0,64,64,0,0,1,0,32,0,0x28,0x42,0,0,22,0,0,0]))
@@ -54,7 +51,6 @@ with open(r'${CMAKE_CURRENT_SOURCE_DIR}/app_icon.ico', 'wb') as f:
             f.write(struct.pack('<I', px[row * 64 + col]))
     f.write(bytes(64 * 8))
 ")
-        endif()
     endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app_icon.ico")
