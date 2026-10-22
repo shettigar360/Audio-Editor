@@ -252,20 +252,20 @@ static const char* g_studio_color_names[NUM_STUDIO_COLORS] = {
     "Sand Ochre",    "Plum Berry",    "Electric Teal","Silver Ice"
 };
 static const uint8_t g_studio_pal_bg[NUM_STUDIO_COLORS][3] = {
-    { 36, 32, 28 }, { 74, 46, 24 }, { 22, 62, 54 }, { 74, 28, 34 },
-    { 28, 44, 78 }, { 72, 58, 22 }, { 58, 32, 72 }, { 22, 58, 72 },
-    { 28, 64, 32 }, { 76, 36, 48 }, { 38, 36, 72 }, { 52, 68, 24 },
-    { 76, 26, 64 }, { 20, 66, 68 }, { 80, 42, 30 }, { 52, 42, 76 },
-    { 54, 58, 26 }, { 68, 22, 36 }, { 26, 52, 82 }, { 26, 68, 48 },
-    { 70, 54, 32 }, { 64, 28, 56 }, { 18, 68, 76 }, { 48, 52, 58 }
+    { 36, 32, 28 },  { 118, 68, 32 }, { 28, 102, 86 }, { 122, 40, 50 },
+    { 40, 72, 128 }, { 118, 94, 30 }, { 92, 48, 118 }, { 30, 96, 118 },
+    { 40, 104, 48 }, { 124, 52, 72 }, { 58, 56, 118 }, { 82, 110, 34 },
+    { 122, 38, 102 },{ 28, 108, 110 },{ 128, 64, 44 }, { 82, 66, 122 },
+    { 86, 94, 38 },  { 112, 34, 58 }, { 38, 82, 132 }, { 38, 110, 76 },
+    { 112, 86, 48 }, { 104, 42, 90 }, { 26, 108, 122 },{ 76, 82, 92 }
 };
 static const uint8_t g_studio_pal_hdr[NUM_STUDIO_COLORS][3] = {
-    { 48, 38, 30 }, { 112, 68, 32 }, { 32, 94, 80 }, { 110, 38, 48 },
-    { 42, 66, 114 },{ 108, 88, 32 }, { 88, 46, 108 },{ 32, 88, 108 },
-    { 42, 96, 48 }, { 114, 52, 70 }, { 56, 54, 106 },{ 78, 102, 34 },
-    { 118, 38, 98 },{ 30, 102, 104 },{ 122, 64, 44 },{ 78, 64, 114 },
-    { 82, 88, 38 }, { 104, 32, 54 }, { 38, 78, 124 },{ 38, 104, 72 },
-    { 106, 82, 48 },{ 98, 42, 86 },  { 28, 104, 116},{ 74, 80, 88 }
+    { 138, 144, 152 }, { 235, 142,  64 }, {  52, 208, 172 }, { 232,  76,  92 },
+    {  82, 146, 235 }, { 235, 190,  58 }, { 184, 102, 235 }, {  58, 204, 232 },
+    {  86, 210,  96 }, { 235, 104, 140 }, { 124, 120, 235 }, { 166, 218,  62 },
+    { 232,  88, 196 }, {  48, 214, 208 }, { 235, 128,  88 }, { 162, 136, 235 },
+    { 180, 194,  74 }, { 222,  68, 108 }, {  90, 168, 235 }, {  74, 218, 144 },
+    { 214, 172, 104 }, { 208,  96, 182 }, {  44, 210, 232 }, { 196, 204, 216 }
 };
 static const uint8_t g_studio_pal_peak[NUM_STUDIO_COLORS][3] = {
     { 196, 202, 210 }, { 255, 168,  88 }, {  72, 238, 198 }, { 255,  98, 112 },
@@ -340,13 +340,16 @@ static int g_clipboard_count = 0;
 static bool     g_track_hidden[MAX_TABS][MAX_TRACKS];
 #ifndef DAW_TRACK_LOCK_VARS_DEFINED
 #define DAW_TRACK_LOCK_VARS_DEFINED
-// Per-tab Track Lock State & Right-Click Track Lock Options Popup Window
+// Per-tab & Per-track Lock State + Main Lock Two-Section Popup Window (All Track | Selected Track)
 static bool g_track_locked[MAX_TABS][MAX_TRACKS];
-static bool g_lock_opt_full[MAX_TABS]       = { true, true, true, true, true, true, true, true };
-static bool g_lock_opt_prevent_lr[MAX_TABS] = { false };
-static bool g_lock_opt_prevent_ud[MAX_TABS] = { false };
+static bool g_track_lock_lr_only[MAX_TABS][MAX_TRACKS];
+static bool g_track_lock_ud_only[MAX_TABS][MAX_TRACKS];
+static bool g_lock_opt_full[MAX_TABS]            = { false };
+static bool g_lock_opt_complete_unlock[MAX_TABS] = { false };
+static bool g_lock_opt_prevent_lr[MAX_TABS]      = { false };
+static bool g_lock_opt_prevent_ud[MAX_TABS]      = { false };
 static bool g_lock_popup_open = false;
-static SDL_Rect g_lock_win_rect = { 390, 165, 430, 210 };
+static SDL_Rect g_lock_win_rect = { 290, 145, 700, 268 };
 static bool g_lock_win_dragging = false;
 static int  g_lock_drag_off_x = 0;
 static int  g_lock_drag_off_y = 0;
@@ -357,15 +360,15 @@ static inline bool is_track_locked_tab(int tab, int trk) {
 }
 static inline bool is_track_full_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return g_lock_opt_full[tab] || (!g_lock_opt_prevent_lr[tab] && !g_lock_opt_prevent_ud[tab]);
+    return (!g_track_lock_lr_only[tab][trk] && !g_track_lock_ud_only[tab][trk]);
 }
 static inline bool is_track_lr_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return is_track_full_locked_tab(tab, trk) || g_lock_opt_prevent_lr[tab];
+    return is_track_full_locked_tab(tab, trk) || g_track_lock_lr_only[tab][trk];
 }
 static inline bool is_track_ud_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return is_track_full_locked_tab(tab, trk) || g_lock_opt_prevent_ud[tab];
+    return is_track_full_locked_tab(tab, trk) || g_track_lock_ud_only[tab][trk];
 }
 
 // Draws a crisp Padlock symbol icon at (cx, cy)
@@ -885,6 +888,12 @@ static void swap_tracks(ProjectTab *p, int t1, int t2) {
     bool tmp_lck = g_track_locked[tab_idx][t1];
     g_track_locked[tab_idx][t1] = g_track_locked[tab_idx][t2];
     g_track_locked[tab_idx][t2] = tmp_lck;
+    bool tmp_lck_lr = g_track_lock_lr_only[tab_idx][t1];
+    g_track_lock_lr_only[tab_idx][t1] = g_track_lock_lr_only[tab_idx][t2];
+    g_track_lock_lr_only[tab_idx][t2] = tmp_lck_lr;
+    bool tmp_lck_ud = g_track_lock_ud_only[tab_idx][t1];
+    g_track_lock_ud_only[tab_idx][t1] = g_track_lock_ud_only[tab_idx][t2];
+    g_track_lock_ud_only[tab_idx][t2] = tmp_lck_ud;
 
     for (int i = 0; i < p->num_items; i++) {
         if (p->items[i].track_idx == t1) p->items[i].track_idx = t2;
@@ -946,7 +955,10 @@ typedef struct {
     int    track_color_idx[MAX_TRACKS];
     int    track_peak_color_idx[MAX_TRACKS];
     bool   track_locked[MAX_TRACKS];
+    bool   track_lock_lr_only[MAX_TRACKS];
+    bool   track_lock_ud_only[MAX_TRACKS];
     bool   lock_opt_full;
+    bool   lock_opt_complete_unlock;
     bool   lock_opt_prevent_lr;
     bool   lock_opt_prevent_ud;
     int    tab_peak_color_idx;
@@ -1021,9 +1033,12 @@ static void capture_tab_into_deep_entry(ProjectTab *p, int tab, DeepUndoEntry *e
     memcpy(ent->track_color_idx, g_track_color_idx[tab], sizeof(ent->track_color_idx));
     memcpy(ent->track_peak_color_idx, g_track_peak_color_idx[tab], sizeof(ent->track_peak_color_idx));
     memcpy(ent->track_locked, g_track_locked[tab], sizeof(ent->track_locked));
-    ent->lock_opt_full       = g_lock_opt_full[tab];
-    ent->lock_opt_prevent_lr = g_lock_opt_prevent_lr[tab];
-    ent->lock_opt_prevent_ud = g_lock_opt_prevent_ud[tab];
+    memcpy(ent->track_lock_lr_only, g_track_lock_lr_only[tab], sizeof(ent->track_lock_lr_only));
+    memcpy(ent->track_lock_ud_only, g_track_lock_ud_only[tab], sizeof(ent->track_lock_ud_only));
+    ent->lock_opt_full            = g_lock_opt_full[tab];
+    ent->lock_opt_complete_unlock = g_lock_opt_complete_unlock[tab];
+    ent->lock_opt_prevent_lr      = g_lock_opt_prevent_lr[tab];
+    ent->lock_opt_prevent_ud      = g_lock_opt_prevent_ud[tab];
     ent->tab_peak_color_idx = g_tab_peak_color_idx[tab];
 
     ent->show_marker_lane = p->show_marker_lane;
@@ -1064,9 +1079,12 @@ static void restore_tab_from_deep_entry(ProjectTab *p, int tab, const DeepUndoEn
     memcpy(g_track_color_idx[tab], ent->track_color_idx, sizeof(ent->track_color_idx));
     memcpy(g_track_peak_color_idx[tab], ent->track_peak_color_idx, sizeof(ent->track_peak_color_idx));
     memcpy(g_track_locked[tab], ent->track_locked, sizeof(ent->track_locked));
-    g_lock_opt_full[tab]       = ent->lock_opt_full;
-    g_lock_opt_prevent_lr[tab] = ent->lock_opt_prevent_lr;
-    g_lock_opt_prevent_ud[tab] = ent->lock_opt_prevent_ud;
+    memcpy(g_track_lock_lr_only[tab], ent->track_lock_lr_only, sizeof(ent->track_lock_lr_only));
+    memcpy(g_track_lock_ud_only[tab], ent->track_lock_ud_only, sizeof(ent->track_lock_ud_only));
+    g_lock_opt_full[tab]            = ent->lock_opt_full;
+    g_lock_opt_complete_unlock[tab] = ent->lock_opt_complete_unlock;
+    g_lock_opt_prevent_lr[tab]      = ent->lock_opt_prevent_lr;
+    g_lock_opt_prevent_ud[tab]      = ent->lock_opt_prevent_ud;
     g_tab_peak_color_idx[tab] = ent->tab_peak_color_idx;
 
     p->show_marker_lane     = ent->show_marker_lane;
@@ -1320,6 +1338,8 @@ static void delete_track_at_index(ProjectTab *p, int trk_idx) {
         g_track_color_idx[tab][t] = g_track_color_idx[tab][t + 1];
         g_track_peak_color_idx[tab][t] = g_track_peak_color_idx[tab][t + 1];
         g_track_locked[tab][t] = g_track_locked[tab][t + 1];
+        g_track_lock_lr_only[tab][t] = g_track_lock_lr_only[tab][t + 1];
+        g_track_lock_ud_only[tab][t] = g_track_lock_ud_only[tab][t + 1];
     }
     p->num_tracks--;
 }
@@ -1330,8 +1350,9 @@ static bool request_delete_selected_tracks_with_prompt(ProjectTab *p) {
     if (!p || p->num_tracks <= 1) return false;
     bool any_sel = false;
     bool any_has_clips = false;
+    int tab_del = get_valid_tab_idx();
     for (int t = 0; t < p->num_tracks; t++) {
-        if (p->track_selected[t]) {
+        if (p->track_selected[t] && !is_track_full_locked_tab(tab_del, t)) {
             any_sel = true;
             for (int i = 0; i < p->num_items; i++) {
                 if (p->items[i].track_idx == t) {
@@ -1349,7 +1370,7 @@ static bool request_delete_selected_tracks_with_prompt(ProjectTab *p) {
     push_undo_state();
     bool removed = false;
     for (int t = p->num_tracks - 1; t >= 0; t--) {
-        if (p->track_selected[t] && p->num_tracks > 1) {
+        if (p->track_selected[t] && !is_track_full_locked_tab(get_valid_tab_idx(), t) && p->num_tracks > 1) {
             delete_track_at_index(p, t);
             removed = true;
         }
@@ -1364,7 +1385,7 @@ static void execute_confirmed_track_delete(ProjectTab *p) {
     push_undo_state();
     bool removed = false;
     for (int t = p->num_tracks - 1; t >= 0; t--) {
-        if (p->track_selected[t] && p->num_tracks > 1) {
+        if (p->track_selected[t] && !is_track_full_locked_tab(get_valid_tab_idx(), t) && p->num_tracks > 1) {
             delete_track_at_index(p, t);
             removed = true;
         }
@@ -1455,6 +1476,8 @@ static void paste_tracks_at_bottom_of_selected(ProjectTab *p) {
             g_track_color_idx[tab][t] = g_track_color_idx[tab][t - 1];
             g_track_peak_color_idx[tab][t] = g_track_peak_color_idx[tab][t - 1];
             g_track_locked[tab][t] = g_track_locked[tab][t - 1];
+            g_track_lock_lr_only[tab][t] = g_track_lock_lr_only[tab][t - 1];
+            g_track_lock_ud_only[tab][t] = g_track_lock_ud_only[tab][t - 1];
         }
         for (int i = 0; i < p->num_items; i++) {
             if (p->items[i].track_idx >= ins_idx) p->items[i].track_idx++;
@@ -1471,6 +1494,8 @@ static void paste_tracks_at_bottom_of_selected(ProjectTab *p) {
         g_track_color_idx[tab][ins_idx] = te->color_idx;
         g_track_peak_color_idx[tab][ins_idx] = te->peak_color_idx;
         g_track_locked[tab][ins_idx] = false;
+        g_track_lock_lr_only[tab][ins_idx] = false;
+        g_track_lock_ud_only[tab][ins_idx] = false;
         g_last_clicked_track_idx = ins_idx;
 
         // Paste all clips belonging to this copied track
@@ -1690,13 +1715,16 @@ static int           g_video_ext_tex_h = 0;
 
 #ifndef DAW_TRACK_LOCK_VARS_DEFINED
 #define DAW_TRACK_LOCK_VARS_DEFINED
-// Per-tab Track Lock State & Right-Click Track Lock Options Popup Window
+// Per-tab & Per-track Lock State + Main Lock Two-Section Popup Window (All Track | Selected Track)
 static bool g_track_locked[MAX_TABS][MAX_TRACKS];
-static bool g_lock_opt_full[MAX_TABS]       = { true, true, true, true, true, true, true, true };
-static bool g_lock_opt_prevent_lr[MAX_TABS] = { false };
-static bool g_lock_opt_prevent_ud[MAX_TABS] = { false };
+static bool g_track_lock_lr_only[MAX_TABS][MAX_TRACKS];
+static bool g_track_lock_ud_only[MAX_TABS][MAX_TRACKS];
+static bool g_lock_opt_full[MAX_TABS]            = { false };
+static bool g_lock_opt_complete_unlock[MAX_TABS] = { false };
+static bool g_lock_opt_prevent_lr[MAX_TABS]      = { false };
+static bool g_lock_opt_prevent_ud[MAX_TABS]      = { false };
 static bool g_lock_popup_open = false;
-static SDL_Rect g_lock_win_rect = { 390, 165, 430, 210 };
+static SDL_Rect g_lock_win_rect = { 290, 145, 700, 268 };
 static bool g_lock_win_dragging = false;
 static int  g_lock_drag_off_x = 0;
 static int  g_lock_drag_off_y = 0;
@@ -1707,15 +1735,15 @@ static inline bool is_track_locked_tab(int tab, int trk) {
 }
 static inline bool is_track_full_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return g_lock_opt_full[tab] || (!g_lock_opt_prevent_lr[tab] && !g_lock_opt_prevent_ud[tab]);
+    return (!g_track_lock_lr_only[tab][trk] && !g_track_lock_ud_only[tab][trk]);
 }
 static inline bool is_track_lr_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return is_track_full_locked_tab(tab, trk) || g_lock_opt_prevent_lr[tab];
+    return is_track_full_locked_tab(tab, trk) || g_track_lock_lr_only[tab][trk];
 }
 static inline bool is_track_ud_locked_tab(int tab, int trk) {
     if (!is_track_locked_tab(tab, trk)) return false;
-    return is_track_full_locked_tab(tab, trk) || g_lock_opt_prevent_ud[tab];
+    return is_track_full_locked_tab(tab, trk) || g_track_lock_ud_only[tab][trk];
 }
 
 // Draws a crisp Padlock symbol icon at (cx, cy)
@@ -2900,7 +2928,7 @@ static void apply_studio_color_choice(ProjectTab *p, int color_idx) {
         }
         push_undo_state();
         for (int t = 0; t < p->num_tracks; t++) {
-            if (p->track_selected[t]) {
+            if (p->track_selected[t] && !is_track_full_locked_tab(tab, t)) {
                 g_track_color_idx[tab][t] = color_idx;
             }
         }
@@ -2909,16 +2937,17 @@ static void apply_studio_color_choice(ProjectTab *p, int color_idx) {
         // Clip color
         bool any_clip = false;
         for (int i = 0; i < p->num_items; i++) {
-            if (p->items[i].is_selected) { any_clip = true; break; }
+            if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx)) { any_clip = true; break; }
         }
-        if (!any_clip && g_last_clicked_item_idx >= 0 && g_last_clicked_item_idx < p->num_items) {
+        if (!any_clip && g_last_clicked_item_idx >= 0 && g_last_clicked_item_idx < p->num_items &&
+            !is_track_full_locked_tab(tab, p->items[g_last_clicked_item_idx].track_idx)) {
             p->items[g_last_clicked_item_idx].is_selected = true;
             any_clip = true;
         }
         if (any_clip) {
             push_undo_state();
             for (int i = 0; i < p->num_items; i++) {
-                if (p->items[i].is_selected) {
+                if (p->items[i].is_selected && !is_track_full_locked_tab(tab, p->items[i].track_idx)) {
                     g_item_color_idx[tab][i] = color_idx;
                 }
             }
@@ -3006,20 +3035,13 @@ static void render_color_picker_window(SDL_Renderer *ren, ProjectTab *p) {
         int cy = grid_y + row * (cell_h + gap_y);
 
         SDL_Rect sw = { cx, cy, cell_w, cell_h };
-        SDL_SetRenderDrawColor(ren, g_studio_pal_bg[c][0], g_studio_pal_bg[c][1], g_studio_pal_bg[c][2], 255);
-        SDL_RenderFillRect(ren, &sw);
-
-        SDL_Rect sw_top = { cx, cy, cell_w, 16 };
         if (m == 2) {
             SDL_SetRenderDrawColor(ren, g_studio_pal_peak[c][0], g_studio_pal_peak[c][1], g_studio_pal_peak[c][2], 255);
         } else {
             SDL_SetRenderDrawColor(ren, g_studio_pal_hdr[c][0], g_studio_pal_hdr[c][1], g_studio_pal_hdr[c][2], 255);
         }
-        SDL_RenderFillRect(ren, &sw_top);
-
+        SDL_RenderFillRect(ren, &sw);
         draw_brown_border_rect(ren, &sw, false, false);
-        SDL_Rect lbl_clip = { cx + 4, cy + 18, cell_w - 8, 22 };
-        draw_text_clipped(ren, g_studio_color_names[c], cx + 6, cy + 22, c_white, &lbl_clip, NULL);
     }
 
     int by = wy + wh - 36;
@@ -3188,8 +3210,8 @@ static double get_project_step_fps(ProjectTab *p) {
 static void open_clip_properties_window(ProjectTab *p, int win_w, int win_h) {
     (void)p;
     g_clip_props.probed_path[0] = '\0';
-    if (g_clip_props.win_rect.w < 540) g_clip_props.win_rect.w = 650;
-    if (g_clip_props.win_rect.h < 400) g_clip_props.win_rect.h = 448;
+    g_clip_props.win_rect.w = 600;
+    g_clip_props.win_rect.h = 370;
     g_clip_props.win_rect.x = (win_w - g_clip_props.win_rect.w) / 2;
     g_clip_props.win_rect.y = (win_h - g_clip_props.win_rect.h) / 2;
     g_clip_props.is_open = true;
@@ -3198,39 +3220,6 @@ static void open_clip_properties_window(ProjectTab *p, int win_w, int win_h) {
 static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
     if (!g_clip_props.is_open || !p) return;
     SDL_Rect *wr = &g_clip_props.win_rect;
-    if (wr->w < 520) wr->w = 520;
-    if (wr->h < 400) wr->h = 400;
-    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
-    SDL_Color c_white  = { 228, 228, 228, 255 };
-    SDL_Color c_muted  = { 155, 150, 145, 255 };
-    SDL_Color c_accent = get_theme_accent_sdl_color();
-
-    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
-    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
-    SDL_RenderFillRect(ren, &shadow);
-    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
-
-    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
-    SDL_RenderFillRect(ren, wr);
-    draw_brown_border_rect(ren, wr, true, false);
-
-    uint8_t hr, hg, hb;
-    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
-    SDL_Rect hdr = { wx, wy, ww, 30 };
-    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
-    SDL_RenderFillRect(ren, &hdr);
-    draw_brown_border_rect(ren, &hdr, false, false);
-    draw_text(ren, "Clip properties (Drag Edges or Click [+] to Expand)", wx + 14, wy + 9, c_white);
-
-    // Expand / Restore button [+] / [-] next to [X]
-    SDL_Rect exp_btn = { wx + ww - 54, wy + 4, 22, 22 };
-    SDL_SetRenderDrawColor(ren, g_clip_props.is_expanded ? 68 : 44, g_clip_props.is_expanded ? 48 : 38, 32, 255);
-    SDL_RenderFillRect(ren, &exp_btn);
-    draw_brown_border_rect(ren, &exp_btn, g_clip_props.is_expanded, false);
-    draw_text(ren, g_clip_props.is_expanded ? "-" : "+", exp_btn.x + 7, exp_btn.y + 4, c_white);
-
-    draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
 
     int sel_idx = -1;
     int sel_count = 0;
@@ -3252,22 +3241,19 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
         sel_max_e = sel_min_s + p->items[sel_idx].duration;
     }
 
-    SDL_Rect body_box = { wx + 14, wy + 38, ww - 28, wh - 88 };
-    SDL_SetRenderDrawColor(ren, 18, 17, 16, 255);
-    SDL_RenderFillRect(ren, &body_box);
-    draw_brown_border_rect(ren, &body_box, false, true);
+    // Prepare all display strings and automatically expand wr->w horizontally so all text fits completely!
+    char row_name[512] = "", row_file[512] = "", row_trk[512] = "", row_st[512] = "";
+    char row_end[512] = "", row_dur[512] = "", row_off[512] = "", row_aud[512] = "";
+    char row_vid[512] = "", row_gain[512] = "", row_fade[512] = "", row_grp[512] = "";
+    int col_i = 0;
+    int tab = get_valid_tab_idx();
 
-    if (sel_idx < 0 || sel_idx >= p->num_items) {
-        draw_text(ren, "No media clip is currently selected.", wx + 28, wy + 80, c_accent);
-        draw_text(ren, "Click any clip on the timeline and press Ctrl+I.", wx + 28, wy + 108, c_muted);
-    } else {
-        int tab = get_valid_tab_idx();
+    if (sel_idx >= 0 && sel_idx < p->num_items) {
         AudioItem *it = &p->items[sel_idx];
         probe_clip_media_stream_specs(it, p);
-
         int trk = it->track_idx;
         const char *tname = (trk >= 0 && trk < p->num_tracks) ? p->track_names[trk] : "Track";
-        int col_i = g_item_color_idx[tab][sel_idx] % NUM_STUDIO_COLORS;
+        col_i = g_item_color_idx[tab][sel_idx] % NUM_STUDIO_COLORS;
         if (col_i < 0) col_i = 0;
 
         char st_tc[32], end_tc[32], dur_tc[32], off_tc[32], tot_tc[32];
@@ -3277,96 +3263,168 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
         format_timecode(it->offset_in_file, off_tc, sizeof(off_tc));
         format_timecode(it->file_total_duration, tot_tc, sizeof(tot_tc));
 
-        char line_buf[512];
-        int ry = wy + 46;
-        int lx = wx + 24;
-        int vx = wx + 188;
-        SDL_Rect val_clip = { vx, wy + 40, ww - 206, wh - 92 };
+        if (sel_count > 1) snprintf(row_name, sizeof(row_name), "%s  (+%d more selected)", it->label, sel_count - 1);
+        else snprintf(row_name, sizeof(row_name), "%s", it->label);
 
-        draw_text(ren, "Clip Name:", lx, ry, c_muted);
+        snprintf(row_file, sizeof(row_file), "%s", it->file_path[0] ? it->file_path : "(Internal Recording)");
+        snprintf(row_trk, sizeof(row_trk), "Track %d - %s", trk + 1, tname);
+        snprintf(row_st, sizeof(row_st), "%s  (%.3f sec)", st_tc, it->start_time);
+        snprintf(row_end, sizeof(row_end), "%s  (%.3f sec)", end_tc, it->start_time + it->duration);
         if (sel_count > 1) {
-            snprintf(line_buf, sizeof(line_buf), "%s  (+%d more selected)", it->label, sel_count - 1);
-        } else {
-            snprintf(line_buf, sizeof(line_buf), "%s", it->label);
-        }
-        draw_text_clipped(ren, line_buf, vx, ry, c_accent, &val_clip, NULL);
-        ry += 25;
-
-        draw_text(ren, "Source File:", lx, ry, c_muted);
-        draw_text_clipped(ren, it->file_path[0] ? it->file_path : "(Internal Recording)", vx, ry, c_white, &val_clip, NULL);
-        ry += 25;
-
-        draw_text(ren, "Track:", lx, ry, c_muted);
-        snprintf(line_buf, sizeof(line_buf), "Track %d - %s", trk + 1, tname);
-        draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 25;
-
-        draw_text(ren, "Timeline Start:", lx, ry, c_muted);
-        snprintf(line_buf, sizeof(line_buf), "%s  (%.3f sec)", st_tc, it->start_time);
-        draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 25;
-
-        draw_text(ren, "Timeline End:", lx, ry, c_muted);
-        snprintf(line_buf, sizeof(line_buf), "%s  (%.3f sec)", end_tc, it->start_time + it->duration);
-        draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 25;
-
-        draw_text(ren, "Clip Duration:", lx, ry, c_muted);
-        if (sel_count > 1) {
-            snprintf(line_buf, sizeof(line_buf), "%s  (%.3f sec | Selection Span: %.3f sec)",
+            snprintf(row_dur, sizeof(row_dur), "%s  (%.3f sec | Selection Span: %.3f sec)",
                      dur_tc, it->duration, sel_max_e - sel_min_s);
         } else {
-            snprintf(line_buf, sizeof(line_buf), "%s  (%.3f sec)", dur_tc, it->duration);
+            snprintf(row_dur, sizeof(row_dur), "%s  (%.3f sec)", dur_tc, it->duration);
         }
-        draw_text_clipped(ren, line_buf, vx, ry, c_accent, &val_clip, NULL);
-        ry += 25;
+        snprintf(row_off, sizeof(row_off), "%s  |  Total File Length: %s", off_tc, tot_tc);
 
-        draw_text(ren, "Source Offset:", lx, ry, c_muted);
-        snprintf(line_buf, sizeof(line_buf), "%s  |  Total File Length: %s", off_tc, tot_tc);
-        draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
-        ry += 25;
-
-        // Requirement 1: Audio: audio bitrate kbps, sample rate Hz (if available)
-        draw_text(ren, "Audio :", lx, ry, c_muted);
         if (g_clip_props.has_audio_stream || it->peak_count > 0) {
             int a_kbps = (g_clip_props.audio_bitrate_kbps > 0) ? g_clip_props.audio_bitrate_kbps : 1536;
             int a_sr   = (g_clip_props.audio_sample_rate_hz > 0) ? g_clip_props.audio_sample_rate_hz : SAMPLE_RATE;
-            snprintf(line_buf, sizeof(line_buf),
+            snprintf(row_aud, sizeof(row_aud),
                      "Audio Bitrate: %d kbps   |   Sample Rate: %d Hz   (%d ch)",
                      a_kbps, a_sr, g_clip_props.audio_channels);
-            draw_text_clipped(ren, line_buf, vx, ry, c_accent, &val_clip, NULL);
         } else {
-            draw_text_clipped(ren, "Not available (Video-only clip)", vx, ry, c_muted, &val_clip, NULL);
+            snprintf(row_aud, sizeof(row_aud), "Not available (Video-only clip)");
         }
-        ry += 25;
 
-        // Requirement 1: Video: frame rate, resolution, and video bitrate kbps (if available)
-        draw_text(ren, "Video :", lx, ry, c_muted);
         if (it->has_video || g_clip_props.has_video_stream) {
             int vw = (g_clip_props.video_width > 0) ? g_clip_props.video_width : ((p->video.width > 0) ? p->video.width : 1920);
             int vh = (g_clip_props.video_height > 0) ? g_clip_props.video_height : ((p->video.height > 0) ? p->video.height : 1080);
             double vfps = (g_clip_props.video_fps > 0.01) ? g_clip_props.video_fps : 25.0;
             int vkbps = (g_clip_props.video_bitrate_kbps > 0) ? g_clip_props.video_bitrate_kbps : 2048;
-            snprintf(line_buf, sizeof(line_buf),
+            snprintf(row_vid, sizeof(row_vid),
                      "Frame Rate: %.2f fps  |  Resolution: %dx%d  |  Bitrate: %d kbps",
                      vfps, vw, vh, vkbps);
-            draw_text_clipped(ren, line_buf, vx, ry, c_accent, &val_clip, NULL);
         } else {
-            draw_text_clipped(ren, "Not available (Audio-only clip)", vx, ry, c_white, &val_clip, NULL);
+            snprintf(row_vid, sizeof(row_vid), "Not available (Audio-only clip)");
         }
+
+        float trk_db = (trk >= 0 && trk < p->num_tracks) ? p->track_db[trk] : 0.0f;
+        snprintf(row_gain, sizeof(row_gain), "Clip: %+.1f dB  |  Track: %+.1f dB  |  Muted: %s",
+                 g_item_vol_db[tab][sel_idx], trk_db, g_item_muted[tab][sel_idx] ? "YES" : "NO");
+        snprintf(row_fade, sizeof(row_fade), "Fade-In: %.3f sec   |   Fade-Out: %.3f sec",
+                 get_item_fade_in(p, sel_idx), get_item_fade_out(p, sel_idx));
+        if (g_item_group_id[tab][sel_idx] > 0) {
+            snprintf(row_grp, sizeof(row_grp), "Group #%d", g_item_group_id[tab][sel_idx]);
+        } else {
+            snprintf(row_grp, sizeof(row_grp), "Ungrouped");
+        }
+
+        const char *all_rows[] = {
+            row_name, row_file, row_trk, row_st, row_end, row_dur,
+            row_off, row_aud, row_vid, row_gain, row_fade, row_grp
+        };
+        int max_chars = 0;
+        for (int r = 0; r < 12; r++) {
+            int l = (int)strlen(all_rows[r]);
+            if (r == 11) l += 4;
+            if (l > max_chars) max_chars = l;
+        }
+        int auto_w = 188 + max_chars * 8 + 36;
+        if (auto_w < 540) auto_w = 540;
+        int out_rw = 1280;
+        if (auto_w > out_rw - 24) auto_w = out_rw - 24;
+        if (g_clip_props.resize_edge == 0 && !g_clip_props.is_expanded) {
+            wr->w = auto_w;
+            if (wr->x + wr->w > out_rw - 12) {
+                wr->x = (out_rw - wr->w) / 2;
+                if (wr->x < 12) wr->x = 12;
+            }
+        }
+    }
+
+    if (wr->w < 520) wr->w = 520;
+    if (wr->h < 368) wr->h = 368;
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_Rect hdr = { wx, wy, ww, 30 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Clip properties", wx + 14, wy + 9, c_white);
+
+    // Expand / Restore button [+] / [-] next to [X]
+    SDL_Rect exp_btn = { wx + ww - 54, wy + 4, 22, 22 };
+    SDL_SetRenderDrawColor(ren, g_clip_props.is_expanded ? 68 : 44, g_clip_props.is_expanded ? 48 : 38, 32, 255);
+    SDL_RenderFillRect(ren, &exp_btn);
+    draw_brown_border_rect(ren, &exp_btn, g_clip_props.is_expanded, false);
+    draw_text(ren, g_clip_props.is_expanded ? "-" : "+", exp_btn.x + 7, exp_btn.y + 4, c_white);
+
+    draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
+
+    SDL_Rect body_box = { wx + 14, wy + 38, ww - 28, wh - 50 };
+    SDL_SetRenderDrawColor(ren, 18, 17, 16, 255);
+    SDL_RenderFillRect(ren, &body_box);
+    draw_brown_border_rect(ren, &body_box, false, true);
+
+    if (sel_idx < 0 || sel_idx >= p->num_items) {
+        draw_text(ren, "No media clip is currently selected.", wx + 28, wy + 80, c_accent);
+        draw_text(ren, "Click any clip on the timeline and press Ctrl+I.", wx + 28, wy + 108, c_muted);
+    } else {
+        AudioItem *it = &p->items[sel_idx];
+        int ry = wy + 46;
+        int lx = wx + 24;
+        int vx = wx + 188;
+        SDL_Rect val_clip = { vx, wy + 40, ww - 206, wh - 54 };
+
+        draw_text(ren, "Clip Name:", lx, ry, c_muted);
+        draw_text_clipped(ren, row_name, vx, ry, c_accent, &val_clip, NULL);
+        ry += 25;
+
+        draw_text(ren, "Source File:", lx, ry, c_muted);
+        draw_text_clipped(ren, row_file, vx, ry, c_white, &val_clip, NULL);
+        ry += 25;
+
+        draw_text(ren, "Track:", lx, ry, c_muted);
+        draw_text_clipped(ren, row_trk, vx, ry, c_white, &val_clip, NULL);
+        ry += 25;
+
+        draw_text(ren, "Timeline Start:", lx, ry, c_muted);
+        draw_text_clipped(ren, row_st, vx, ry, c_white, &val_clip, NULL);
+        ry += 25;
+
+        draw_text(ren, "Timeline End:", lx, ry, c_muted);
+        draw_text_clipped(ren, row_end, vx, ry, c_white, &val_clip, NULL);
+        ry += 25;
+
+        draw_text(ren, "Clip Duration:", lx, ry, c_muted);
+        draw_text_clipped(ren, row_dur, vx, ry, c_accent, &val_clip, NULL);
+        ry += 25;
+
+        draw_text(ren, "Source Offset:", lx, ry, c_muted);
+        draw_text_clipped(ren, row_off, vx, ry, c_white, &val_clip, NULL);
+        ry += 25;
+
+        draw_text(ren, "Audio :", lx, ry, c_muted);
+        draw_text_clipped(ren, row_aud, vx, ry, (g_clip_props.has_audio_stream || it->peak_count > 0) ? c_accent : c_muted, &val_clip, NULL);
+        ry += 25;
+
+        draw_text(ren, "Video :", lx, ry, c_muted);
+        draw_text_clipped(ren, row_vid, vx, ry, (it->has_video || g_clip_props.has_video_stream) ? c_accent : c_white, &val_clip, NULL);
         ry += 25;
 
         draw_text(ren, "Gain & Mute:", lx, ry, c_muted);
-        float trk_db = (trk >= 0 && trk < p->num_tracks) ? p->track_db[trk] : 0.0f;
-        snprintf(line_buf, sizeof(line_buf), "Clip: %+.1f dB  |  Track: %+.1f dB  |  Muted: %s",
-                 g_item_vol_db[tab][sel_idx], trk_db, g_item_muted[tab][sel_idx] ? "YES" : "NO");
-        draw_text_clipped(ren, line_buf, vx, ry, g_item_muted[tab][sel_idx] ? c_accent : c_white, &val_clip, NULL);
+        draw_text_clipped(ren, row_gain, vx, ry, g_item_muted[tab][sel_idx] ? c_accent : c_white, &val_clip, NULL);
         ry += 25;
 
         draw_text(ren, "Fade In / Out:", lx, ry, c_muted);
-        snprintf(line_buf, sizeof(line_buf), "Fade-In: %.3f sec   |   Fade-Out: %.3f sec",
-                 get_item_fade_in(p, sel_idx), get_item_fade_out(p, sel_idx));
-        draw_text_clipped(ren, line_buf, vx, ry, c_white, &val_clip, NULL);
+        draw_text_clipped(ren, row_fade, vx, ry, c_white, &val_clip, NULL);
         ry += 25;
 
         draw_text(ren, "Color & Group:", lx, ry, c_muted);
@@ -3374,44 +3432,13 @@ static void render_clip_properties_window(SDL_Renderer *ren, ProjectTab *p) {
         SDL_SetRenderDrawColor(ren, g_studio_pal_hdr[col_i][0], g_studio_pal_hdr[col_i][1], g_studio_pal_hdr[col_i][2], 255);
         SDL_RenderFillRect(ren, &c_sw);
         draw_brown_border_rect(ren, &c_sw, false, false);
-        if (g_item_group_id[tab][sel_idx] > 0) {
-            snprintf(line_buf, sizeof(line_buf), "%s   |   Group #%d",
-                     g_studio_color_names[col_i], g_item_group_id[tab][sel_idx]);
-        } else {
-            snprintf(line_buf, sizeof(line_buf), "%s   |   Ungrouped", g_studio_color_names[col_i]);
-        }
-        draw_text_clipped(ren, line_buf, vx + 26, ry, c_white, &val_clip, NULL);
+        draw_text_clipped(ren, row_grp, vx + 26, ry, c_white, &val_clip, NULL);
     }
 
     // Bottom-right corner resize grip indicator
     SDL_SetRenderDrawColor(ren, 175, 125, 75, 255);
     SDL_RenderDrawLine(ren, wx + ww - 10, wy + wh - 3, wx + ww - 3, wy + wh - 10);
     SDL_RenderDrawLine(ren, wx + ww - 14, wy + wh - 3, wx + ww - 3, wy + wh - 14);
-
-    int by = wy + wh - 40;
-    SDL_Rect b_mute = { wx + 14, by, 118, 28 };
-    SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
-    SDL_RenderFillRect(ren, &b_mute);
-    draw_brown_border_rect(ren, &b_mute, false, false);
-    draw_text(ren, "Toggle Mute", b_mute.x + 14, by + 8, c_white);
-
-    SDL_Rect b_col = { wx + 142, by, 118, 28 };
-    SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
-    SDL_RenderFillRect(ren, &b_col);
-    draw_brown_border_rect(ren, &b_col, false, false);
-    draw_text(ren, "Clip Color...", b_col.x + 10, by + 8, c_white);
-
-    SDL_Rect b_rst = { wx + 270, by, 122, 28 };
-    SDL_SetRenderDrawColor(ren, 44, 38, 34, 255);
-    SDL_RenderFillRect(ren, &b_rst);
-    draw_brown_border_rect(ren, &b_rst, false, false);
-    draw_text(ren, "Reset 0.0 dB", b_rst.x + 13, by + 8, c_white);
-
-    SDL_Rect b_close = { wx + ww - 102, by, 88, 28 };
-    SDL_SetRenderDrawColor(ren, hr + 22, hg + 14, hb + 8, 255);
-    SDL_RenderFillRect(ren, &b_close);
-    draw_brown_border_rect(ren, &b_close, true, false);
-    draw_text(ren, "Close", b_close.x + 24, by + 8, c_white);
 }
 
 // ================= MASTER MUTE (M) & MASTER SOLO (S) ALL TRACKS HELPERS (REQUIREMENT 13) =================
@@ -3458,6 +3485,7 @@ static void toggle_master_lock_all_tracks(ProjectTab *p) {
 static void render_track_lock_popup_window(SDL_Renderer *ren) {
     if (!g_lock_popup_open) return;
     int tab = get_valid_tab_idx();
+    ProjectTab *p = get_cur_tab();
     SDL_Rect *wr = &g_lock_win_rect;
     int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
     SDL_Color c_white  = { 228, 228, 228, 255 };
@@ -3481,39 +3509,104 @@ static void render_track_lock_popup_window(SDL_Renderer *ren) {
     SDL_RenderFillRect(ren, &hdr);
     draw_brown_border_rect(ren, &hdr, false, false);
     draw_lock_symbol_icon(ren, wx + 12, wy + 8, true, c_accent);
-    draw_text(ren, "Track Lock Options", wx + 30, wy + 9, c_white);
+    draw_text(ren, "Track Lock Settings", wx + 30, wy + 9, c_white);
     draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
 
-    struct { bool val; const char *lbl; int y; } opts[3] = {
-        { g_lock_opt_full[tab],       "1. Full lock [Default]",                      wy + 44 },
-        { g_lock_opt_prevent_lr[tab], "2. Clip item: only prevent left right move",  wy + 84 },
-        { g_lock_opt_prevent_ud[tab], "3. Clip item: only prevent up down move",     wy + 124 }
+    int col_w = (ww - 44) / 2;
+    int left_x = wx + 14;
+    int right_x = wx + 30 + col_w;
+    int box_y = wy + 40;
+    int box_h = wh - 86;
+
+    // Left Section Box: All Track
+    SDL_Rect left_box = { left_x, box_y, col_w, box_h };
+    SDL_SetRenderDrawColor(ren, 20, 19, 18, 255);
+    SDL_RenderFillRect(ren, &left_box);
+    draw_brown_border_rect(ren, &left_box, false, true);
+    draw_text(ren, "All Track", left_x + 12, box_y + 8, c_accent);
+
+    struct { bool val; const char *lbl; int y; } all_opts[4] = {
+        { g_lock_opt_full[tab],            "1. All Track Complete Lock",          box_y + 30 },
+        { g_lock_opt_complete_unlock[tab], "2. All Track Complete Unlock",        box_y + 66 },
+        { g_lock_opt_prevent_lr[tab],      "3. Lock only clip item Left Right move", box_y + 102 },
+        { g_lock_opt_prevent_ud[tab],      "4. Lock only clip item Up Down move",    box_y + 138 }
     };
 
-    for (int i = 0; i < 3; i++) {
-        int ry = opts[i].y;
-        bool chk = opts[i].val;
-        SDL_Rect row_r = { wx + 16, ry, ww - 32, 32 };
-        SDL_SetRenderDrawColor(ren, chk ? 48 : 30, chk ? 36 : 28, chk ? 26 : 26, 255);
+    for (int i = 0; i < 4; i++) {
+        int ry = all_opts[i].y;
+        bool chk = all_opts[i].val;
+        SDL_Rect row_r = { left_x + 8, ry, col_w - 16, 30 };
+        SDL_SetRenderDrawColor(ren, chk ? 48 : 28, chk ? 36 : 26, chk ? 26 : 24, 255);
         SDL_RenderFillRect(ren, &row_r);
         draw_brown_border_rect(ren, &row_r, chk, !chk);
 
-        SDL_Rect cb = { wx + 26, ry + 7, 18, 18 };
+        SDL_Rect cb = { left_x + 16, ry + 6, 18, 18 };
         SDL_SetRenderDrawColor(ren, chk ? hr + 24 : 15, chk ? hg + 16 : 14, chk ? hb + 10 : 13, 255);
         SDL_RenderFillRect(ren, &cb);
         draw_brown_border_rect(ren, &cb, chk, false);
         if (chk) draw_text(ren, "x", cb.x + 5, cb.y + 2, c_white);
 
-        draw_text(ren, opts[i].lbl, wx + 54, ry + 9, chk ? c_accent : c_white);
+        SDL_Rect r_clip = { left_x + 40, ry + 2, col_w - 50, 26 };
+        draw_text_clipped(ren, all_opts[i].lbl, left_x + 40, ry + 8, chk ? c_accent : c_white, &r_clip, NULL);
     }
 
-    int by = wy + wh - 40;
-    draw_text(ren, "Saved in project file (.ehs)", wx + 18, by + 8, c_muted);
-    SDL_Rect b_ok = { wx + ww - 98, by, 82, 28 };
+    // Right Section Box: Selected track
+    SDL_Rect right_box = { right_x, box_y, col_w, box_h };
+    SDL_SetRenderDrawColor(ren, 20, 19, 18, 255);
+    SDL_RenderFillRect(ren, &right_box);
+    draw_brown_border_rect(ren, &right_box, false, true);
+
+    int sel_trk = -1;
+    if (p) {
+        for (int t = 0; t < p->num_tracks; t++) {
+            if (p->track_selected[t]) { sel_trk = t; break; }
+        }
+        if (sel_trk < 0 && p->num_tracks > 0) {
+            sel_trk = (g_last_clicked_track_idx >= 0 && g_last_clicked_track_idx < p->num_tracks) ? g_last_clicked_track_idx : 0;
+        }
+    }
+    char sel_hdr[96];
+    if (p && sel_trk >= 0 && sel_trk < p->num_tracks) {
+        snprintf(sel_hdr, sizeof(sel_hdr), "Selected track (%s)", p->track_names[sel_trk]);
+    } else {
+        snprintf(sel_hdr, sizeof(sel_hdr), "Selected track");
+    }
+    SDL_Rect sh_clip = { right_x + 10, box_y + 4, col_w - 20, 20 };
+    draw_text_clipped(ren, sel_hdr, right_x + 12, box_y + 8, c_accent, &sh_clip, NULL);
+
+    bool sel_lr = (sel_trk >= 0) ? g_track_lock_lr_only[tab][sel_trk] : false;
+    bool sel_ud = (sel_trk >= 0) ? g_track_lock_ud_only[tab][sel_trk] : false;
+
+    struct { bool val; const char *lbl; int y; } sel_opts[2] = {
+        { sel_lr, "1. Lock only clip item Left Right move", box_y + 30 },
+        { sel_ud, "2. Lock only clip item Up Down move",    box_y + 66 }
+    };
+
+    for (int i = 0; i < 2; i++) {
+        int ry = sel_opts[i].y;
+        bool chk = sel_opts[i].val;
+        SDL_Rect row_r = { right_x + 8, ry, col_w - 16, 30 };
+        SDL_SetRenderDrawColor(ren, chk ? 48 : 28, chk ? 36 : 26, chk ? 26 : 24, 255);
+        SDL_RenderFillRect(ren, &row_r);
+        draw_brown_border_rect(ren, &row_r, chk, !chk);
+
+        SDL_Rect cb = { right_x + 16, ry + 6, 18, 18 };
+        SDL_SetRenderDrawColor(ren, chk ? hr + 24 : 15, chk ? hg + 16 : 14, chk ? hb + 10 : 13, 255);
+        SDL_RenderFillRect(ren, &cb);
+        draw_brown_border_rect(ren, &cb, chk, false);
+        if (chk) draw_text(ren, "x", cb.x + 5, cb.y + 2, c_white);
+
+        SDL_Rect r_clip = { right_x + 40, ry + 2, col_w - 50, 26 };
+        draw_text_clipped(ren, sel_opts[i].lbl, right_x + 40, ry + 8, chk ? c_accent : c_white, &r_clip, NULL);
+    }
+
+    int by = wy + wh - 38;
+    draw_text(ren, "Complete lock blocks clip edge drag, dB gain, color & delete.", wx + 16, by + 8, c_muted);
+    SDL_Rect b_ok = { wx + ww - 98, by, 82, 26 };
     SDL_SetRenderDrawColor(ren, hr + 22, hg + 14, hb + 8, 255);
     SDL_RenderFillRect(ren, &b_ok);
     draw_brown_border_rect(ren, &b_ok, true, false);
-    draw_text(ren, "OK", b_ok.x + 30, by + 8, c_white);
+    draw_text(ren, "Close", b_ok.x + 21, by + 6, c_white);
 }
 
 // Draws crisp Play (triangle) or Pause (double bars) symbol only (Requirement 12)
@@ -4171,6 +4264,10 @@ static void update_export_progress_ui(SDL_Renderer *ren, int pct, const char *st
     }
 
     if (ren && g_export.is_open && (force_present || (now - g_export.last_ui_present_ticks >= 30))) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_DROPFILE && ev.drop.file) SDL_free(ev.drop.file);
+        }
         g_export.last_ui_present_ticks = now;
         SDL_Rect *er = &g_export.win_rect;
         int ex = er->x, ey = er->y, ew = er->w;
@@ -4729,7 +4826,10 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
     // Pause live playback and lock out the realtime audio mixer callback during export so file handles never race
     p->is_playing = false;
     g_engine_processing = true;
-    if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
+    if (g_daw.audio_device > 0) {
+        SDL_LockAudioDevice(g_daw.audio_device);
+        SDL_UnlockAudioDevice(g_daw.audio_device);
+    }
 
     const char *ext = get_export_ext();
     const char *dir = (g_export.directory[0] != '\0') ? g_export.directory : ".";
@@ -4838,7 +4938,6 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
         }
     }
 
-    if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
     g_engine_processing = false;
     g_export.is_rendering = false;
     char done_msg[256];
@@ -4857,7 +4956,14 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
 // Opens Windows save/browse dialog to pick output directory & filename for g_export
 static void browse_export_directory_and_filename(void) {
     char chosen[MAX_PATH] = {0};
-    if (open_generic_dialog(chosen, sizeof(chosen), "Select Output Folder & Name\0*.*\0", true)) {
+    const char *ext = get_export_ext();
+    const char *fn_init = g_export.filename[0] ? g_export.filename : "output";
+    if (g_export.directory[0] && strcmp(g_export.directory, ".") != 0) {
+        snprintf(chosen, sizeof(chosen), "%s\\%s.%s", g_export.directory, fn_init, ext);
+    } else {
+        snprintf(chosen, sizeof(chosen), "%s.%s", fn_init, ext);
+    }
+    if (open_generic_dialog(chosen, sizeof(chosen), "Export Media File\0*.*\0", true)) {
         char *last_sep = strrchr(chosen, '\\');
         if (!last_sep) last_sep = strrchr(chosen, '/');
         if (last_sep) {
@@ -6192,6 +6298,9 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     fwrite(&g_lock_opt_full[tab_i], sizeof(bool), 1, f);
     fwrite(&g_lock_opt_prevent_lr[tab_i], sizeof(bool), 1, f);
     fwrite(&g_lock_opt_prevent_ud[tab_i], sizeof(bool), 1, f);
+    fwrite(g_track_lock_lr_only[tab_i], sizeof(bool), MAX_TRACKS, f);
+    fwrite(g_track_lock_ud_only[tab_i], sizeof(bool), MAX_TRACKS, f);
+    fwrite(&g_lock_opt_complete_unlock[tab_i], sizeof(bool), 1, f);
 
     fflush(f);
     fclose(f);
@@ -6410,6 +6519,9 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
                 fread(&g_lock_opt_full[tab_i], sizeof(bool), 1, f);
                 fread(&g_lock_opt_prevent_lr[tab_i], sizeof(bool), 1, f);
                 fread(&g_lock_opt_prevent_ud[tab_i], sizeof(bool), 1, f);
+                fread(g_track_lock_lr_only[tab_i], sizeof(bool), MAX_TRACKS, f);
+                fread(g_track_lock_ud_only[tab_i], sizeof(bool), MAX_TRACKS, f);
+                fread(&g_lock_opt_complete_unlock[tab_i], sizeof(bool), 1, f);
             }
         }
     }
@@ -7222,9 +7334,10 @@ static int hit_test_clip_interaction(ProjectTab *p, int mx, int my,
     const int edge_tol = 10; // Generous +-10px tolerance on left/right clip edges
 
     // Pass 1: Check clip edges & fade handles first (top-to-bottom item order) so edge drag always succeeds when double-arrow is shown
+    int cur_tab_hit = get_valid_tab_idx();
     for (int i = p->num_items - 1; i >= 0; i--) {
         AudioItem *it = &p->items[i];
-        if (is_track_hidden(it->track_idx)) continue;
+        if (is_track_hidden(it->track_idx) || is_track_full_locked_tab(cur_tab_hit, it->track_idx)) continue;
         int iy = get_track_y_pos(it->track_idx);
         int ih = p->track_heights[it->track_idx];
         if (my < iy || my > iy + ih) continue;
@@ -7457,7 +7570,14 @@ int main(int argc, char *argv[]) {
     memset(g_item_group_id, 0, sizeof(g_item_group_id));
     memset(g_track_hidden, 0, sizeof(g_track_hidden));
     memset(g_track_locked, 0, sizeof(g_track_locked));
-    for (int lt = 0; lt < MAX_TABS; lt++) { g_lock_opt_full[lt] = true; g_lock_opt_prevent_lr[lt] = false; g_lock_opt_prevent_ud[lt] = false; }
+    memset(g_track_lock_lr_only, 0, sizeof(g_track_lock_lr_only));
+    memset(g_track_lock_ud_only, 0, sizeof(g_track_lock_ud_only));
+    for (int lt = 0; lt < MAX_TABS; lt++) {
+        g_lock_opt_full[lt] = false;
+        g_lock_opt_complete_unlock[lt] = false;
+        g_lock_opt_prevent_lr[lt] = false;
+        g_lock_opt_prevent_ud[lt] = false;
+    }
     memset(g_tab_history, 0, sizeof(g_tab_history));
     memset(g_tab_history_count, 0, sizeof(g_tab_history_count));
     memset(g_tab_notification, 0, sizeof(g_tab_notification));
@@ -8081,7 +8201,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                // Track Lock Options Right-Click Popup Window (Requirement 1)
+                // Main Lock Two-Section Popup Window (All Track | Selected track)
                 if (g_lock_popup_open && point_in_rect(mx, my, &g_lock_win_rect)) {
                     SDL_Rect *wr = &g_lock_win_rect;
                     int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
@@ -8096,28 +8216,110 @@ int main(int argc, char *argv[]) {
                         }
                         continue;
                     }
-                    if (mx >= wx + 16 && mx <= wx + ww - 16) {
-                        if (my >= wy + 44 && my <= wy + 76) {
+                    int col_w = (ww - 44) / 2;
+                    int left_x = wx + 14;
+                    int right_x = wx + 30 + col_w;
+                    int box_y = wy + 40;
+
+                    // Left Section clicks: All Track (4 tick boxes)
+                    if (mx >= left_x + 8 && mx <= left_x + col_w - 8) {
+                        if (my >= box_y + 30 && my <= box_y + 60) {
+                            // 1. All Track Complete Lock
+                            push_undo_state();
                             g_lock_opt_full[ltab] = !g_lock_opt_full[ltab];
                             if (g_lock_opt_full[ltab]) {
+                                g_lock_opt_complete_unlock[ltab] = false;
                                 g_lock_opt_prevent_lr[ltab] = false;
                                 g_lock_opt_prevent_ud[ltab] = false;
+                                for (int t = 0; t < p->num_tracks; t++) {
+                                    g_track_locked[ltab][t] = true;
+                                    g_track_lock_lr_only[ltab][t] = false;
+                                    g_track_lock_ud_only[ltab][t] = false;
+                                }
+                                record_project_change("All Track Complete Lock: ON", true);
+                            } else {
+                                for (int t = 0; t < p->num_tracks; t++) {
+                                    g_track_locked[ltab][t] = false;
+                                    g_track_lock_lr_only[ltab][t] = false;
+                                    g_track_lock_ud_only[ltab][t] = false;
+                                }
+                                record_project_change("All Track Complete Lock: OFF", true);
                             }
-                            record_project_change("Updated Track Lock Option: Full Lock", true);
-                        } else if (my >= wy + 84 && my <= wy + 116) {
+                        } else if (my >= box_y + 66 && my <= box_y + 96) {
+                            // 2. All Track Complete Unlock
+                            push_undo_state();
+                            g_lock_opt_complete_unlock[ltab] = !g_lock_opt_complete_unlock[ltab];
+                            if (g_lock_opt_complete_unlock[ltab]) {
+                                g_lock_opt_full[ltab] = false;
+                                g_lock_opt_prevent_lr[ltab] = false;
+                                g_lock_opt_prevent_ud[ltab] = false;
+                                for (int t = 0; t < p->num_tracks; t++) {
+                                    g_track_locked[ltab][t] = false;
+                                    g_track_lock_lr_only[ltab][t] = false;
+                                    g_track_lock_ud_only[ltab][t] = false;
+                                }
+                                record_project_change("All Track Complete Unlock", true);
+                            }
+                        } else if (my >= box_y + 102 && my <= box_y + 132) {
+                            // 3. Lock only clip item Left Right move (All Track)
+                            push_undo_state();
                             g_lock_opt_prevent_lr[ltab] = !g_lock_opt_prevent_lr[ltab];
-                            if (g_lock_opt_prevent_lr[ltab]) g_lock_opt_full[ltab] = false;
-                            if (!g_lock_opt_prevent_lr[ltab] && !g_lock_opt_prevent_ud[ltab]) g_lock_opt_full[ltab] = true;
-                            record_project_change("Updated Track Lock Option: Prevent Left/Right Move", true);
-                        } else if (my >= wy + 124 && my <= wy + 156) {
+                            g_lock_opt_full[ltab] = false;
+                            g_lock_opt_complete_unlock[ltab] = false;
+                            for (int t = 0; t < p->num_tracks; t++) {
+                                g_track_lock_lr_only[ltab][t] = g_lock_opt_prevent_lr[ltab];
+                                g_track_lock_ud_only[ltab][t] = g_lock_opt_prevent_ud[ltab];
+                                g_track_locked[ltab][t] = (g_track_lock_lr_only[ltab][t] || g_track_lock_ud_only[ltab][t]);
+                            }
+                            record_project_change("All Track: Lock Left/Right Clip Move", true);
+                        } else if (my >= box_y + 138 && my <= box_y + 168) {
+                            // 4. Lock only clip item Up Down move (All Track)
+                            push_undo_state();
                             g_lock_opt_prevent_ud[ltab] = !g_lock_opt_prevent_ud[ltab];
-                            if (g_lock_opt_prevent_ud[ltab]) g_lock_opt_full[ltab] = false;
-                            if (!g_lock_opt_prevent_lr[ltab] && !g_lock_opt_prevent_ud[ltab]) g_lock_opt_full[ltab] = true;
-                            record_project_change("Updated Track Lock Option: Prevent Up/Down Move", true);
+                            g_lock_opt_full[ltab] = false;
+                            g_lock_opt_complete_unlock[ltab] = false;
+                            for (int t = 0; t < p->num_tracks; t++) {
+                                g_track_lock_lr_only[ltab][t] = g_lock_opt_prevent_lr[ltab];
+                                g_track_lock_ud_only[ltab][t] = g_lock_opt_prevent_ud[ltab];
+                                g_track_locked[ltab][t] = (g_track_lock_lr_only[ltab][t] || g_track_lock_ud_only[ltab][t]);
+                            }
+                            record_project_change("All Track: Lock Up/Down Clip Move", true);
                         }
                     }
-                    int by = wy + wh - 40;
-                    if (my >= by && my <= by + 28 && mx >= wx + ww - 98 && mx <= wx + ww - 16) {
+
+                    // Right Section clicks: Selected track (2 tick boxes)
+                    if (mx >= right_x + 8 && mx <= right_x + col_w - 8) {
+                        bool any_sel_t = false;
+                        for (int t = 0; t < p->num_tracks; t++) {
+                            if (p->track_selected[t]) { any_sel_t = true; break; }
+                        }
+                        if (!any_sel_t && p->num_tracks > 0) {
+                            int fb_t = (g_last_clicked_track_idx >= 0 && g_last_clicked_track_idx < p->num_tracks) ? g_last_clicked_track_idx : 0;
+                            p->track_selected[fb_t] = true;
+                        }
+                        if (my >= box_y + 30 && my <= box_y + 60) {
+                            // 1. Lock only clip item Left Right move (Selected track)
+                            push_undo_state();
+                            for (int t = 0; t < p->num_tracks; t++) {
+                                if (!p->track_selected[t]) continue;
+                                g_track_lock_lr_only[ltab][t] = !g_track_lock_lr_only[ltab][t];
+                                g_track_locked[ltab][t] = (g_track_lock_lr_only[ltab][t] || g_track_lock_ud_only[ltab][t]);
+                            }
+                            record_project_change("Selected Track: Lock Left/Right Clip Move", true);
+                        } else if (my >= box_y + 66 && my <= box_y + 96) {
+                            // 2. Lock only clip item Up Down move (Selected track)
+                            push_undo_state();
+                            for (int t = 0; t < p->num_tracks; t++) {
+                                if (!p->track_selected[t]) continue;
+                                g_track_lock_ud_only[ltab][t] = !g_track_lock_ud_only[ltab][t];
+                                g_track_locked[ltab][t] = (g_track_lock_lr_only[ltab][t] || g_track_lock_ud_only[ltab][t]);
+                            }
+                            record_project_change("Selected Track: Lock Up/Down Clip Move", true);
+                        }
+                    }
+
+                    int by = wy + wh - 38;
+                    if (my >= by && my <= by + 26 && mx >= wx + ww - 98 && mx <= wx + ww - 16) {
                         g_lock_popup_open = false;
                     }
                     continue;
@@ -8420,30 +8622,6 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
                     if (mx >= wx && mx <= wx + ww && my >= wy + 30 && my <= wy + wh) {
-                        int by = wy + wh - 40;
-                        if (my >= by && my <= by + 28) {
-                            int tab = get_valid_tab_idx();
-                            if (mx >= wx + 14 && mx <= wx + 132) {
-                                // [Toggle Mute]
-                                push_undo_state();
-                                for (int i = 0; i < p->num_items; i++) {
-                                    if (p->items[i].is_selected) g_item_muted[tab][i] = !g_item_muted[tab][i];
-                                }
-                                record_project_change("Toggled Selected Clip Mute", true);
-                            } else if (mx >= wx + 142 && mx <= wx + 260) {
-                                // [Clip Color...]
-                                open_color_picker_dialog(1);
-                            } else if (mx >= wx + 270 && mx <= wx + 392) {
-                                // [Reset 0.0 dB]
-                                push_undo_state();
-                                for (int i = 0; i < p->num_items; i++) {
-                                    if (p->items[i].is_selected) g_item_vol_db[tab][i] = 0.0f;
-                                }
-                                record_project_change("Reset Clip Volume to 0.0 dB", true);
-                            } else if (mx >= wx + ww - 102 && mx <= wx + ww - 14) {
-                                g_clip_props.is_open = false;
-                            }
-                        }
                         continue;
                     }
                     continue;
@@ -8584,8 +8762,10 @@ int main(int argc, char *argv[]) {
 
                     // Title bar drag or [X] close
                     if (mx >= ex && mx <= ex + ew && my >= ey && my <= ey + 30) {
-                        if (mx >= ex + ew - 30) {
+                        if (mx >= ex + ew - 34) {
+                            g_export.mp4_aac_dropdown_open = false;
                             g_export.is_open = false;
+                            save_themes_settings_json();
                         } else {
                             g_export.is_dragging = true;
                             g_export.drag_off_x = mx - ex;
@@ -8595,130 +8775,171 @@ int main(int argc, char *argv[]) {
                     }
 
                     if (mx >= ex && mx <= ex + ew && my >= ey + 30 && my <= ey + eh) {
-                        // 1. Source row (ey + 48 .. ey + 76)
-                        int sy_src = ey + 48;
-                        if (my >= sy_src && my <= sy_src + 26) {
-                            if (mx >= ex + 110 && mx <= ex + 245) g_export.source = EXPORT_SRC_MASTER;
-                            else if (mx >= ex + 255 && mx <= ex + 465) g_export.source = EXPORT_SRC_STEMS;
-                            else if (mx >= ex + 475 && mx <= ex + 662) g_export.source = EXPORT_SRC_ITEMS;
+                        // First check open MP4 AAC bitrate dropdown menu so it never gets swallowed by rows underneath!
+                        int sy_sub = ey + 278;
+                        int r3_y = sy_sub + 84;
+                        if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
+                            int dd_x = ex + 295;
+                            int dd_y = r3_y + 26;
+                            int dd_w = 130;
+                            if (mx >= dd_x && mx <= dd_x + dd_w && my >= dd_y && my <= dd_y + 78) {
+                                int sel_row = (my - dd_y) / 26;
+                                if (sel_row == 0) strcpy(g_export.mp4_audio_kbps_str, "120");
+                                else if (sel_row == 1) strcpy(g_export.mp4_audio_kbps_str, "192");
+                                else if (sel_row == 2) strcpy(g_export.mp4_audio_kbps_str, "320");
+                                g_export.mp4_aac_dropdown_open = false;
+                                continue;
+                            }
+                            g_export.mp4_aac_dropdown_open = false;
                         }
 
-                        // 2. Output Directory row (ey + 98 .. ey + 124) & [Browse...] button
+                        // 1. Source row (ey + 46 .. ey + 78)
+                        int sy_src = ey + 48;
+                        if (my >= sy_src - 2 && my <= sy_src + 28) {
+                            if (mx >= ex + 108 && mx <= ex + 247) g_export.source = EXPORT_SRC_MASTER;
+                            else if (mx >= ex + 253 && mx <= ex + 467) g_export.source = EXPORT_SRC_STEMS;
+                            else if (mx >= ex + 473 && mx <= ex + 664) g_export.source = EXPORT_SRC_ITEMS;
+                            continue;
+                        }
+
+                        // 2. Output Directory row (ey + 96 .. ey + 126) & [Browse...] button
                         int sy_dir = ey + 98;
-                        if (my >= sy_dir && my <= sy_dir + 26) {
-                            if (mx >= ex + 130 && mx <= ex + 545) {
+                        if (my >= sy_dir - 2 && my <= sy_dir + 28) {
+                            if (mx >= ex + 128 && mx <= ex + 547) {
                                 g_export.active_field = EXP_FIELD_DIR;
                                 SDL_StartTextInput();
-                            } else if (mx >= ex + 555 && mx <= ex + 662) {
+                            } else if (mx >= ex + 553 && mx <= ex + 664) {
                                 browse_export_directory_and_filename();
                             }
+                            continue;
                         }
 
-                        // 3. Output File Name row (ey + 132 .. ey + 158)
+                        // 3. Output File Name row (ey + 130 .. ey + 160)
                         int sy_fn = ey + 132;
-                        if (my >= sy_fn && my <= sy_fn + 26) {
-                            if (mx >= ex + 130 && mx <= ex + 545) {
+                        if (my >= sy_fn - 2 && my <= sy_fn + 28) {
+                            if (mx >= ex + 128 && mx <= ex + 547) {
                                 g_export.active_field = EXP_FIELD_FILENAME;
                                 SDL_StartTextInput();
                             }
+                            continue;
                         }
 
-                        // 4. Sample Rate (48,000 / 44,100) & Channels (Mono / Stereo) row (ey + 182 .. ey + 208)
+                        // 4. Sample Rate (48,000 / 44,100) & Channels (Mono / Stereo) row (ey + 180 .. ey + 210)
                         int sy_sr = ey + 182;
-                        if (my >= sy_sr && my <= sy_sr + 26) {
-                            if (mx >= ex + 130 && mx <= ex + 235) g_export.sample_rate = 48000;
-                            else if (mx >= ex + 243 && mx <= ex + 348) g_export.sample_rate = 44100;
-                            else if (mx >= ex + 455 && mx <= ex + 545) g_export.channels = 1;
-                            else if (mx >= ex + 553 && mx <= ex + 655) g_export.channels = 2;
+                        if (my >= sy_sr - 2 && my <= sy_sr + 28) {
+                            if (mx >= ex + 128 && mx <= ex + 237) g_export.sample_rate = 48000;
+                            else if (mx >= ex + 241 && mx <= ex + 350) g_export.sample_rate = 44100;
+                            else if (mx >= ex + 453 && mx <= ex + 547) g_export.channels = 1;
+                            else if (mx >= ex + 551 && mx <= ex + 658) g_export.channels = 2;
+                            continue;
                         }
 
-                        // 5. Format Tabs: WAV / MP3 / MP4 (ey + 232 .. ey + 260)
+                        // 5. Format Tabs: WAV / MP3 / MP4 (ey + 230 .. ey + 262)
                         int sy_fmt = ey + 232;
-                        if (my >= sy_fmt && my <= sy_fmt + 28) {
-                            if (mx >= ex + 130 && mx <= ex + 260) g_export.format = EXPORT_FMT_WAV;
-                            else if (mx >= ex + 270 && mx <= ex + 400) g_export.format = EXPORT_FMT_MP3;
-                            else if (mx >= ex + 410 && mx <= ex + 655) g_export.format = EXPORT_FMT_MP4;
+                        if (my >= sy_fmt - 2 && my <= sy_fmt + 30) {
+                            if (mx >= ex + 128 && mx <= ex + 262) {
+                                g_export.format = EXPORT_FMT_WAV;
+                                g_export.mp4_aac_dropdown_open = false;
+                            } else if (mx >= ex + 268 && mx <= ex + 402) {
+                                g_export.format = EXPORT_FMT_MP3;
+                                g_export.mp4_aac_dropdown_open = false;
+                            } else if (mx >= ex + 408 && mx <= ex + 658) {
+                                g_export.format = EXPORT_FMT_MP4;
+                            }
+                            continue;
                         }
 
-                        // 6. Format-specific sub-options (ey + 276 .. ey + 420)
-                        int sy_sub = ey + 278;
+                        // 6. Format-specific sub-options (ey + 272 .. ey + 424)
                         if (g_export.format == EXPORT_FMT_WAV) {
-                            if (my >= sy_sub + 12 && my <= sy_sub + 40) {
-                                if (mx >= ex + 140 && mx <= ex + 280) g_export.wav_bit_depth = 16;
-                                else if (mx >= ex + 292 && mx <= ex + 432) g_export.wav_bit_depth = 24;
-                                else if (mx >= ex + 444 && mx <= ex + 584) g_export.wav_bit_depth = 32;
+                            if (my >= sy_sub + 8 && my <= sy_sub + 44) {
+                                if (mx >= ex + 148 && mx <= ex + 282) g_export.wav_bit_depth = 16;
+                                else if (mx >= ex + 290 && mx <= ex + 424) g_export.wav_bit_depth = 24;
+                                else if (mx >= ex + 432 && mx <= ex + 568) g_export.wav_bit_depth = 32;
+                                continue;
                             }
                         } else if (g_export.format == EXPORT_FMT_MP3) {
-                            if (my >= sy_sub + 12 && my <= sy_sub + 40) {
-                                if (mx >= ex + 140 && mx <= ex + 280) g_export.mp3_bitrate = 128;
-                                else if (mx >= ex + 292 && mx <= ex + 432) g_export.mp3_bitrate = 192;
-                                else if (mx >= ex + 444 && mx <= ex + 584) g_export.mp3_bitrate = 320;
+                            if (my >= sy_sub + 8 && my <= sy_sub + 44) {
+                                if (mx >= ex + 148 && mx <= ex + 282) g_export.mp3_bitrate = 128;
+                                else if (mx >= ex + 290 && mx <= ex + 424) g_export.mp3_bitrate = 192;
+                                else if (mx >= ex + 432 && mx <= ex + 568) g_export.mp3_bitrate = 320;
+                                continue;
                             }
                         } else if (g_export.format == EXPORT_FMT_MP4) {
                             // Row 1: File: [MPEG-4]  Size: [1920] x [1080]  Framerate: [25.00]
                             int r1_y = sy_sub + 8;
-                            if (my >= r1_y && my <= r1_y + 26) {
-                                if (mx >= ex + 295 && mx <= ex + 365) {
+                            if (my >= r1_y - 2 && my <= r1_y + 28) {
+                                if (mx >= ex + 90 && mx <= ex + 230) {
+                                    // Clicking File [MPEG-4] cycles common resolution presets (1080p -> 720p -> 4K)
+                                    if (strcmp(g_export.mp4_width_str, "1920") == 0) {
+                                        strcpy(g_export.mp4_width_str, "1280");
+                                        strcpy(g_export.mp4_height_str, "720");
+                                    } else if (strcmp(g_export.mp4_width_str, "1280") == 0) {
+                                        strcpy(g_export.mp4_width_str, "3840");
+                                        strcpy(g_export.mp4_height_str, "2160");
+                                    } else {
+                                        strcpy(g_export.mp4_width_str, "1920");
+                                        strcpy(g_export.mp4_height_str, "1080");
+                                    }
+                                } else if (mx >= ex + 293 && mx <= ex + 367) {
                                     g_export.active_field = EXP_FIELD_MP4_WIDTH;
                                     SDL_StartTextInput();
-                                } else if (mx >= ex + 390 && mx <= ex + 460) {
+                                } else if (mx >= ex + 388 && mx <= ex + 462) {
                                     g_export.active_field = EXP_FIELD_MP4_HEIGHT;
                                     SDL_StartTextInput();
-                                } else if (mx >= ex + 568 && mx <= ex + 648) {
+                                } else if (mx >= ex + 566 && mx <= ex + 650) {
                                     g_export.active_field = EXP_FIELD_MP4_FPS;
                                     SDL_StartTextInput();
                                 }
+                                continue;
                             }
                             // Row 2: Video: [H.264]  [2048] kbps
                             int r2_y = sy_sub + 46;
-                            if (my >= r2_y && my <= r2_y + 26) {
-                                if (mx >= ex + 295 && mx <= ex + 395) {
+                            if (my >= r2_y - 2 && my <= r2_y + 28) {
+                                if (mx >= ex + 90 && mx <= ex + 270) {
+                                    // Clicking Video [H.264] box cycles standard video bitrates (2048 -> 4096 -> 8192 -> 1024)
+                                    int vk = atoi(g_export.mp4_video_kbps_str);
+                                    if (vk < 2048) strcpy(g_export.mp4_video_kbps_str, "2048");
+                                    else if (vk < 4096) strcpy(g_export.mp4_video_kbps_str, "4096");
+                                    else if (vk < 8192) strcpy(g_export.mp4_video_kbps_str, "8192");
+                                    else strcpy(g_export.mp4_video_kbps_str, "1024");
+                                } else if (mx >= ex + 293 && mx <= ex + 398) {
                                     g_export.active_field = EXP_FIELD_MP4_V_KBPS;
                                     SDL_StartTextInput();
                                 }
+                                continue;
                             }
-                            // Row 3: Audio: [AAC]  [ 120 / 192 / 320 kbps v ] dropdown menu
-                            int r3_y = sy_sub + 84;
-                            if (g_export.mp4_aac_dropdown_open) {
-                                int dd_x = ex + 295;
-                                int dd_y = r3_y + 26;
-                                int dd_w = 130;
-                                if (mx >= dd_x && mx <= dd_x + dd_w && my >= dd_y && my <= dd_y + 78) {
-                                    int sel_row = (my - dd_y) / 26;
-                                    if (sel_row == 0) strcpy(g_export.mp4_audio_kbps_str, "120");
-                                    else if (sel_row == 1) strcpy(g_export.mp4_audio_kbps_str, "192");
-                                    else if (sel_row == 2) strcpy(g_export.mp4_audio_kbps_str, "320");
-                                    g_export.mp4_aac_dropdown_open = false;
+                            // Row 3: Audio: [AAC / MP3 / WAV]  [ 120 / 192 / 320 kbps v ] dropdown menu
+                            if (my >= r3_y - 2 && my <= r3_y + 28) {
+                                if (mx >= ex + 90 && mx <= ex + 270) {
+                                    g_export.mp4_audio_codec = (ExportMp4AudioCodec)(((int)g_export.mp4_audio_codec + 1) % 3);
                                     continue;
                                 }
-                            }
-                            if (my >= r3_y && my <= r3_y + 26) {
-                                g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
-                                if (mx >= ex + 295 && mx <= ex + 425) {
+                                if (mx >= ex + 293 && mx <= ex + 428) {
                                     g_export.mp4_aac_dropdown_open = !g_export.mp4_aac_dropdown_open;
                                     continue;
                                 }
                             }
-                            g_export.mp4_aac_dropdown_open = false;
-                        } else {
-                            g_export.mp4_aac_dropdown_open = false;
                         }
 
-                        // 7. Option: Two-pass render checkbox (ey + 436 .. ey + 460)
+                        // 7. Option: Two-pass render checkbox (ey + 434 .. ey + 462)
                         int sy_opt = ey + 436;
-                        if (my >= sy_opt && my <= sy_opt + 24 && mx >= ex + 22 && mx <= ex + 240) {
+                        if (my >= sy_opt - 2 && my <= sy_opt + 26 && mx >= ex + 20 && mx <= ex + 280) {
                             g_export.two_pass_render = !g_export.two_pass_render;
+                            continue;
                         }
 
-                        save_themes_settings_json();
-                        // 8. Bottom buttons: [Render / Export] and [Close]
+                        // 8. Bottom buttons: [Render / Export] and [Cancel]
                         int btn_y = ey + eh - 44;
-                        if (my >= btn_y && my <= btn_y + 32) {
-                            if (mx >= ex + ew - 270 && mx <= ex + ew - 125) {
+                        if (my >= btn_y - 2 && my <= btn_y + 34) {
+                            if (mx >= ex + ew - 272 && mx <= ex + ew - 123) {
+                                save_themes_settings_json();
                                 execute_unified_export(p, ren);
-                            } else if (mx >= ex + ew - 115 && mx <= ex + ew - 20) {
+                            } else if (mx >= ex + ew - 117 && mx <= ex + ew - 18) {
+                                g_export.mp4_aac_dropdown_open = false;
                                 g_export.is_open = false;
+                                save_themes_settings_json();
                             }
+                            continue;
                         }
                         continue;
                     }
@@ -9378,6 +9599,9 @@ int main(int argc, char *argv[]) {
                         }
                         else if (my >= m_start + 96 && my <= m_start + 126) {
                             // Row 4: Export Media (no 3 dots)
+                            g_lock_popup_open = false;
+                            g_time_jump_open = false;
+                            g_mouse_settings_open = false;
                             g_export.is_open = true;
                             g_export.win_rect.x = (win_w - g_export.win_rect.w) / 2;
                             g_export.win_rect.y = (win_h - g_export.win_rect.h) / 2;
@@ -9655,13 +9879,11 @@ int main(int argc, char *argv[]) {
                         snprintf(p->track_names[p->num_tracks], 64, "Track %d", p->num_tracks + 1);
                         p->num_tracks++;
                         record_project_change("Added New Track", true);
-                    } else if (mx >= 82 && mx <= 108) {
-                        if (e.button.button == SDL_BUTTON_RIGHT) {
-                            g_lock_popup_open = true;
+                    } else if (mx >= 82 && mx <= 108 && e.button.button == SDL_BUTTON_LEFT) {
+                        g_lock_popup_open = !g_lock_popup_open;
+                        if (g_lock_popup_open) {
                             g_lock_win_rect.x = (win_w - g_lock_win_rect.w) / 2;
                             g_lock_win_rect.y = (win_h - g_lock_win_rect.h) / 2;
-                        } else if (e.button.button == SDL_BUTTON_LEFT) {
-                            toggle_master_lock_all_tracks(p);
                         }
                     } else if (mx >= 112 && mx <= 138 && e.button.button == SDL_BUTTON_LEFT) {
                         toggle_master_mute_all_tracks(p);
@@ -9789,11 +10011,17 @@ int main(int argc, char *argv[]) {
                     for (int t = 0; t < p->num_tracks; t++) {
                         if (is_track_hidden(t)) continue;
                         int th = p->track_heights[t];
-                        if (abs(my - (cur_y + th)) <= 5) {
-                            push_undo_state();
-                            resizing_track_idx = t;
-                            track_orig_height = th;
-                            mouse_drag_start_y = my;
+                        int tab_tcp = get_valid_tab_idx();
+                        bool trk_full_locked = is_track_full_locked_tab(tab_tcp, t);
+                        int rel_y_edge_chk = my - cur_y;
+                        bool over_bot_controls = (rel_y_edge_chk >= 32 && rel_y_edge_chk <= 55 && mx >= 8 && mx <= 172);
+                        if (!over_bot_controls && abs(my - (cur_y + th)) <= 4) {
+                            if (!trk_full_locked) {
+                                push_undo_state();
+                                resizing_track_idx = t;
+                                track_orig_height = th;
+                                mouse_drag_start_y = my;
+                            }
                             break;
                         }
                         if (my >= cur_y && my < cur_y + th) {
@@ -9805,7 +10033,6 @@ int main(int argc, char *argv[]) {
                             } else if (shift_pressed) {
                                 int anchor = g_last_clicked_track_idx;
                                 if (anchor < 0 || anchor >= p->num_tracks) {
-                                    // Find existing single selected track if any, else make t the anchor
                                     for (int tr = 0; tr < p->num_tracks; tr++) {
                                         if (p->track_selected[tr]) { anchor = tr; break; }
                                     }
@@ -9822,49 +10049,43 @@ int main(int argc, char *argv[]) {
                                     }
                                 }
                             } else {
-                                // Requirement 5: Clicking any single track header without Shift releases multiple selection and selects clicked track only
-                                bool on_grip = (mx >= g_daw.tcp_width - 28 && mx <= g_daw.tcp_width - 6);
-                                if (!on_grip || !p->track_selected[t]) {
-                                    for (int tr = 0; tr < p->num_tracks; tr++) p->track_selected[tr] = false;
-                                    p->track_selected[t] = true;
-                                }
+                                for (int tr = 0; tr < p->num_tracks; tr++) p->track_selected[tr] = false;
+                                p->track_selected[t] = true;
                                 g_last_clicked_track_idx = t;
                             }
                             for (int o = 0; o < p->num_items; o++) p->items[o].is_selected = false;
 
-                            int tab_tcp = get_valid_tab_idx();
-                            bool trk_full_locked = is_track_full_locked_tab(tab_tcp, t);
-                            int lock_btn_x = g_daw.tcp_width - 48;
                             bool handled_btn = false;
 
-                            // Per-track Lock symbol button right next to Track Name box (left-click toggles lock, right-click opens Lock Options popup)
-                            if (rel_y >= 6 && rel_y <= 28 && mx >= lock_btn_x && mx <= lock_btn_x + 20) {
-                                if (e.button.button == SDL_BUTTON_RIGHT) {
-                                    g_lock_popup_open = true;
-                                    g_lock_win_rect.x = (win_w - g_lock_win_rect.w) / 2;
-                                    g_lock_win_rect.y = (win_h - g_lock_win_rect.h) / 2;
-                                } else if (e.button.button == SDL_BUTTON_LEFT) {
-                                    push_undo_state();
-                                    g_track_locked[tab_tcp][t] = !g_track_locked[tab_tcp][t];
-                                    record_project_change(g_track_locked[tab_tcp][t] ? "Locked Track" : "Unlocked Track", true);
-                                }
-                                handled_btn = true;
-                            } else if (mx >= g_daw.tcp_width - 24 && mx <= g_daw.tcp_width - 6) {
-                                if (!trk_full_locked) {
-                                    dragging_track_order_idx = t;
-                                    dragging_track_order_pushed_undo = false;
-                                }
-                                handled_btn = true;
-                            } else if (rel_y >= 30 && rel_y <= 56) {
-                                if (!trk_full_locked) {
+                            if (rel_y >= 32 && rel_y <= 56) {
+                                // Individual Track Lock button is at left side of 'M' (mx: 96 .. 118)
+                                if (mx >= 96 && mx <= 118) {
+                                    if (e.button.button == SDL_BUTTON_LEFT) {
+                                        push_undo_state();
+                                        g_track_locked[tab_tcp][t] = !g_track_locked[tab_tcp][t];
+                                        if (g_track_locked[tab_tcp][t]) {
+                                            // Individual track lock defaults to Complete Lock unless partial LR/UD was set
+                                            if (!g_track_lock_lr_only[tab_tcp][t] && !g_track_lock_ud_only[tab_tcp][t]) {
+                                                g_track_lock_lr_only[tab_tcp][t] = false;
+                                                g_track_lock_ud_only[tab_tcp][t] = false;
+                                            }
+                                        } else {
+                                            g_track_lock_lr_only[tab_tcp][t] = false;
+                                            g_track_lock_ud_only[tab_tcp][t] = false;
+                                            g_lock_opt_full[tab_tcp] = false;
+                                        }
+                                        record_project_change(g_track_locked[tab_tcp][t] ? "Locked Individual Track" : "Unlocked Individual Track", true);
+                                    }
+                                    handled_btn = true;
+                                } else if (!trk_full_locked && e.button.button == SDL_BUTTON_LEFT) {
                                     if (mx >= 8 && mx <= 26) { push_undo_state(); p->track_db[t] -= 1.0f; record_project_change("Adjusted Track Volume", true); handled_btn = true; }
-                                    else if (mx >= 76 && mx <= 94) { push_undo_state(); p->track_db[t] += 1.0f; record_project_change("Adjusted Track Volume", true); handled_btn = true; }
-                                    else if (mx >= 110 && mx <= 132) { push_undo_state(); p->tracks[t].mute = !p->tracks[t].mute; record_project_change("Toggled Track Mute", true); handled_btn = true; }
-                                    else if (mx >= 138 && mx <= 160) { push_undo_state(); p->tracks[t].solo = !p->tracks[t].solo; record_project_change("Toggled Track Solo", true); handled_btn = true; }
-                                } else {
+                                    else if (mx >= 72 && mx <= 90) { push_undo_state(); p->track_db[t] += 1.0f; record_project_change("Adjusted Track Volume", true); handled_btn = true; }
+                                    else if (mx >= 122 && mx <= 144) { push_undo_state(); p->tracks[t].mute = !p->tracks[t].mute; record_project_change("Toggled Track Mute", true); handled_btn = true; }
+                                    else if (mx >= 148 && mx <= 170) { push_undo_state(); p->tracks[t].solo = !p->tracks[t].solo; record_project_change("Toggled Track Solo", true); handled_btn = true; }
+                                } else if (mx >= 8 && mx <= 172) {
                                     handled_btn = true;
                                 }
-                            } else if (rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx < lock_btn_x - 2) {
+                            } else if (rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx <= g_daw.tcp_width - 10) {
                                 if (e.button.clicks >= 2 && !trk_full_locked) {
                                     g_daw.input_focus = INPUT_FOCUS_TRACK_NAME;
                                     g_daw.editing_track_name_idx = t;
@@ -10406,16 +10627,16 @@ int main(int argc, char *argv[]) {
                     for (int t = 0; t < p->num_tracks; t++) {
                         if (is_track_hidden(t)) continue;
                         int th = p->track_heights[t];
-                        if (abs(my - (cur_y + th)) <= 5) {
+                        int rel_y = my - cur_y;
+                        bool trk_full_lck = is_track_full_locked_tab(get_valid_tab_idx(), t);
+                        // Never show vertical resize cursor over the Lock / M / S / Volume buttons row
+                        bool over_buttons = (rel_y >= 30 && rel_y <= 56 && mx >= 6 && mx <= 174);
+                        if (!over_buttons && !trk_full_lck && abs(my - (cur_y + th)) <= 3) {
                             SDL_SetCursor(g_cursor_size_ns);
                             hovered_edge = true;
                             break;
                         }
-                        if (mx >= g_daw.tcp_width - 28 && mx <= g_daw.tcp_width - 6 && my >= cur_y + 6 && my <= cur_y + th - 6) {
-                            SDL_SetCursor(g_cursor_arrow);
-                            break;
-                        }
-                        if (my >= cur_y + 6 && my <= cur_y + 28 && mx >= 8 && mx <= g_daw.tcp_width - 32) {
+                        if (!trk_full_lck && rel_y >= 6 && rel_y <= 28 && mx >= 8 && mx <= g_daw.tcp_width - 10) {
                             SDL_SetCursor(g_cursor_ibeam);
                             hovered_ibeam = true;
                             break;
@@ -10952,10 +11173,10 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &save_btn, p->is_dirty, false);
         draw_text(ren, "Save", win_w - 50, TABBAR_HEIGHT + 13, c_white);
 
-        // 3. Corner Header (+ Track and Master M / S buttons next to + Track, Requirement 13)
+        // 3. Corner Header (+ Track and Master Lock / M / S buttons next to + Track — semi-dark to match TCP)
         int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
         SDL_Rect corner_area = { 0, corner_y, g_daw.tcp_width, RULER_HEIGHT + m_lane_h };
-        SDL_SetRenderDrawColor(ren, 32, 32, 32, 255);
+        SDL_SetRenderDrawColor(ren, 16, 16, 18, 255);
         SDL_RenderFillRect(ren, &corner_area);
         draw_brown_border_rect(ren, &corner_area, false, true);
 
@@ -10977,15 +11198,17 @@ int main(int argc, char *argv[]) {
             if (!p->tracks[t].solo) all_trks_soloed = false;
         }
 
-        // All-Track Lock symbol button right next to '+ Track' (Right-click opens Track Lock Options popup)
+        // Main Lock symbol button right next to '+ Track' (only active when all tracks / Main Lock is active, same like M and S)
+        (void)any_trk_locked;
+        bool main_lock_active = all_trks_locked || g_lock_opt_full[c_tab] || g_lock_opt_prevent_lr[c_tab] || g_lock_opt_prevent_ud[c_tab];
         SDL_Rect btn_master_lock = { 82, corner_y + 2, 26, 24 };
-        SDL_SetRenderDrawColor(ren, all_trks_locked ? 155 : (any_trk_locked ? 76 : 44),
-                                    all_trks_locked ? 86  : (any_trk_locked ? 52 : 44),
+        SDL_SetRenderDrawColor(ren, main_lock_active ? 155 : 44,
+                                    main_lock_active ? 86  : 44,
                                     32, 255);
         SDL_RenderFillRect(ren, &btn_master_lock);
-        draw_brown_border_rect(ren, &btn_master_lock, all_trks_locked || any_trk_locked, false);
-        draw_lock_symbol_icon(ren, 89, corner_y + 7, all_trks_locked || any_trk_locked,
-                              (all_trks_locked || any_trk_locked) ? get_theme_accent_sdl_color() : c_white);
+        draw_brown_border_rect(ren, &btn_master_lock, main_lock_active || g_lock_popup_open, false);
+        draw_lock_symbol_icon(ren, 89, corner_y + 7, main_lock_active,
+                              main_lock_active ? get_theme_accent_sdl_color() : c_white);
 
         SDL_Rect btn_master_m = { 112, corner_y + 2, 26, 24 };
         SDL_SetRenderDrawColor(ren, all_trks_muted ? 185 : 44, all_trks_muted ? 42 : 44, 44, 255);
@@ -11161,6 +11384,8 @@ int main(int argc, char *argv[]) {
         int header_top_y = marker_y + m_lane_h;
         SDL_Rect timeline_clip = { g_daw.tcp_width, header_top_y, view_w, view_h };
         SDL_RenderSetClipRect(ren, &timeline_clip);
+        SDL_SetRenderDrawColor(ren, 31, 31, 33, 255);
+        SDL_RenderFillRect(ren, &timeline_clip);
 
         // Subtle vertical timeline grid lines in faded brown
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -11619,9 +11844,11 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ren, NULL);
 
-        // 6. Track Header (TCP) with Identical Simple Faded Brown Edge & Thicker Selected Brown Edge
+        // 6. Track Header (TCP) — Semi-Dark Background for Clean Visual Separation from Timeline Section
         SDL_Rect tcp_clip = { 0, header_top_y, g_daw.tcp_width, view_h };
         SDL_RenderSetClipRect(ren, &tcp_clip);
+        SDL_SetRenderDrawColor(ren, 12, 12, 14, 255);
+        SDL_RenderFillRect(ren, &tcp_clip);
         for (int i = 0; i < p->num_tracks; i++) {
             if (is_track_hidden(i)) continue;
             int ty = get_track_y_pos(i);
@@ -11631,9 +11858,9 @@ int main(int argc, char *argv[]) {
 
             int trk_col = g_track_color_idx[get_valid_tab_idx()][i] % NUM_STUDIO_COLORS;
             if (trk_col < 0) trk_col = 0;
-            uint8_t tcp_r = (trk_col > 0) ? (g_studio_pal_bg[trk_col][0] + (is_sel ? 16 : 0)) : (is_dragging_this_trk ? 48 : (is_sel ? 38 : 26));
-            uint8_t tcp_g = (trk_col > 0) ? (g_studio_pal_bg[trk_col][1] + (is_sel ? 12 : 0)) : (is_dragging_this_trk ? 36 : (is_sel ? 30 : 26));
-            uint8_t tcp_b = (trk_col > 0) ? (g_studio_pal_bg[trk_col][2] + (is_sel ? 10 : 0)) : (is_dragging_this_trk ? 26 : (is_sel ? 24 : 26));
+            uint8_t tcp_r = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][0] * 70) / 100 + (is_sel ? 14 : 0)) : (is_dragging_this_trk ? 34 : (is_sel ? 25 : 16));
+            uint8_t tcp_g = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][1] * 70) / 100 + (is_sel ? 10 : 0)) : (is_dragging_this_trk ? 26 : (is_sel ? 20 : 16));
+            uint8_t tcp_b = (trk_col > 0) ? ((g_studio_pal_bg[trk_col][2] * 70) / 100 + (is_sel ? 8 : 0))  : (is_dragging_this_trk ? 20 : (is_sel ? 18 : 18));
             SDL_Rect tp = { 1, ty + 1, g_daw.tcp_width - 2, th - 2 };
             SDL_SetRenderDrawColor(ren, tcp_r, tcp_g, tcp_b, 255);
             SDL_RenderFillRect(ren, &tp);
@@ -11653,11 +11880,11 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
             }
 
-            // Top Part: Track Name Box + Track Lock Symbol Button right next to Name Box
-            SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 60, 22 };
+            // Top Part: Track Name Box (expands cleanly without right-side drag symbol)
+            SDL_Rect name_box = { 8, ty + 6, g_daw.tcp_width - 18, 22 };
             bool is_editing = (g_daw.input_focus == INPUT_FOCUS_TRACK_NAME && g_daw.editing_track_name_idx == i);
 
-            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+            SDL_SetRenderDrawColor(ren, 10, 10, 12, 255);
             SDL_RenderFillRect(ren, &name_box);
             draw_brown_border_rect(ren, &name_box, is_editing, false);
 
@@ -11673,60 +11900,47 @@ int main(int argc, char *argv[]) {
                 draw_text_clipped(ren, p->track_names[i], 12, ty + 10, c_white, &name_txt_bounds, &tcp_clip);
             }
 
-            // Per-Track Lock Symbol Button near next to Name Box
-            bool trk_is_locked = g_track_locked[get_valid_tab_idx()][i];
-            int lock_bx = g_daw.tcp_width - 48;
-            SDL_Rect btn_trk_lock = { lock_bx, ty + 6, 20, 22 };
-            SDL_SetRenderDrawColor(ren, trk_is_locked ? 155 : 38, trk_is_locked ? 86 : 36, 32, 255);
-            SDL_RenderFillRect(ren, &btn_trk_lock);
-            draw_brown_border_rect(ren, &btn_trk_lock, trk_is_locked, false);
-            draw_lock_symbol_icon(ren, lock_bx + 4, ty + 10, trk_is_locked,
-                                  trk_is_locked ? get_theme_accent_sdl_color() : c_white);
-
-            // Right-side Up/Down Drag Grip Handle
-            int grip_x = g_daw.tcp_width - 24;
-            SDL_Rect grip_box = { grip_x, ty + 6, 18, 48 };
-            SDL_SetRenderDrawColor(ren, is_dragging_this_trk ? 56 : 36, is_dragging_this_trk ? 42 : 32, is_dragging_this_trk ? 28 : 28, 255);
-            SDL_RenderFillRect(ren, &grip_box);
-            draw_brown_border_rect(ren, &grip_box, is_dragging_this_trk, false);
-            // Draw grip bars (=)
-            SDL_SetRenderDrawColor(ren, 195, 140, 88, 255);
-            for (int gy = ty + 22; gy <= ty + 36; gy += 4) {
-                SDL_RenderDrawLine(ren, grip_x + 4, gy, grip_x + 13, gy);
-            }
-
-            // Bottom Part: Controls
+            // Bottom Part: Controls ([-][dB][+]  [Lock][M][S])
             int bot_y = ty + 34;
 
             // DB Controls
             SDL_Rect btn_minus = { 8, bot_y, 18, 20 };
-            SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
+            SDL_SetRenderDrawColor(ren, 32, 32, 34, 255);
             SDL_RenderFillRect(ren, &btn_minus);
             draw_brown_border_rect(ren, &btn_minus, false, false);
             draw_text(ren, "-", 14, bot_y + 4, c_white);
 
             char db_txt[16];
             snprintf(db_txt, sizeof(db_txt), "%+.1f", p->track_db[i]);
-            draw_text(ren, db_txt, 30, bot_y + 5, c_white);
+            draw_text(ren, db_txt, 29, bot_y + 5, c_white);
 
-            SDL_Rect btn_plus = { 76, bot_y, 18, 20 };
-            SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
+            SDL_Rect btn_plus = { 72, bot_y, 18, 20 };
+            SDL_SetRenderDrawColor(ren, 32, 32, 34, 255);
             SDL_RenderFillRect(ren, &btn_plus);
             draw_brown_border_rect(ren, &btn_plus, false, false);
-            draw_text(ren, "+", 81, bot_y + 4, c_white);
+            draw_text(ren, "+", 77, bot_y + 4, c_white);
+
+            // Individual Track Lock Symbol Button on the LEFT side of 'M'
+            bool trk_is_locked = g_track_locked[get_valid_tab_idx()][i];
+            SDL_Rect btn_trk_lock = { 96, bot_y, 22, 20 };
+            SDL_SetRenderDrawColor(ren, trk_is_locked ? 155 : 32, trk_is_locked ? 86 : 32, 34, 255);
+            SDL_RenderFillRect(ren, &btn_trk_lock);
+            draw_brown_border_rect(ren, &btn_trk_lock, trk_is_locked, false);
+            draw_lock_symbol_icon(ren, 96 + 5, bot_y + 3, trk_is_locked,
+                                  trk_is_locked ? get_theme_accent_sdl_color() : c_white);
 
             // M & S Buttons
-            SDL_Rect m_btn = { 110, bot_y, 22, 20 };
-            SDL_SetRenderDrawColor(ren, p->tracks[i].mute ? 180 : 40, p->tracks[i].mute ? 40 : 40, 40, 255);
+            SDL_Rect m_btn = { 122, bot_y, 22, 20 };
+            SDL_SetRenderDrawColor(ren, p->tracks[i].mute ? 180 : 32, p->tracks[i].mute ? 40 : 32, 34, 255);
             SDL_RenderFillRect(ren, &m_btn);
             draw_brown_border_rect(ren, &m_btn, p->tracks[i].mute, false);
-            draw_text(ren, "M", 117, bot_y + 4, c_white);
+            draw_text(ren, "M", 129, bot_y + 4, c_white);
 
-            SDL_Rect s_btn = { 138, bot_y, 22, 20 };
-            SDL_SetRenderDrawColor(ren, p->tracks[i].solo ? 180 : 40, p->tracks[i].solo ? 140 : 40, 40, 255);
+            SDL_Rect s_btn = { 148, bot_y, 22, 20 };
+            SDL_SetRenderDrawColor(ren, p->tracks[i].solo ? 180 : 32, p->tracks[i].solo ? 140 : 32, 34, 255);
             SDL_RenderFillRect(ren, &s_btn);
             draw_brown_border_rect(ren, &s_btn, p->tracks[i].solo, false);
-            draw_text(ren, "S", 145, bot_y + 4, c_white);
+            draw_text(ren, "S", 155, bot_y + 4, c_white);
         }
         SDL_RenderSetClipRect(ren, NULL);
 
@@ -12410,7 +12624,10 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
                 SDL_RenderFillRect(ren, &box_ac_aac);
                 draw_brown_border_rect(ren, &box_ac_aac, true, false);
-                draw_text(ren, "AAC", ex + 104, r3_y + 7, c_white);
+                const char *ac_lbl = (g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_MP3) ? "MP3 Audio"
+                                   : ((g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_WAV) ? "PCM WAV" : "AAC");
+                draw_text(ren, ac_lbl, ex + 104, r3_y + 7, c_white);
+                draw_text(ren, "v", ex + 250, r3_y + 7, c_muted);
 
                 SDL_Rect box_akbps = { ex + 295, r3_y, 130, 26 };
                 SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
@@ -12799,6 +13016,11 @@ int main(int argc, char *argv[]) {
         // Settings -> Mouse Popup Window (Requirement 9)
         if (g_mouse_settings_open) {
             render_mouse_settings_window(ren);
+        }
+
+        // Main Lock Two-Section Popup Window (All Track | Selected track)
+        if (g_lock_popup_open) {
+            render_track_lock_popup_window(ren);
         }
 
         // Double-Click Time Clock Manual Timings Entry Popup (Requirement 14)
