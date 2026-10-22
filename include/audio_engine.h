@@ -341,7 +341,18 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
 
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    float temp_pcm[4096 * 2];
+    int pcm_cap_frames = 16384;
+    float *temp_pcm = (float *)malloc((size_t)pcm_cap_frames * 2 * sizeof(float));
+    if (!temp_pcm) {
+        fclose(f_raw);
+        if (peak_cache) free(peak_cache);
+        av_frame_free(&frame);
+        av_packet_free(&pkt);
+        swr_free(&swr);
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return -1;
+    }
     float cur_min = 0.0f, cur_max = 0.0f;
     int samples_in_bin = 0;
     int64_t total_written_frames = 0;
@@ -350,9 +361,24 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
         if (pkt->stream_index == a_idx) {
             if (avcodec_send_packet(ctx, pkt) == 0) {
                 while (avcodec_receive_frame(ctx, frame) == 0) {
-                    uint8_t *out_d[2] = { (uint8_t *)temp_pcm, NULL };
-                    int converted = swr_convert(swr, out_d, 4096, (const uint8_t **)frame->extended_data, frame->nb_samples);
-                    if (converted > 0) {
+                    int needed_out = (int)((double)frame->nb_samples * (double)SAMPLE_RATE / (double)(ctx->sample_rate > 0 ? ctx->sample_rate : SAMPLE_RATE)) + 1024;
+                    if (needed_out < frame->nb_samples + 256) needed_out = frame->nb_samples + 256;
+                    if (needed_out > pcm_cap_frames) {
+                        int new_cap = needed_out * 2;
+                        float *grown_pcm = (float *)realloc(temp_pcm, (size_t)new_cap * 2 * sizeof(float));
+                        if (grown_pcm) {
+                            temp_pcm = grown_pcm;
+                            pcm_cap_frames = new_cap;
+                        }
+                    }
+                    const uint8_t **in_data = (const uint8_t **)frame->extended_data;
+                    int in_samples = frame->nb_samples;
+                    for (;;) {
+                        uint8_t *out_d[2] = { (uint8_t *)temp_pcm, NULL };
+                        int converted = swr_convert(swr, out_d, pcm_cap_frames, in_data, in_samples);
+                        in_data = NULL;
+                        in_samples = 0;
+                        if (converted <= 0) break;
                         fwrite(temp_pcm, sizeof(float) * 2, (size_t)converted, f_raw);
                         total_written_frames += converted;
 
@@ -389,6 +415,85 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
         av_packet_unref(pkt);
     }
 
+    // Flush decoder and resampler so 100% of audio frames and final peak bin are written
+    avcodec_send_packet(ctx, NULL);
+    while (avcodec_receive_frame(ctx, frame) == 0) {
+        const uint8_t **in_data = (const uint8_t **)frame->extended_data;
+        int in_samples = frame->nb_samples;
+        for (;;) {
+            uint8_t *out_d[2] = { (uint8_t *)temp_pcm, NULL };
+            int converted = swr_convert(swr, out_d, pcm_cap_frames, in_data, in_samples);
+            in_data = NULL;
+            in_samples = 0;
+            if (converted <= 0) break;
+            fwrite(temp_pcm, sizeof(float) * 2, (size_t)converted, f_raw);
+            total_written_frames += converted;
+            for (int s = 0; s < converted; s++) {
+                float mono = (temp_pcm[s * 2] + temp_pcm[s * 2 + 1]) * 0.5f;
+                if (mono < cur_min) cur_min = mono;
+                if (mono > cur_max) cur_max = mono;
+                samples_in_bin++;
+                if (samples_in_bin >= PEAK_SAMPLES_PER_BIN) {
+                    if (current_bin >= estimated_bins && peak_cache) {
+                        int new_cap = estimated_bins * 2;
+                        PeakBin *grown = (PeakBin *)realloc(peak_cache, (size_t)new_cap * sizeof(PeakBin));
+                        if (grown) {
+                            memset(grown + estimated_bins, 0, (size_t)(new_cap - estimated_bins) * sizeof(PeakBin));
+                            peak_cache = grown;
+                            estimated_bins = new_cap;
+                        }
+                    }
+                    if (peak_cache && current_bin < estimated_bins) {
+                        peak_cache[current_bin].min_val = cur_min;
+                        peak_cache[current_bin].max_val = cur_max;
+                        current_bin++;
+                    }
+                    cur_min = 0.0f;
+                    cur_max = 0.0f;
+                    samples_in_bin = 0;
+                }
+            }
+        }
+    }
+    for (;;) {
+        uint8_t *out_d[2] = { (uint8_t *)temp_pcm, NULL };
+        int converted = swr_convert(swr, out_d, pcm_cap_frames, NULL, 0);
+        if (converted <= 0) break;
+        fwrite(temp_pcm, sizeof(float) * 2, (size_t)converted, f_raw);
+        total_written_frames += converted;
+        for (int s = 0; s < converted; s++) {
+            float mono = (temp_pcm[s * 2] + temp_pcm[s * 2 + 1]) * 0.5f;
+            if (mono < cur_min) cur_min = mono;
+            if (mono > cur_max) cur_max = mono;
+            samples_in_bin++;
+            if (samples_in_bin >= PEAK_SAMPLES_PER_BIN) {
+                if (current_bin >= estimated_bins && peak_cache) {
+                    int new_cap = estimated_bins * 2;
+                    PeakBin *grown = (PeakBin *)realloc(peak_cache, (size_t)new_cap * sizeof(PeakBin));
+                    if (grown) {
+                        memset(grown + estimated_bins, 0, (size_t)(new_cap - estimated_bins) * sizeof(PeakBin));
+                        peak_cache = grown;
+                        estimated_bins = new_cap;
+                    }
+                }
+                if (peak_cache && current_bin < estimated_bins) {
+                    peak_cache[current_bin].min_val = cur_min;
+                    peak_cache[current_bin].max_val = cur_max;
+                    current_bin++;
+                }
+                cur_min = 0.0f;
+                cur_max = 0.0f;
+                samples_in_bin = 0;
+            }
+        }
+    }
+    if (samples_in_bin > 0 && peak_cache && current_bin < estimated_bins) {
+        peak_cache[current_bin].min_val = cur_min;
+        peak_cache[current_bin].max_val = cur_max;
+        current_bin++;
+    }
+
+    free(temp_pcm);
     fclose(f_raw);
     av_frame_free(&frame);
     av_packet_free(&pkt);
