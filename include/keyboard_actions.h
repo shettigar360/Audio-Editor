@@ -968,6 +968,8 @@ typedef enum {
     ACT_NAV_FRAME_LEFT,
     ACT_NAV_5SEC_RIGHT,
     ACT_NAV_5SEC_LEFT,
+    ACT_TRACK_TOGGLE_INFINITY_DB,
+    ACT_SETTINGS_OPEN_AUTOSAVE,
 
     // User-imported custom script action (dynamic)
     ACT_USER_IMPORTED_SCRIPT
@@ -1025,7 +1027,7 @@ static int g_num_actions = 0;
 
 static ActionWindowState g_action_win = {
     false,
-    { 250, 56, 780, 600 },
+    { 250, 44, 780, 646 },
     false, 0, 0,
     "",
     false,
@@ -1059,6 +1061,8 @@ static void open_color_picker_dialog(int target_mode);
 static double get_project_step_fps(ProjectTab *p);
 static void toggle_master_mute_all_tracks(ProjectTab *p);
 static void toggle_master_solo_all_tracks(ProjectTab *p);
+static void toggle_selected_track_infinity_db(ProjectTab *p);
+static bool is_selected_track_infinity_db_on(ProjectTab *p);
 static void toggle_video_global_pin_state(ProjectTab *p, SDL_Window *main_win);
 static void open_time_jump_popup(ProjectTab *p, int win_w, int win_h);
 static void request_open_project_with_save_prompt(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
@@ -1461,7 +1465,9 @@ static void write_shortcuts_json_to_stream(FILE *f) {
     fprintf(f, "    \"export_two_pass\": %s,\n", g_export.two_pass_render ? "true" : "false");
     fprintf(f, "    \"universal_peak_color_idx\": %d,\n", g_universal_peak_color_idx);
     fprintf(f, "    \"mouse_click_empty_moves_playhead\": %s,\n", g_mouse_click_empty_moves_playhead ? "true" : "false");
-    fprintf(f, "    \"mouse_click_universal_moves_playhead\": %s\n", g_mouse_click_universal_moves_playhead ? "true" : "false");
+    fprintf(f, "    \"mouse_click_universal_moves_playhead\": %s,\n", g_mouse_click_universal_moves_playhead ? "true" : "false");
+    fprintf(f, "    \"autosave_enabled\": %s,\n", g_autosave.enabled ? "true" : "false");
+    fprintf(f, "    \"autosave_interval_min\": %d\n", g_autosave.interval_minutes);
     fprintf(f, "  }\n");
     fprintf(f, "}\n");
 }
@@ -1828,16 +1834,10 @@ static bool load_themes_settings_json(void) {
     return true;
 }
 
-// Loads permanent keyboard shortcuts and custom scripts from keyboard_shortcuts.json in the software installed folder.
-// Returns true if an existing JSON file was found and loaded; false if it needs to be created.
-static bool load_keyboard_shortcuts_json(void) {
-    char installed_json[1024];
-    get_installed_file_path(installed_json, sizeof(installed_json), SHORTCUT_JSON_FILENAME);
-
-    FILE *f = fopen(installed_json, "rb");
-    if (!f && strcmp(installed_json, SHORTCUT_JSON_FILENAME) != 0) {
-        f = fopen(SHORTCUT_JSON_FILENAME, "rb");
-    }
+// Loads keyboard shortcuts (and optionally app_settings) from any JSON file path.
+static bool load_keyboard_shortcuts_from_path(const char *filepath, bool load_app_settings) {
+    if (!filepath || !filepath[0]) return false;
+    FILE *f = fopen(filepath, "rb");
     if (!f) return false;
 
     fseek(f, 0, SEEK_END);
@@ -2025,19 +2025,86 @@ static bool load_keyboard_shortcuts_json(void) {
         g_export.two_pass_render = json_extract_bool_field(app_sec, app_end, "export_two_pass", g_export.two_pass_render);
         int app_upk = json_extract_int_field(app_sec, app_end, "universal_peak_color_idx", g_universal_peak_color_idx);
         if (app_upk >= 0 && app_upk < NUM_STUDIO_COLORS) g_universal_peak_color_idx = app_upk;
-        g_mouse_click_empty_moves_playhead = json_extract_bool_field(app_sec, app_end, "mouse_click_empty_moves_playhead", g_mouse_click_empty_moves_playhead);
-        g_mouse_click_universal_moves_playhead = json_extract_bool_field(app_sec, app_end, "mouse_click_universal_moves_playhead", g_mouse_click_universal_moves_playhead);
-        char exp_dir[512] = {0}, exp_fn[128] = {0};
-        if (json_extract_string_field(app_sec, app_end, "export_directory", exp_dir, sizeof(exp_dir)) && exp_dir[0]) {
-            strncpy(g_export.directory, exp_dir, sizeof(g_export.directory) - 1);
-        }
-        if (json_extract_string_field(app_sec, app_end, "export_filename", exp_fn, sizeof(exp_fn)) && exp_fn[0]) {
-            strncpy(g_export.filename, exp_fn, sizeof(g_export.filename) - 1);
+        if (load_app_settings) {
+            g_mouse_click_empty_moves_playhead = json_extract_bool_field(app_sec, app_end, "mouse_click_empty_moves_playhead", g_mouse_click_empty_moves_playhead);
+            g_mouse_click_universal_moves_playhead = json_extract_bool_field(app_sec, app_end, "mouse_click_universal_moves_playhead", g_mouse_click_universal_moves_playhead);
+            g_autosave.enabled = json_extract_bool_field(app_sec, app_end, "autosave_enabled", g_autosave.enabled);
+            int as_min = json_extract_int_field(app_sec, app_end, "autosave_interval_min", g_autosave.interval_minutes);
+            if (as_min >= 1 && as_min <= 1440) {
+                g_autosave.interval_minutes = as_min;
+                snprintf(g_autosave.interval_buf, sizeof(g_autosave.interval_buf), "%d", as_min);
+            }
+            char exp_dir[512] = {0}, exp_fn[128] = {0};
+            if (json_extract_string_field(app_sec, app_end, "export_directory", exp_dir, sizeof(exp_dir)) && exp_dir[0]) {
+                strncpy(g_export.directory, exp_dir, sizeof(g_export.directory) - 1);
+            }
+            if (json_extract_string_field(app_sec, app_end, "export_filename", exp_fn, sizeof(exp_fn)) && exp_fn[0]) {
+                strncpy(g_export.filename, exp_fn, sizeof(g_export.filename) - 1);
+            }
         }
     }
 
     free(json_buf);
     return true;
+}
+
+// Loads permanent keyboard shortcuts and custom scripts from keyboard_shortcuts.json in the software installed folder.
+static bool load_keyboard_shortcuts_json(void) {
+    char installed_json[1024];
+    get_installed_file_path(installed_json, sizeof(installed_json), SHORTCUT_JSON_FILENAME);
+    if (load_keyboard_shortcuts_from_path(installed_json, true)) {
+        return true;
+    }
+    if (strcmp(installed_json, SHORTCUT_JSON_FILENAME) != 0) {
+        return load_keyboard_shortcuts_from_path(SHORTCUT_JSON_FILENAME, true);
+    }
+    return false;
+}
+
+// Requirement 1: Export or Import ALL Keyboard Shortcuts via file dialog from the Actions window bottom row
+static void export_or_import_all_shortcuts_dialog(bool is_export) {
+    char path[MAX_PATH] = {0};
+    if (is_export) {
+        strcpy(path, "keyboard_shortcuts_export.json");
+    }
+    const char *flt = "Keyboard Shortcuts JSON (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+    if (!open_generic_dialog(path, sizeof(path), flt, is_export) || !path[0]) {
+        return;
+    }
+    if (is_export) {
+        const char *ext = strrchr(path, '.');
+        if (!ext || (!str_equals_nocase(ext, ".json"))) {
+            strncat(path, ".json", sizeof(path) - strlen(path) - 1);
+        }
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            write_shortcuts_json_to_stream(f);
+            fclose(f);
+            const char *bn = strrchr(path, '\\');
+            if (!bn) bn = strrchr(path, '/');
+            bn = bn ? (bn + 1) : path;
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Exported all keyboard shortcuts to %s", bn);
+            record_project_change("Exported All Keyboard Shortcuts", false);
+        } else {
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Failed to export shortcuts to file.");
+        }
+    } else {
+        if (load_keyboard_shortcuts_from_path(path, false)) {
+            save_keyboard_shortcuts_json();
+            refresh_filtered_actions();
+            const char *bn = strrchr(path, '\\');
+            if (!bn) bn = strrchr(path, '/');
+            bn = bn ? (bn + 1) : path;
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Imported all keyboard shortcuts from %s", bn);
+            record_project_change("Imported All Keyboard Shortcuts", false);
+        } else {
+            snprintf(g_action_win.status_banner, sizeof(g_action_win.status_banner),
+                     "Invalid or unreadable keyboard shortcuts JSON file.");
+        }
+    }
 }
 
 // Formats an SDL_Keycode + SDL_Keymod into canonical REAPER shortcut notation
@@ -2771,6 +2838,12 @@ static void init_keyboard_actions_system(void) {
         NULL, NULL, NULL, NULL, false, false);
     register_builtin_action(ACT_TAB_CLOSE_CURRENT_TAB,
         "Project tabs: Close Current Tab",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_TRACK_TOGGLE_INFINITY_DB,
+        "Track: Toggle Infinity -dB (ON/OFF) for selected track",
+        NULL, NULL, NULL, NULL, false, false);
+    register_builtin_action(ACT_SETTINGS_OPEN_AUTOSAVE,
+        "Settings: Open Auto Save settings window",
         NULL, NULL, NULL, NULL, false, false);
 
     if (zv_out_idx >= 0) {
@@ -5768,8 +5841,21 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             g_export.est_remaining_sec = 0.0;
             g_export.mp4_aac_dropdown_open = false;
             g_export.mp4_size_dropdown_open = false;
+            g_export.mp4_v_kbps_dropdown_open = false;
             g_export.overwrite_prompt_open = false;
             g_export.status_msg[0] = '\0';
+            break;
+        }
+        case ACT_TRACK_TOGGLE_INFINITY_DB: {
+            toggle_selected_track_infinity_db(p);
+            break;
+        }
+        case ACT_SETTINGS_OPEN_AUTOSAVE: {
+            g_autosave.is_open = true;
+            g_autosave.win_rect.x = (win_w - g_autosave.win_rect.w) / 2;
+            g_autosave.win_rect.y = (win_h - g_autosave.win_rect.h) / 2;
+            snprintf(g_autosave.interval_buf, sizeof(g_autosave.interval_buf), "%d", g_autosave.interval_minutes);
+            g_autosave.interval_focused = false;
             break;
         }
         default: {
@@ -5896,7 +5982,7 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
     int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
 
     if (g_action_win.capturing_add_shortcut || g_action_win.capturing_find_shortcut) {
-        int mw = 430, mh = 134;
+        int mw = 460, mh = 134;
         int mx_box = wx + (ww - mw) / 2;
         int my_box = wy + (wh - mh) / 2;
         SDL_Rect cancel_btn = { mx_box + mw - 106, my_box + mh - 40, 90, 28 };
@@ -5957,11 +6043,11 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
         return true;
     }
 
-    // 3. Main Table (Shortcut | Description) at { wx + 14, wy + 72, ww - 28, wh - 220 }
+    // 3. Main Table (Shortcut | Description) at { wx + 14, wy + 72, ww - 28, wh - 266 }
     int tbl_x = wx + 14;
     int tbl_y = wy + 72;
     int tbl_w = ww - 28;
-    int tbl_h = wh - 220;
+    int tbl_h = wh - 266;
     int rows_y = tbl_y + 24;
     int rows_h = tbl_h - 24;
     int sb_x = tbl_x + tbl_w - 16;
@@ -5986,9 +6072,9 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
         return true;
     }
 
-    // 4. Bottom-Left Group Box: "Shortcuts for selected action" { wx + 14, wy + wh - 140, 560, 126 }
+    // 4. Bottom-Left Group Box: "Shortcuts for selected action" { wx + 14, wy + wh - 186, 560, 126 }
     int sub_box_x = wx + 26;
-    int sub_box_y = wy + wh - 116;
+    int sub_box_y = wy + wh - 162;
     int sub_box_w = 424;
     int sub_box_h = 92;
 
@@ -6004,16 +6090,16 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
         return true;
     }
 
-    // [Add...] button inside "Shortcuts for selected action" { wx + 462, wy + wh - 116, 86, 32 }
-    if (mx >= wx + 462 && mx <= wx + 548 && my >= wy + wh - 116 && my <= wy + wh - 84) {
+    // [Add...] button inside "Shortcuts for selected action" { wx + 462, wy + wh - 162, 86, 32 }
+    if (mx >= wx + 462 && mx <= wx + 548 && my >= wy + wh - 162 && my <= wy + wh - 130) {
         if (g_action_win.selected_action_idx >= 0 && g_action_win.selected_action_idx < g_num_actions) {
             g_action_win.capturing_add_shortcut = true;
         }
         return true;
     }
 
-    // [Delete] button inside "Shortcuts for selected action" { wx + 462, wy + wh - 76, 86, 32 }
-    if (mx >= wx + 462 && mx <= wx + 548 && my >= wy + wh - 76 && my <= wy + wh - 44) {
+    // [Delete] button inside "Shortcuts for selected action" { wx + 462, wy + wh - 122, 86, 32 }
+    if (mx >= wx + 462 && mx <= wx + 548 && my >= wy + wh - 122 && my <= wy + wh - 90) {
         int sel = g_action_win.selected_action_idx;
         if (sel >= 0 && sel < g_num_actions) {
             DawActionEntry *act = &g_actions[sel];
@@ -6045,18 +6131,33 @@ static bool handle_action_window_mouse_down(ProjectTab *p, SDL_Renderer *ren, SD
     }
 
     // 5. Bottom-Right Buttons: [New action...] and [Run]
-    // [New action...] { wx + 590, wy + wh - 104, 176, 34 }
-    if (mx >= wx + 590 && mx <= wx + 766 && my >= wy + wh - 104 && my <= wy + wh - 70) {
+    // [New action...] { wx + 590, wy + wh - 150, 176, 34 }
+    if (mx >= wx + 590 && mx <= wx + 766 && my >= wy + wh - 150 && my <= wy + wh - 116) {
         import_script_into_action_system(false);
         return true;
     }
 
-    // [Run] { wx + 590, wy + wh - 62, 176, 34 }
-    if (mx >= wx + 590 && mx <= wx + 766 && my >= wy + wh - 62 && my <= wy + wh - 28) {
+    // [Run] { wx + 590, wy + wh - 108, 176, 34 }
+    if (mx >= wx + 590 && mx <= wx + 766 && my >= wy + wh - 108 && my <= wy + wh - 74) {
         if (g_action_win.selected_action_idx >= 0 && g_action_win.selected_action_idx < g_num_actions) {
             execute_daw_action_by_index(p, ren, win, g_action_win.selected_action_idx);
         }
         return true;
+    }
+
+    // 6. Bottom Row Section (Requirement 1): "Keyboard shortcut: [ Import ] [ Export ]"
+    int exp_row_y = wy + wh - 50;
+    if (my >= exp_row_y && my <= exp_row_y + 38) {
+        if (mx >= wx + 188 && mx <= wx + 312 && my >= exp_row_y + 5 && my <= exp_row_y + 33) {
+            // [ Import ] all keyboard shortcuts
+            export_or_import_all_shortcuts_dialog(false);
+            return true;
+        }
+        if (mx >= wx + 324 && mx <= wx + 448 && my >= exp_row_y + 5 && my <= exp_row_y + 33) {
+            // [ Export ] all keyboard shortcuts
+            export_or_import_all_shortcuts_dialog(true);
+            return true;
+        }
     }
 
     return true;
@@ -6138,10 +6239,12 @@ static void render_action_window(SDL_Renderer *ren) {
     draw_text(ren, "Find shortcut...", wx + 618, wy + 45, c_white);
 
     // ---- Main Table: Shortcut | Description ----
+    if (wr->w < 780) { wr->w = 780; ww = 780; }
+    if (wr->h < 646) { wr->h = 646; wh = 646; }
     int tbl_x = wx + 14;
     int tbl_y = wy + 72;
     int tbl_w = ww - 28;
-    int tbl_h = wh - 220;
+    int tbl_h = wh - 266;
     int col1_w = 190;
 
     SDL_Rect tbl_rect = { tbl_x, tbl_y, tbl_w, tbl_h };
@@ -6225,13 +6328,13 @@ static void render_action_window(SDL_Renderer *ren) {
     draw_brown_border_rect(ren, &sb_thumb, false, false);
 
     // ---- Bottom-Left Group Box: "Shortcuts for selected action" ----
-    SDL_Rect grp_box = { wx + 14, wy + wh - 140, 560, 126 };
+    SDL_Rect grp_box = { wx + 14, wy + wh - 186, 560, 126 };
     SDL_SetRenderDrawColor(ren, 22, 20, 19, 255);
     SDL_RenderFillRect(ren, &grp_box);
     draw_brown_border_rect(ren, &grp_box, false, false);
-    draw_text(ren, "Shortcuts for selected action", wx + 24, wy + wh - 134, c_white);
+    draw_text(ren, "Shortcuts for selected action", wx + 24, wy + wh - 180, c_white);
 
-    SDL_Rect sub_list = { wx + 26, wy + wh - 116, 424, 92 };
+    SDL_Rect sub_list = { wx + 26, wy + wh - 162, 424, 92 };
     SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
     SDL_RenderFillRect(ren, &sub_list);
     draw_brown_border_rect(ren, &sub_list, false, true);
@@ -6264,35 +6367,56 @@ static void render_action_window(SDL_Renderer *ren) {
     }
 
     // [Add...] Button
-    SDL_Rect btn_add = { wx + 462, wy + wh - 116, 86, 32 };
+    SDL_Rect btn_add = { wx + 462, wy + wh - 162, 86, 32 };
     SDL_SetRenderDrawColor(ren, 54, 42, 32, 255);
     SDL_RenderFillRect(ren, &btn_add);
     draw_brown_border_rect(ren, &btn_add, true, false);
-    draw_text(ren, "Add...", wx + 484, wy + wh - 106, c_white);
+    draw_text(ren, "Add...", wx + 484, wy + wh - 152, c_white);
 
     // [Delete] Button
-    SDL_Rect btn_del = { wx + 462, wy + wh - 76, 86, 32 };
+    SDL_Rect btn_del = { wx + 462, wy + wh - 122, 86, 32 };
     SDL_SetRenderDrawColor(ren, has_sel_shortcut ? 48 : 30, has_sel_shortcut ? 36 : 28, has_sel_shortcut ? 28 : 26, 255);
     SDL_RenderFillRect(ren, &btn_del);
     draw_brown_border_rect(ren, &btn_del, false, !has_sel_shortcut);
-    draw_text(ren, "Delete", wx + 481, wy + wh - 66, has_sel_shortcut ? c_white : c_muted);
+    draw_text(ren, "Delete", wx + 481, wy + wh - 112, has_sel_shortcut ? c_white : c_muted);
 
     // ---- Bottom-Right Buttons: [New action...] and [Run] ----
-    SDL_Rect btn_new_act = { wx + 590, wy + wh - 104, 176, 34 };
+    SDL_Rect btn_new_act = { wx + 590, wy + wh - 150, 176, 34 };
     SDL_SetRenderDrawColor(ren, 52, 40, 32, 255);
     SDL_RenderFillRect(ren, &btn_new_act);
     draw_brown_border_rect(ren, &btn_new_act, false, false);
-    draw_text(ren, "New action...", wx + 626, wy + wh - 93, c_white);
+    draw_text(ren, "New action...", wx + 626, wy + wh - 139, c_white);
 
-    SDL_Rect btn_run = { wx + 590, wy + wh - 62, 176, 34 };
+    SDL_Rect btn_run = { wx + 590, wy + wh - 108, 176, 34 };
     SDL_SetRenderDrawColor(ren, 76, 52, 32, 255);
     SDL_RenderFillRect(ren, &btn_run);
     draw_brown_border_rect(ren, &btn_run, true, false);
-    draw_text(ren, "Run", wx + 664, wy + wh - 51, c_white);
+    draw_text(ren, "Run", wx + 664, wy + wh - 97, c_white);
+
+    // ---- Bottom Row Section (Requirement 1): "Keyboard shortcut: [ Import ] [ Export ]" ----
+    int exp_row_y = wy + wh - 50;
+    SDL_Rect bot_row_sec = { wx + 14, exp_row_y, ww - 28, 38 };
+    SDL_SetRenderDrawColor(ren, 22, 20, 19, 255);
+    SDL_RenderFillRect(ren, &bot_row_sec);
+    draw_brown_border_rect(ren, &bot_row_sec, false, false);
+
+    draw_text(ren, "Keyboard shortcut:", wx + 26, exp_row_y + 13, c_white);
+
+    SDL_Rect btn_sc_imp = { wx + 188, exp_row_y + 5, 124, 28 };
+    SDL_SetRenderDrawColor(ren, 48, 40, 34, 255);
+    SDL_RenderFillRect(ren, &btn_sc_imp);
+    draw_brown_border_rect(ren, &btn_sc_imp, true, false);
+    draw_text(ren, "Import", btn_sc_imp.x + 38, btn_sc_imp.y + 8, c_white);
+
+    SDL_Rect btn_sc_exp = { wx + 324, exp_row_y + 5, 124, 28 };
+    SDL_SetRenderDrawColor(ren, 62, 46, 34, 255);
+    SDL_RenderFillRect(ren, &btn_sc_exp);
+    draw_brown_border_rect(ren, &btn_sc_exp, true, false);
+    draw_text(ren, "Export", btn_sc_exp.x + 38, btn_sc_exp.y + 8, c_white);
 
     // ---- Key Capture Modal Overlay (for [Add...] or [Find shortcut...]) ----
     if (g_action_win.capturing_add_shortcut || g_action_win.capturing_find_shortcut) {
-        int mw = 430, mh = 134;
+        int mw = 460, mh = 134;
         int mx_box = wx + (ww - mw) / 2;
         int my_box = wy + (wh - mh) / 2;
 
