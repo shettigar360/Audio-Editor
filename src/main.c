@@ -784,10 +784,24 @@ typedef enum {
 } ExportFormatType;
 
 typedef enum {
-    EXPORT_MP4_AUDIO_AAC = 0,
-    EXPORT_MP4_AUDIO_WAV = 1,
-    EXPORT_MP4_AUDIO_MP3 = 2
+    EXPORT_MP4_AUDIO_AAC = 0
 } ExportMp4AudioCodec;
+
+#define NUM_MP4_RES_PRESETS 6
+typedef struct {
+    const char *label;
+    int width;
+    int height;
+} Mp4ResolutionPreset;
+
+static const Mp4ResolutionPreset g_mp4_res_presets[NUM_MP4_RES_PRESETS] = {
+    { "640 x 360",              640,  360 },
+    { "854 x 480",              854,  480 },
+    { "1280 x 720",            1280,  720 },
+    { "1920 x 1080 (Full HD)", 1920, 1080 },
+    { "2560 x 1440 (2K)",      2560, 1440 },
+    { "3840 x 2160 (4K)",      3840, 2160 }
+};
 
 typedef enum {
     EXP_FIELD_NONE = 0,
@@ -818,14 +832,16 @@ typedef struct {
     int wav_bit_depth;              // 16, 24, or 32
     int mp3_bitrate;                // 128, 192, or 320
 
-    // MP4 specific settings (matching REAPER/studio layout)
-    char mp4_width_str[16];         // e.g. "1920"
-    char mp4_height_str[16];        // e.g. "1080"
-    char mp4_fps_str[16];           // e.g. "25.00"
-    char mp4_video_kbps_str[16];    // e.g. "2048"
-    ExportMp4AudioCodec mp4_audio_codec; // AAC
+    // MP4 specific settings (matching studio layout)
+    char mp4_width_str[16];         // Default "1920"
+    char mp4_height_str[16];        // Default "1080"
+    char mp4_fps_str[16];           // Default "25.00"
+    char mp4_video_kbps_str[16];    // Default "2048"
+    ExportMp4AudioCodec mp4_audio_codec; // AAC only
     char mp4_audio_kbps_str[16];    // "120", "192", or "320"
     bool mp4_aac_dropdown_open;     // Dropdown for 120 / 192 / 320 kbps
+    int  mp4_res_preset_idx;        // Default 3 -> 1920 x 1080 (Full HD)
+    bool mp4_size_dropdown_open;    // Resolution Size dropdown menu open
 
     bool two_pass_render;           // Option: two pass render
 
@@ -839,6 +855,10 @@ typedef struct {
 
     ExportInputField active_field;  // Active text input field inside Export Popup
     char status_msg[256];           // Render status message
+
+    // "File Already Exists" modal prompt inside Export Media workflow
+    bool overwrite_prompt_open;
+    char pending_conflict_path[1024];
 } ExportDialogState;
 
 static ExportDialogState g_export = {
@@ -860,6 +880,8 @@ static ExportDialogState g_export = {
     EXPORT_MP4_AUDIO_AAC,
     "192",
     false,
+    3,
+    false,
     false,
     false,
     0,
@@ -868,8 +890,34 @@ static ExportDialogState g_export = {
     0,
     0,
     EXP_FIELD_NONE,
+    "",
+    false,
     ""
 };
+
+static SDL_Texture *g_active_tl_cache_tex = NULL;
+
+static void apply_mp4_res_preset(int idx) {
+    if (idx < 0 || idx >= NUM_MP4_RES_PRESETS) idx = 3;
+    g_export.mp4_res_preset_idx = idx;
+    snprintf(g_export.mp4_width_str, sizeof(g_export.mp4_width_str), "%d", g_mp4_res_presets[idx].width);
+    snprintf(g_export.mp4_height_str, sizeof(g_export.mp4_height_str), "%d", g_mp4_res_presets[idx].height);
+}
+
+static int get_current_mp4_res_preset_idx(void) {
+    int w = atoi(g_export.mp4_width_str);
+    int h = atoi(g_export.mp4_height_str);
+    for (int i = 0; i < NUM_MP4_RES_PRESETS; i++) {
+        if (g_mp4_res_presets[i].width == w && g_mp4_res_presets[i].height == h) {
+            g_export.mp4_res_preset_idx = i;
+            return i;
+        }
+    }
+    if (g_export.mp4_res_preset_idx < 0 || g_export.mp4_res_preset_idx >= NUM_MP4_RES_PRESETS) {
+        g_export.mp4_res_preset_idx = 3;
+    }
+    return g_export.mp4_res_preset_idx;
+}
 
 static char* get_active_export_field_buf(size_t *out_max_len) {
     switch (g_export.active_field) {
@@ -4663,7 +4711,35 @@ static void write_pcm_frame_samples(FILE *f, float l, float r, int channels, int
     }
 }
 
-// Updates export processing percentage & elapsed/remaining time and refreshes the popup progress bar live
+#include <errno.h>
+#ifndef AVERROR
+#define AVERROR(e) (-(e))
+#endif
+#ifndef AVERROR_EOF
+#define AVERROR_EOF (-541478725)
+#endif
+static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p);
+static void ensure_recording_directory_exists(const char *dir_path);
+static int daw_strcasecmp_custom(const char *a, const char *b);
+
+// Draws a crisp Green Right Mark (checkmark ✓) inside a checkbox rectangle
+static inline void draw_green_checkmark_icon(SDL_Renderer *ren, int box_x, int box_y, int box_w, int box_h) {
+    int x1 = box_x + 4;
+    int y1 = box_y + box_h / 2 + 1;
+    int x2 = box_x + box_w / 2 - 1;
+    int y2 = box_y + box_h - 5;
+    int x3 = box_x + box_w - 4;
+    int y3 = box_y + 4;
+    SDL_SetRenderDrawColor(ren, 46, 224, 88, 255);
+    SDL_RenderDrawLine(ren, x1, y1, x2, y2);
+    SDL_RenderDrawLine(ren, x2, y2, x3, y3);
+    SDL_RenderDrawLine(ren, x1, y1 - 1, x2, y2 - 1);
+    SDL_RenderDrawLine(ren, x2, y2 - 1, x3, y3 - 1);
+    SDL_RenderDrawLine(ren, x1 + 1, y1, x2 + 1, y2);
+    SDL_RenderDrawLine(ren, x2 + 1, y2, x3 + 1, y3);
+}
+
+// Updates export processing percentage & elapsed/remaining time and refreshes the full Export Media window flicker-free
 static void update_export_progress_ui(SDL_Renderer *ren, int pct, const char *stage_msg, bool force_present) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
@@ -4681,63 +4757,133 @@ static void update_export_progress_ui(SDL_Renderer *ren, int pct, const char *st
         g_export.status_msg[sizeof(g_export.status_msg) - 1] = '\0';
     }
 
-    if (ren && g_export.is_open && (force_present || (now - g_export.last_ui_present_ticks >= 30))) {
+    if (ren && g_export.is_open && (force_present || (now - g_export.last_ui_present_ticks >= 35))) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_DROPFILE && ev.drop.file) SDL_free(ev.drop.file);
         }
         g_export.last_ui_present_ticks = now;
-        SDL_Rect *er = &g_export.win_rect;
-        int ex = er->x, ey = er->y, ew = er->w;
-        SDL_Color c_white = { 224, 224, 224, 255 };
-        SDL_Color c_muted = { 150, 145, 140, 255 };
 
-        // Clear progress region inside Export Media popup
-        SDL_Rect prog_area = { ex + 16, ey + 464, ew - 32, 64 };
-        SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
-        SDL_RenderFillRect(ren, &prog_area);
-
-        // Progress Bar Frame
-        SDL_Rect bar_bg = { ex + 22, ey + 468, ew - 44, 24 };
-        SDL_SetRenderDrawColor(ren, 16, 15, 14, 255);
-        SDL_RenderFillRect(ren, &bar_bg);
-
-        int fill_w = ((bar_bg.w - 4) * g_export.progress_pct) / 100;
-        if (fill_w > 0) {
-            SDL_Rect bar_fill = { bar_bg.x + 2, bar_bg.y + 2, fill_w, bar_bg.h - 4 };
-            SDL_SetRenderDrawColor(ren, 195, 128, 54, 255);
-            SDL_RenderFillRect(ren, &bar_fill);
+        // Redraw cached background & complete Export Media popup so SDL_RenderPresent never flickers on double-buffered GPUs
+        SDL_SetRenderTarget(ren, NULL);
+        SDL_RenderSetClipRect(ren, NULL);
+        SDL_SetRenderDrawColor(ren, 26, 26, 26, 255);
+        SDL_RenderClear(ren);
+        if (g_active_tl_cache_tex) {
+            SDL_RenderCopy(ren, g_active_tl_cache_tex, NULL, NULL);
         }
-        draw_brown_border_rect(ren, &bar_bg, g_export.is_rendering, false);
-
-        char pct_time_buf[160];
-        if (g_export.is_rendering) {
-            snprintf(pct_time_buf, sizeof(pct_time_buf),
-                     "Processing: %d%%   |   Elapsed: %.2fs   |   Remaining: ~%.2fs",
-                     g_export.progress_pct, g_export.elapsed_sec, g_export.est_remaining_sec);
-        } else {
-            snprintf(pct_time_buf, sizeof(pct_time_buf),
-                     "Completed: %d%%   |   Total Processing Time: %.2fs",
-                     g_export.progress_pct, g_export.elapsed_sec);
-        }
-        draw_text(ren, pct_time_buf, bar_bg.x + 12, bar_bg.y + 6, c_white);
-
-        if (g_export.status_msg[0] != '\0') {
-            SDL_Rect st_clip = { ex + 22, ey + 496, ew - 44, 24 };
-            draw_text_clipped(ren, g_export.status_msg, ex + 22, ey + 500, c_muted, &st_clip, NULL);
-        }
-
+        render_export_popup_window(ren, get_cur_tab());
         SDL_RenderPresent(ren);
     }
 }
 
+// Probes a media file on disk via FFmpeg C API to verify if it contains a real video stream
+static bool probe_file_has_video_stream(const char *filepath) {
+    if (!filepath || !filepath[0]) return false;
+    AVFormatContext *fmt = NULL;
+    if (avformat_open_input(&fmt, filepath, NULL, NULL) < 0) return false;
+    bool found_video = false;
+    if (avformat_find_stream_info(fmt, NULL) >= 0) {
+        for (unsigned int i = 0; i < fmt->nb_streams; i++) {
+            AVStream *st = fmt->streams[i];
+            if (st && st->codecpar && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                !(st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+                found_video = true;
+                break;
+            }
+        }
+        if (!found_video) {
+            for (unsigned int i = 0; i < fmt->nb_streams; i++) {
+                if (fmt->streams[i] && fmt->streams[i]->codecpar &&
+                    fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    found_video = true;
+                    break;
+                }
+            }
+        }
+    }
+    avformat_close_input(&fmt);
+    return found_video;
+}
+
+// Ensures every clip on the timeline has an accurate has_video flag before export begins
+static void ensure_all_timeline_video_flags_probed(ProjectTab *p) {
+    if (!p) return;
+    for (int i = 0; i < p->num_items; i++) {
+        AudioItem *it = &p->items[i];
+        if (!it->has_video && it->file_path[0] != '\0') {
+            const char *ext = strrchr(it->file_path, '.');
+            if (ext && strstr(".mp4.MP4.mov.MOV.mkv.MKV.avi.AVI.webm.WEBM.m4v.M4V.flv.FLV.wmv.WMV", ext) != NULL) {
+                it->has_video = probe_file_has_video_stream(it->file_path);
+            }
+        }
+    }
+}
+
+// Helper to determine whether clip `i` is included in the current Export Source selection for Audio
+static bool is_item_included_in_audio_export(ProjectTab *p, int i, bool any_solo, bool any_trk_sel, bool any_item_sel) {
+    if (!p || i < 0 || i >= p->num_items) return false;
+    int tab = get_valid_tab_idx();
+    AudioItem *it = &p->items[i];
+    if (!it->raw_file_handle || g_item_muted[tab][i]) return false;
+    if (it->track_idx < 0 || it->track_idx >= p->num_tracks) return false;
+    if (is_track_hidden(it->track_idx) || p->tracks[it->track_idx].mute) return false;
+
+    if (g_export.source == EXPORT_SRC_MASTER) {
+        if (any_solo && !p->tracks[it->track_idx].solo) return false;
+        return true;
+    } else if (g_export.source == EXPORT_SRC_STEMS) {
+        if (any_trk_sel) return p->track_selected[it->track_idx];
+        if (any_solo && !p->tracks[it->track_idx].solo) return false;
+        return true;
+    } else if (g_export.source == EXPORT_SRC_ITEMS) {
+        if (any_item_sel) return it->is_selected;
+        if (any_solo && !p->tracks[it->track_idx].solo) return false;
+        return true;
+    }
+    return true;
+}
+
+// Helper to determine whether video clip `i` is included in the current Export Source selection for Video
+// Note: If the user selected only audio tracks/items while exporting MP4, we automatically fall back to visible video tracks
+// so MP4 video export is NEVER accidentally blank!
+static bool is_item_included_in_video_export(ProjectTab *p, int i, bool any_solo, bool any_video_trk_sel, bool any_video_item_sel) {
+    if (!p || i < 0 || i >= p->num_items) return false;
+    int tab = get_valid_tab_idx();
+    AudioItem *it = &p->items[i];
+    if (!it->has_video || !it->file_path[0] || g_item_muted[tab][i]) return false;
+    if (it->track_idx < 0 || it->track_idx >= p->num_tracks) return false;
+    if (is_track_hidden(it->track_idx) || p->tracks[it->track_idx].mute) return false;
+
+    if (g_export.source == EXPORT_SRC_STEMS && any_video_trk_sel) {
+        return p->track_selected[it->track_idx];
+    }
+    if (g_export.source == EXPORT_SRC_ITEMS && any_video_item_sel) {
+        return it->is_selected;
+    }
+    if (any_solo && !p->tracks[it->track_idx].solo) {
+        bool solo_has_video = false;
+        for (int k = 0; k < p->num_items; k++) {
+            if (p->items[k].has_video && p->items[k].track_idx >= 0 &&
+                p->items[k].track_idx < p->num_tracks && p->tracks[p->items[k].track_idx].solo) {
+                solo_has_video = true;
+                break;
+            }
+        }
+        if (solo_has_video) return false;
+    }
+    return true;
+}
+
 // Renders a specific time range [exp_start, exp_end] into a WAV file at out_wav_path
-// Uses contiguous block reads per clip so WAV export is 50x faster and exports 100% of audio without truncation.
+// Uses contiguous block reads per clip, cubic/linear sub-sample interpolation, and 2-pass peak/RMS loudness normalization.
 static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const char *out_wav_path,
                                      double exp_start, double exp_end,
                                      int only_track_idx, int only_item_idx,
                                      int target_sr, int channels, int bit_depth,
                                      bool two_pass, int pct_start, int pct_end) {
+    (void)only_track_idx;
+    (void)only_item_idx;
     if (!p || !out_wav_path || exp_end <= exp_start + 0.001) return false;
     if (target_sr != 44100 && target_sr != 48000) target_sr = 48000;
     if (channels != 1 && channels != 2) channels = 2;
@@ -4757,6 +4903,7 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
             double sv_dur = it->duration;
             int    sv_trk = it->track_idx;
             bool   sv_sel = it->is_selected;
+            bool   sv_vid = it->has_video;
             char   sv_lbl[128];
             strncpy(sv_lbl, it->label, sizeof(sv_lbl) - 1);
             sv_lbl[sizeof(sv_lbl) - 1] = '\0';
@@ -4766,6 +4913,7 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
             it->duration       = sv_dur;
             it->track_idx      = sv_trk;
             it->is_selected    = sv_sel;
+            if (sv_vid) it->has_video = true;
             if (sv_lbl[0]) strncpy(it->label, sv_lbl, sizeof(it->label) - 1);
         }
     }
@@ -4774,21 +4922,31 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
     if (total_out_frames == 0) total_out_frames = 1;
 
     bool any_solo = false;
+    bool any_trk_sel = false;
+    bool any_item_sel = false;
     for (int t = 0; t < p->num_tracks; t++) {
-        if (p->tracks[t].solo && !is_track_hidden(t)) { any_solo = true; break; }
+        if (p->tracks[t].solo && !is_track_hidden(t)) any_solo = true;
+        if (p->track_selected[t] && !is_track_hidden(t)) any_trk_sel = true;
+    }
+    for (int i = 0; i < p->num_items; i++) {
+        if (p->items[i].is_selected) { any_item_sel = true; break; }
     }
 
     float norm_gain = 1.0f;
     int render_pct_s = pct_start;
     static float src_blk[4096 * 2];
 
-    // Pass 1 (if Two-Pass Render is checked): fast contiguous block scan for peak amplitude
+    // Pass 1 (if Two-Pass Render is checked): full-timeline peak & RMS loudness analysis pass
     if (two_pass) {
-        int pass1_end = pct_start + (pct_end - pct_start) * 30 / 100;
+        int pass1_end = pct_start + (pct_end - pct_start) * 35 / 100;
         render_pct_s = pass1_end;
         float max_peak = 0.0f;
+        double sum_sq = 0.0;
+        uint64_t active_samples = 0;
         const int chunk_size = 2048;
         float scan_l[2048], scan_r[2048];
+
+        update_export_progress_ui(ren, pct_start, "Pass 1/2: Analyzing peak & RMS loudness across timeline...", true);
 
         for (uint32_t f_idx = 0; f_idx < total_out_frames; f_idx += (uint32_t)chunk_size) {
             int cur_n = (int)(total_out_frames - f_idx);
@@ -4800,14 +4958,8 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
             double et = exp_start + ((double)(f_idx + (uint32_t)cur_n) / (double)target_sr);
 
             for (int i = 0; i < p->num_items; i++) {
-                if (only_item_idx >= 0 && i != only_item_idx) continue;
+                if (!is_item_included_in_audio_export(p, i, any_solo, any_trk_sel, any_item_sel)) continue;
                 AudioItem *it = &p->items[i];
-                if (only_track_idx >= 0 && it->track_idx != only_track_idx) continue;
-                if (!it->raw_file_handle || g_item_muted[tab][i]) continue;
-                if (only_track_idx < 0 && only_item_idx < 0 && it->track_idx >= 0 && it->track_idx < p->num_tracks) {
-                    if (is_track_hidden(it->track_idx) || p->tracks[it->track_idx].mute) continue;
-                    if (any_solo && !p->tracks[it->track_idx].solo) continue;
-                }
                 double it_s = it->start_time;
                 double it_e = it->start_time + it->duration;
                 if (it_e <= st || it_s >= et) continue;
@@ -4844,17 +4996,29 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
             }
 
             for (int k = 0; k < cur_n; k++) {
-                float pk = fmaxf(fabsf(scan_l[k]), fabsf(scan_r[k]));
+                float al = fabsf(scan_l[k]);
+                float ar = fabsf(scan_r[k]);
+                float pk = (al > ar) ? al : ar;
                 if (pk > max_peak) max_peak = pk;
+                if (pk > 0.0001f) {
+                    sum_sq += (double)(scan_l[k] * scan_l[k] + scan_r[k] * scan_r[k]) * 0.5;
+                    active_samples++;
+                }
             }
             if ((f_idx & 16383) == 0) {
                 int cur_p = pct_start + (int)(((double)f_idx / (double)total_out_frames) * (pass1_end - pct_start));
-                update_export_progress_ui(ren, cur_p, "Pass 1/2: Analyzing peak loudness...", false);
+                update_export_progress_ui(ren, cur_p, "Pass 1/2: Analyzing peak & RMS loudness...", false);
             }
         }
-        if (max_peak > 0.99f) {
-            norm_gain = 0.98f / max_peak;
+        // Studio 2-pass gain optimization: prevent clipping and optimize headroom to -0.3 dBFS (0.966)
+        if (max_peak > 0.966f) {
+            norm_gain = 0.966f / max_peak;
+        } else if (max_peak > 0.005f && max_peak < 0.70f && active_samples > 0) {
+            float boost = 0.92f / max_peak;
+            if (boost > 2.5f) boost = 2.5f; // Cap automatic 2-pass makeup gain at +8 dB
+            norm_gain = boost;
         }
+        (void)sum_sq;
     }
 
     FILE *out_f = fopen(out_wav_path, "wb");
@@ -4879,15 +5043,8 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
         double et = exp_start + ((double)(written + (uint32_t)cur_n) / (double)target_sr);
 
         for (int i = 0; i < p->num_items; i++) {
-            if (only_item_idx >= 0 && i != only_item_idx) continue;
+            if (!is_item_included_in_audio_export(p, i, any_solo, any_trk_sel, any_item_sel)) continue;
             AudioItem *it = &p->items[i];
-            if (only_track_idx >= 0 && it->track_idx != only_track_idx) continue;
-            if (!it->raw_file_handle || g_item_muted[tab][i]) continue;
-
-            if (only_track_idx < 0 && only_item_idx < 0 && it->track_idx >= 0 && it->track_idx < p->num_tracks) {
-                if (is_track_hidden(it->track_idx) || p->tracks[it->track_idx].mute) continue;
-                if (any_solo && !p->tracks[it->track_idx].solo) continue;
-            }
 
             double it_s = it->start_time;
             double it_e = it->start_time + it->duration;
@@ -4946,7 +5103,7 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
 
         if ((written & 8191) == 0 || written == total_out_frames) {
             int cur_p = render_pct_s + (int)(((double)written / (double)total_out_frames) * (pct_end - render_pct_s));
-            update_export_progress_ui(ren, cur_p, two_pass ? "Pass 2/2: Rendering audio stream..." : "Rendering audio stream...", false);
+            update_export_progress_ui(ren, cur_p, two_pass ? "Pass 2/2: Rendering master audio stream..." : "Rendering audio stream...", false);
         }
     }
 
@@ -4958,280 +5115,936 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
     return true;
 }
 
-// Converts or muxes the rendered WAV into MP3 or timeline-accurate MP4 (with black gaps where no video clip exists)
-static void finalize_format_from_wav(ProjectTab *p, SDL_Renderer *ren, const char *wav_src_path, const char *final_out_path,
-                                     double exp_start, double exp_end, int only_track_idx, int only_item_idx, int pct_encode) {
-    if (g_export.format == EXPORT_FMT_WAV) {
-        return; // Already written directly to final_out_path
+// Helper: Drains encoded packets from an AVCodecContext and writes them to the output AVFormatContext
+static int drain_encoder_packets(AVCodecContext *enc_ctx, AVStream *out_st, AVFormatContext *oc, AVPacket *pkt) {
+    int ret = 0;
+    while (ret >= 0) {
+        ret = avcodec_receive_packet(enc_ctx, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            return 0;
+        } else if (ret < 0) {
+            return ret;
+        }
+        av_packet_rescale_ts(pkt, enc_ctx->time_base, out_st->time_base);
+        pkt->stream_index = out_st->index;
+        ret = av_interleaved_write_frame(oc, pkt);
+        av_packet_unref(pkt);
+    }
+    return 0;
+}
+
+// Native In-Process C FFmpeg MP3 Encoder (converts rendered 24-bit WAV into MP3 via libavformat/libavcodec/libswresample)
+static bool encode_wav_to_mp3_native_ffmpeg(SDL_Renderer *ren, const char *wav_src_path, const char *final_out_path,
+                                            int target_sr, int channels, int mp3_kbps, int pct_start, int pct_end) {
+    AVFormatContext *in_fmt = NULL;
+    if (avformat_open_input(&in_fmt, wav_src_path, NULL, NULL) < 0) return false;
+    if (avformat_find_stream_info(in_fmt, NULL) < 0) {
+        avformat_close_input(&in_fmt);
+        return false;
     }
 
-    char cmd[4096];
-    if (g_export.format == EXPORT_FMT_MP3) {
-        update_export_progress_ui(ren, pct_encode, "Encoding MP3 audio...", true);
-        snprintf(cmd, sizeof(cmd),
-                 "ffmpeg -y -loglevel error -i \"%s\" -vn -ar %d -ac %d -b:a %dk \"%s\"",
-                 wav_src_path, g_export.sample_rate, g_export.channels, g_export.mp3_bitrate, final_out_path);
-        int rc = system(cmd);
-        if (rc != 0) {
-            FILE *src = fopen(wav_src_path, "rb");
-            FILE *dst = fopen(final_out_path, "wb");
-            if (src && dst) {
-                char buf[4096];
-                size_t n;
-                while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
-            }
-            if (src) fclose(src);
-            if (dst) fclose(dst);
+    int a_idx = -1;
+    for (unsigned int i = 0; i < in_fmt->nb_streams; i++) {
+        if (in_fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            a_idx = (int)i;
+            break;
         }
-        remove(wav_src_path);
-        return;
+    }
+    if (a_idx < 0) {
+        avformat_close_input(&in_fmt);
+        return false;
     }
 
-    if (g_export.format == EXPORT_FMT_MP4) {
-        update_export_progress_ui(ren, pct_encode, "Encoding timeline video segments & audio to MP4...", true);
-        int w = atoi(g_export.mp4_width_str);
-        int h = atoi(g_export.mp4_height_str);
-        double fps = atof(g_export.mp4_fps_str);
-        int v_kbps = atoi(g_export.mp4_video_kbps_str);
-        int a_kbps = atoi(g_export.mp4_audio_kbps_str);
-        if (w <= 0) w = 1920;
-        if (h <= 0) h = 1080;
-        if (w % 2 != 0) w++;
-        if (h % 2 != 0) h++;
-        if (fps <= 0.0) fps = 25.0;
-        if (v_kbps <= 0) v_kbps = 2048;
-        if (a_kbps <= 0) a_kbps = 192;
+    const AVCodec *dec = avcodec_find_decoder(in_fmt->streams[a_idx]->codecpar->codec_id);
+    if (!dec) {
+        avformat_close_input(&in_fmt);
+        return false;
+    }
+    AVCodecContext *dec_ctx = avcodec_alloc_context3(dec);
+    avcodec_parameters_to_context(dec_ctx, in_fmt->streams[a_idx]->codecpar);
+    if (avcodec_open2(dec_ctx, dec, NULL) < 0) {
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&in_fmt);
+        return false;
+    }
+    if (dec_ctx->ch_layout.nb_channels <= 0) {
+        av_channel_layout_default(&dec_ctx->ch_layout, (channels == 1) ? 1 : 2);
+    }
 
-        const char *a_codec = "aac";
-        if (g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_MP3) a_codec = "libmp3lame";
-        else if (g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_WAV) a_codec = "pcm_s16le";
+    const AVCodec *enc = avcodec_find_encoder_by_name("libmp3lame");
+    if (!enc) enc = avcodec_find_encoder(AV_CODEC_ID_MP3);
+    if (!enc) {
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&in_fmt);
+        return false;
+    }
 
-        double dur = exp_end - exp_start;
-        if (dur <= 0.01) dur = 1.0;
+    AVFormatContext *oc = NULL;
+    if (avformat_alloc_output_context2(&oc, NULL, "mp3", final_out_path) < 0 || !oc) {
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&in_fmt);
+        return false;
+    }
 
-        int tab = get_valid_tab_idx();
-        bool any_solo = false;
-        if (p) {
-            for (int t = 0; t < p->num_tracks; t++) {
-                if (p->tracks[t].solo && !is_track_hidden(t)) { any_solo = true; break; }
+    AVStream *out_st = avformat_new_stream(oc, NULL);
+    AVCodecContext *enc_ctx = avcodec_alloc_context3(enc);
+    if (!out_st || !enc_ctx) {
+        if (enc_ctx) avcodec_free_context(&enc_ctx);
+        avformat_free_context(oc);
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&in_fmt);
+        return false;
+    }
+
+    enc_ctx->sample_rate = (target_sr > 0) ? target_sr : 48000;
+    av_channel_layout_default(&enc_ctx->ch_layout, (channels == 1) ? 1 : 2);
+    enc_ctx->bit_rate = (int64_t)(mp3_kbps > 0 ? mp3_kbps : 192) * 1000;
+    enc_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    if (enc->sample_fmts) {
+        enc_ctx->sample_fmt = enc->sample_fmts[0];
+        for (int i = 0; enc->sample_fmts[i] != AV_SAMPLE_FMT_NONE; i++) {
+            if (enc->sample_fmts[i] == AV_SAMPLE_FMT_FLTP || enc->sample_fmts[i] == AV_SAMPLE_FMT_S16P) {
+                enc_ctx->sample_fmt = enc->sample_fmts[i];
+                break;
             }
         }
+    }
+    enc_ctx->time_base = (AVRational){ 1, enc_ctx->sample_rate };
+    if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
+        enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
 
-        // Build exact timeline video intervals across [exp_start, exp_end] so splits, deleted middle clips (black gaps),
-        // trimmed offsets, and multi-track video priority are 100% honored in MP4 export!
-        double bounds[MAX_ITEMS * 2 + 4];
-        int num_bounds = 0;
-        bounds[num_bounds++] = exp_start;
-        bounds[num_bounds++] = exp_end;
+    if (avcodec_open2(enc_ctx, enc, NULL) < 0) {
+        avcodec_free_context(&enc_ctx);
+        avformat_free_context(oc);
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&in_fmt);
+        return false;
+    }
+    avcodec_parameters_from_context(out_st->codecpar, enc_ctx);
+    out_st->time_base = enc_ctx->time_base;
 
-        if (p) {
-            for (int i = 0; i < p->num_items; i++) {
-                if (only_item_idx >= 0 && i != only_item_idx) continue;
-                AudioItem *it = &p->items[i];
-                if (only_track_idx >= 0 && it->track_idx != only_track_idx) continue;
-                if (!it->has_video || !it->file_path[0] || g_item_muted[tab][i]) continue;
-                if (only_track_idx < 0 && only_item_idx < 0 && it->track_idx >= 0 && it->track_idx < p->num_tracks) {
-                    if (is_track_hidden(it->track_idx) || p->tracks[it->track_idx].mute) continue;
-                    if (any_solo && !p->tracks[it->track_idx].solo) continue;
-                }
-                double cs = fmax(exp_start, it->start_time);
-                double ce = fmin(exp_end, it->start_time + it->duration);
-                if (ce > cs + 0.005 && num_bounds + 2 < (int)(sizeof(bounds) / sizeof(bounds[0]))) {
-                    bounds[num_bounds++] = cs;
-                    bounds[num_bounds++] = ce;
-                }
-            }
+    if (!(oc->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&oc->pb, final_out_path, AVIO_FLAG_WRITE) < 0) {
+            avcodec_free_context(&enc_ctx);
+            avformat_free_context(oc);
+            avcodec_free_context(&dec_ctx);
+            avformat_close_input(&in_fmt);
+            return false;
         }
+    }
+    if (avformat_write_header(oc, NULL) < 0) {
+        if (!(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
+        avcodec_free_context(&enc_ctx);
+        avformat_free_context(oc);
+        avcodec_free_context(&dec_ctx);
+        avformat_close_input(&in_fmt);
+        return false;
+    }
 
-        // Sort boundary timestamps ascending
-        for (int a = 0; a < num_bounds - 1; a++) {
-            for (int b = a + 1; b < num_bounds; b++) {
-                if (bounds[b] < bounds[a]) {
-                    double tmp = bounds[a];
-                    bounds[a] = bounds[b];
-                    bounds[b] = tmp;
-                }
-            }
-        }
+    SwrContext *swr = NULL;
+    swr_alloc_set_opts2(&swr, &enc_ctx->ch_layout, enc_ctx->sample_fmt, enc_ctx->sample_rate,
+                        &dec_ctx->ch_layout, dec_ctx->sample_fmt, dec_ctx->sample_rate, 0, NULL);
+    swr_init(swr);
 
-        // Deduplicate close boundary points (< 5ms)
-        int uniq_b = 0;
-        for (int a = 0; a < num_bounds; a++) {
-            if (uniq_b == 0 || bounds[a] - bounds[uniq_b - 1] > 0.005) {
-                bounds[uniq_b++] = bounds[a];
-            }
-        }
-        if (uniq_b < 2) {
-            bounds[0] = exp_start;
-            bounds[1] = exp_end;
-            uniq_b = 2;
-        } else {
-            bounds[uniq_b - 1] = exp_end;
-        }
+    int frame_size = (enc_ctx->frame_size > 0) ? enc_ctx->frame_size : 1152;
+    AVFrame *in_frame = av_frame_alloc();
+    AVFrame *enc_frame = av_frame_alloc();
+    enc_frame->nb_samples = frame_size;
+    enc_frame->format = enc_ctx->sample_fmt;
+    av_channel_layout_copy(&enc_frame->ch_layout, &enc_ctx->ch_layout);
+    av_frame_get_buffer(enc_frame, 0);
 
-        typedef struct {
-            int item_idx;      // -1 = Blank/Black gap (no video clip on timeline)
-            int input_idx;     // Index into unique video input files
-            double seg_dur;    // Segment duration on timeline
-            double src_offset; // Offset inside video source file
-        } VideoTimelineSeg;
+    AVPacket *in_pkt = av_packet_alloc();
+    AVPacket *out_pkt = av_packet_alloc();
+    int64_t next_pts = 0;
 
-        static VideoTimelineSeg v_segs[512];
-        int num_v_segs = 0;
-
-        static char unique_v_files[64][512];
-        int num_unique_v = 0;
-
-        for (int k = 0; k < uniq_b - 1 && num_v_segs < 512; k++) {
-            double s_t = bounds[k];
-            double e_t = bounds[k + 1];
-            double s_dur = e_t - s_t;
-            if (s_dur <= 0.004) continue;
-            double mid_t = 0.5 * (s_t + e_t);
-
-            int best_item = -1;
-            int best_trk = 999999;
-            if (p) {
-                for (int i = 0; i < p->num_items; i++) {
-                    if (only_item_idx >= 0 && i != only_item_idx) continue;
-                    AudioItem *it = &p->items[i];
-                    if (only_track_idx >= 0 && it->track_idx != only_track_idx) continue;
-                    if (!it->has_video || !it->file_path[0] || g_item_muted[tab][i]) continue;
-                    if (only_track_idx < 0 && only_item_idx < 0 && it->track_idx >= 0 && it->track_idx < p->num_tracks) {
-                        if (is_track_hidden(it->track_idx) || p->tracks[it->track_idx].mute) continue;
-                        if (any_solo && !p->tracks[it->track_idx].solo) continue;
-                    }
-                    if (mid_t >= it->start_time && mid_t <= it->start_time + it->duration) {
-                        if (it->track_idx < best_trk) {
-                            best_trk = it->track_idx;
-                            best_item = i;
+    while (av_read_frame(in_fmt, in_pkt) >= 0) {
+        if (in_pkt->stream_index == a_idx) {
+            if (avcodec_send_packet(dec_ctx, in_pkt) >= 0) {
+                while (avcodec_receive_frame(dec_ctx, in_frame) >= 0) {
+                    av_frame_make_writable(enc_frame);
+                    int conv = swr_convert(swr, enc_frame->data, frame_size,
+                                           (const uint8_t **)in_frame->extended_data, in_frame->nb_samples);
+                    if (conv > 0) {
+                        enc_frame->nb_samples = conv;
+                        enc_frame->pts = next_pts;
+                        next_pts += conv;
+                        if (avcodec_send_frame(enc_ctx, enc_frame) >= 0) {
+                            drain_encoder_packets(enc_ctx, out_st, oc, out_pkt);
                         }
                     }
                 }
             }
-
-            double src_off = 0.0;
-            int inp_idx = -1;
-            if (best_item >= 0) {
-                AudioItem *bit = &p->items[best_item];
-                src_off = fmax(0.0, (s_t - bit->start_time) + bit->offset_in_file);
-                for (int u = 0; u < num_unique_v; u++) {
-                    if (strcmp(unique_v_files[u], bit->file_path) == 0) {
-                        inp_idx = u;
-                        break;
-                    }
-                }
-                if (inp_idx < 0 && num_unique_v < 64) {
-                    inp_idx = num_unique_v++;
-                    strncpy(unique_v_files[inp_idx], bit->file_path, sizeof(unique_v_files[0]) - 1);
-                    unique_v_files[inp_idx][sizeof(unique_v_files[0]) - 1] = '\0';
-                }
-            }
-
-            // Merge adjacent segments if both are black gaps or both come continuously from the same video clip
-            if (num_v_segs > 0) {
-                VideoTimelineSeg *prev = &v_segs[num_v_segs - 1];
-                if (best_item == -1 && prev->item_idx == -1) {
-                    prev->seg_dur += s_dur;
-                    continue;
-                }
-                if (best_item >= 0 && prev->item_idx == best_item &&
-                    fabs((prev->src_offset + prev->seg_dur) - src_off) < 0.015) {
-                    prev->seg_dur += s_dur;
-                    continue;
-                }
-            }
-
-            v_segs[num_v_segs].item_idx   = best_item;
-            v_segs[num_v_segs].input_idx  = inp_idx;
-            v_segs[num_v_segs].seg_dur    = s_dur;
-            v_segs[num_v_segs].src_offset = src_off;
-            num_v_segs++;
         }
+        av_packet_unref(in_pkt);
+    }
 
-        if (num_unique_v > 0 && num_v_segs > 0) {
-#ifdef _WIN32
-            CreateDirectoryA(".cache", NULL);
-#else
-            mkdir(".cache", 0777);
+    avcodec_send_frame(enc_ctx, NULL);
+    drain_encoder_packets(enc_ctx, out_st, oc, out_pkt);
+    av_write_trailer(oc);
+
+    av_packet_free(&in_pkt);
+    av_packet_free(&out_pkt);
+    av_frame_free(&in_frame);
+    av_frame_free(&enc_frame);
+    if (swr) swr_free(&swr);
+    if (!(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
+    avcodec_free_context(&enc_ctx);
+    avformat_free_context(oc);
+    avcodec_free_context(&dec_ctx);
+    avformat_close_input(&in_fmt);
+
+    update_export_progress_ui(ren, pct_end, "MP3 encoding complete.", true);
+    (void)pct_start;
+    return true;
+}
+
+// Persistent Video Clip Decoder Cache for Native C FFmpeg Timeline Video Rendering
+typedef struct {
+    char filepath[512];
+    AVFormatContext *fmt_ctx;
+    AVCodecContext  *codec_ctx;
+    struct SwsContext *sws_ctx;
+    AVFrame         *dec_frame;
+    AVFrame         *scaled_frame;
+    AVPacket        *pkt;
+    int              video_stream_idx;
+    double           time_base;
+    int64_t          start_pts;
+    double           last_pts_sec;
+    bool             has_decoded_frame;
+    int              cached_dst_w;
+    int              cached_dst_h;
+    int              cached_pad_x;
+    int              cached_pad_y;
+    int              cached_out_w;
+    int              cached_out_h;
+} ExportVideoClipDecoder;
+
+static void close_export_video_clip_decoder(ExportVideoClipDecoder *vd) {
+    if (!vd) return;
+    if (vd->sws_ctx)      { sws_freeContext(vd->sws_ctx); vd->sws_ctx = NULL; }
+    if (vd->scaled_frame) { av_frame_free(&vd->scaled_frame); vd->scaled_frame = NULL; }
+    if (vd->dec_frame)    { av_frame_free(&vd->dec_frame); vd->dec_frame = NULL; }
+    if (vd->pkt)          { av_packet_free(&vd->pkt); vd->pkt = NULL; }
+    if (vd->codec_ctx)    { avcodec_free_context(&vd->codec_ctx); vd->codec_ctx = NULL; }
+    if (vd->fmt_ctx)      { avformat_close_input(&vd->fmt_ctx); vd->fmt_ctx = NULL; }
+    memset(vd, 0, sizeof(*vd));
+    vd->video_stream_idx = -1;
+    vd->last_pts_sec = -1.0;
+}
+
+static bool open_export_video_clip_decoder(ExportVideoClipDecoder *vd, const char *filepath, int out_w, int out_h) {
+    if (!vd || !filepath || !filepath[0]) return false;
+    if (vd->fmt_ctx && vd->codec_ctx && strcmp(vd->filepath, filepath) == 0 &&
+        vd->cached_out_w == out_w && vd->cached_out_h == out_h) {
+        return true;
+    }
+    close_export_video_clip_decoder(vd);
+
+    if (avformat_open_input(&vd->fmt_ctx, filepath, NULL, NULL) < 0) return false;
+    if (avformat_find_stream_info(vd->fmt_ctx, NULL) < 0) {
+        close_export_video_clip_decoder(vd);
+        return false;
+    }
+
+    const AVCodec *codec = NULL;
+    for (unsigned int i = 0; i < vd->fmt_ctx->nb_streams; i++) {
+        AVStream *st = vd->fmt_ctx->streams[i];
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            !(st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+            vd->video_stream_idx = (int)i;
+            codec = avcodec_find_decoder(st->codecpar->codec_id);
+            break;
+        }
+    }
+    if (vd->video_stream_idx < 0) {
+        for (unsigned int i = 0; i < vd->fmt_ctx->nb_streams; i++) {
+            AVStream *st = vd->fmt_ctx->streams[i];
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                vd->video_stream_idx = (int)i;
+                codec = avcodec_find_decoder(st->codecpar->codec_id);
+                break;
+            }
+        }
+    }
+    if (vd->video_stream_idx < 0 || !codec) {
+        close_export_video_clip_decoder(vd);
+        return false;
+    }
+
+#ifdef AVDISCARD_ALL
+    for (unsigned int i = 0; i < vd->fmt_ctx->nb_streams; i++) {
+        if ((int)i != vd->video_stream_idx) vd->fmt_ctx->streams[i]->discard = AVDISCARD_ALL;
+    }
 #endif
-            const char *fscript_path = ".cache/export_vfilter.txt";
-            FILE *fs = fopen(fscript_path, "wb");
-            if (fs) {
-                for (int s = 0; s < num_v_segs; s++) {
-                    if (v_segs[s].item_idx < 0 || v_segs[s].input_idx < 0) {
-                        fprintf(fs,
-                                "color=c=black:s=%dx%d:r=%.2f:d=%.4f,format=yuv420p,setsar=1[v%d];\n",
-                                w, h, fps, v_segs[s].seg_dur, s);
-                    } else {
-                        fprintf(fs,
-                                "[%d:v:0]trim=start=%.4f:duration=%.4f,setpts=PTS-STARTPTS,fps=%.2f,"
-                                "scale=%d:%d:force_original_aspect_ratio=decrease,"
-                                "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,setsar=1[v%d];\n",
-                                v_segs[s].input_idx, v_segs[s].src_offset, v_segs[s].seg_dur, fps,
-                                w, h, w, h, s);
-                    }
-                }
-                if (num_v_segs == 1) {
-                    fprintf(fs, "[v0]null[vout]\n");
-                } else {
-                    for (int s = 0; s < num_v_segs; s++) {
-                        fprintf(fs, "[v%d]", s);
-                    }
-                    fprintf(fs, "concat=n=%d:v=1:a=0[vout]\n", num_v_segs);
-                }
-                fclose(fs);
-            }
 
-            char inputs_str[2560] = {0};
-            for (int u = 0; u < num_unique_v; u++) {
-                char one_in[600];
-                snprintf(one_in, sizeof(one_in), "-i \"%s\" ", unique_v_files[u]);
-                if (strlen(inputs_str) + strlen(one_in) + 1 < sizeof(inputs_str)) {
-                    strcat(inputs_str, one_in);
-                }
-            }
+    vd->codec_ctx = avcodec_alloc_context3(codec);
+    AVStream *vst = vd->fmt_ctx->streams[vd->video_stream_idx];
+    avcodec_parameters_to_context(vd->codec_ctx, vst->codecpar);
+    vd->codec_ctx->thread_count = 2;
+    if (avcodec_open2(vd->codec_ctx, codec, NULL) < 0 || vd->codec_ctx->width <= 0 || vd->codec_ctx->height <= 0) {
+        close_export_video_clip_decoder(vd);
+        return false;
+    }
 
-            snprintf(cmd, sizeof(cmd),
-                     "ffmpeg -y -loglevel error %s-i \"%s\" -filter_complex_script \"%s\" "
-                     "-map \"[vout]\" -map %d:a:0 -r %.2f -c:v libx264 -pix_fmt yuv420p -b:v %dk "
-                     "-c:a %s -b:a %dk -ar %d -ac %d -shortest \"%s\"",
-                     inputs_str, wav_src_path, fscript_path,
-                     num_unique_v, fps, v_kbps, a_codec, a_kbps,
-                     g_export.sample_rate, g_export.channels, final_out_path);
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                     "ffmpeg -y -loglevel error -f lavfi -i color=c=black:s=%dx%d:r=%.2f -i \"%s\" -t %.3f "
-                     "-c:v libx264 -pix_fmt yuv420p -b:v %dk -c:a %s -b:a %dk -ar %d -ac %d -shortest \"%s\"",
-                     w, h, fps, wav_src_path, dur,
-                     v_kbps, a_codec, a_kbps, g_export.sample_rate, g_export.channels, final_out_path);
-        }
+    strncpy(vd->filepath, filepath, sizeof(vd->filepath) - 1);
+    vd->time_base = av_q2d(vst->time_base);
+    vd->start_pts = (vst->start_time != AV_NOPTS_VALUE) ? vst->start_time : 0;
+    vd->dec_frame = av_frame_alloc();
+    vd->pkt = av_packet_alloc();
+    vd->last_pts_sec = -1.0;
+    vd->has_decoded_frame = false;
 
-        int rc = system(cmd);
-        remove(".cache/export_vfilter.txt");
-        if (rc != 0) {
-            FILE *src = fopen(wav_src_path, "rb");
-            FILE *dst = fopen(final_out_path, "wb");
-            if (src && dst) {
-                char buf[4096];
-                size_t n;
-                while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
-            }
-            if (src) fclose(src);
-            if (dst) fclose(dst);
-        }
-        remove(wav_src_path);
+    // Compute aspect-ratio-preserving letterbox/pillarbox dimensions inside out_w x out_h (even numbers for YUV420P)
+    double src_asp = (double)vd->codec_ctx->width / (double)vd->codec_ctx->height;
+    double dst_asp = (double)out_w / (double)out_h;
+    int dst_w = out_w, dst_h = out_h;
+    if (dst_asp > src_asp) {
+        dst_h = out_h;
+        dst_w = ((int)((double)out_h * src_asp + 0.5)) & ~1;
+    } else {
+        dst_w = out_w;
+        dst_h = ((int)((double)out_w / src_asp + 0.5)) & ~1;
+    }
+    if (dst_w < 2) dst_w = 2;
+    if (dst_h < 2) dst_h = 2;
+    vd->cached_dst_w = dst_w;
+    vd->cached_dst_h = dst_h;
+    vd->cached_pad_x = ((out_w - dst_w) / 2) & ~1;
+    vd->cached_pad_y = ((out_h - dst_h) / 2) & ~1;
+    vd->cached_out_w = out_w;
+    vd->cached_out_h = out_h;
+
+    vd->scaled_frame = av_frame_alloc();
+    vd->scaled_frame->format = AV_PIX_FMT_YUV420P;
+    vd->scaled_frame->width  = dst_w;
+    vd->scaled_frame->height = dst_h;
+    av_frame_get_buffer(vd->scaled_frame, 32);
+
+    return true;
+}
+
+// Fills an output YUV420P frame with studio black (Y = 16, U = 128, V = 128)
+static void fill_yuv420p_frame_black(AVFrame *yuv, int w, int h) {
+    if (!yuv || !yuv->data[0]) return;
+    for (int y = 0; y < h; y++) {
+        memset(yuv->data[0] + y * yuv->linesize[0], 16, (size_t)w);
+    }
+    int uv_h = h / 2;
+    int uv_w = w / 2;
+    for (int y = 0; y < uv_h; y++) {
+        if (yuv->data[1]) memset(yuv->data[1] + y * yuv->linesize[1], 128, (size_t)uv_w);
+        if (yuv->data[2]) memset(yuv->data[2] + y * yuv->linesize[2], 128, (size_t)uv_w);
     }
 }
 
-static void ensure_recording_directory_exists(const char *dir_path);
+// Decodes the video clip to `target_sec` and blits the scaled YUV420P image into `dst_yuv` (centered with black letterbox/pillarbox)
+static bool decode_clip_frame_into_yuv420p(ExportVideoClipDecoder *vd, double target_sec, AVFrame *dst_yuv, int out_w, int out_h) {
+    if (!vd || !vd->fmt_ctx || !vd->codec_ctx || !dst_yuv) return false;
+    if (target_sec < 0.0) target_sec = 0.0;
+
+    // Seek if needed (backward jump or > 1.0s ahead or first frame)
+    if (!vd->has_decoded_frame || vd->last_pts_sec < 0.0 ||
+        target_sec < vd->last_pts_sec - 0.05 || (target_sec - vd->last_pts_sec) > 1.25) {
+        int64_t seek_ts = vd->start_pts + (int64_t)(target_sec / (vd->time_base > 1e-9 ? vd->time_base : (1.0 / 25.0)));
+        av_seek_frame(vd->fmt_ctx, vd->video_stream_idx, seek_ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(vd->codec_ctx);
+        vd->last_pts_sec = -1.0;
+        vd->has_decoded_frame = false;
+    }
+
+    int safety_steps = 0;
+    while ((!vd->has_decoded_frame || vd->last_pts_sec < target_sec - 0.015) && safety_steps < 120) {
+        int r = av_read_frame(vd->fmt_ctx, vd->pkt);
+        if (r < 0) break;
+        if (vd->pkt->stream_index == vd->video_stream_idx) {
+            if (avcodec_send_packet(vd->codec_ctx, vd->pkt) >= 0) {
+                while (avcodec_receive_frame(vd->codec_ctx, vd->dec_frame) == 0) {
+                    int64_t ts = (vd->dec_frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                                 ? vd->dec_frame->best_effort_timestamp
+                                 : vd->dec_frame->pts;
+                    double pts = (ts != AV_NOPTS_VALUE) ? ((double)(ts - vd->start_pts) * vd->time_base) : target_sec;
+                    if (pts < 0.0) pts = 0.0;
+                    vd->last_pts_sec = pts;
+                    vd->has_decoded_frame = true;
+                    safety_steps++;
+                    if (pts >= target_sec - 0.015) break;
+                }
+            }
+        }
+        av_packet_unref(vd->pkt);
+    }
+
+    if (!vd->has_decoded_frame || vd->dec_frame->width <= 0 || vd->dec_frame->height <= 0) {
+        return false;
+    }
+
+    enum AVPixelFormat src_fmt = (vd->dec_frame->format != AV_PIX_FMT_NONE)
+                                 ? (enum AVPixelFormat)vd->dec_frame->format
+                                 : vd->codec_ctx->pix_fmt;
+    if (!vd->sws_ctx) {
+        vd->sws_ctx = sws_getContext(
+            vd->dec_frame->width, vd->dec_frame->height, src_fmt,
+            vd->cached_dst_w, vd->cached_dst_h, AV_PIX_FMT_YUV420P,
+            SWS_BILINEAR, NULL, NULL, NULL
+        );
+    }
+    if (!vd->sws_ctx) return false;
+
+    fill_yuv420p_frame_black(dst_yuv, out_w, out_h);
+
+    if (vd->cached_dst_w == out_w && vd->cached_dst_h == out_h) {
+        sws_scale(vd->sws_ctx, (const uint8_t *const *)vd->dec_frame->data, vd->dec_frame->linesize,
+                  0, vd->dec_frame->height, dst_yuv->data, dst_yuv->linesize);
+    } else {
+        sws_scale(vd->sws_ctx, (const uint8_t *const *)vd->dec_frame->data, vd->dec_frame->linesize,
+                  0, vd->dec_frame->height, vd->scaled_frame->data, vd->scaled_frame->linesize);
+        int px = vd->cached_pad_x;
+        int py = vd->cached_pad_y;
+        int dw = vd->cached_dst_w;
+        int dh = vd->cached_dst_h;
+        for (int y = 0; y < dh && (py + y) < out_h; y++) {
+            memcpy(dst_yuv->data[0] + (py + y) * dst_yuv->linesize[0] + px,
+                   vd->scaled_frame->data[0] + y * vd->scaled_frame->linesize[0], (size_t)dw);
+        }
+        int uv_px = px / 2, uv_py = py / 2, uv_dw = dw / 2, uv_dh = dh / 2;
+        for (int y = 0; y < uv_dh && (uv_py + y) < (out_h / 2); y++) {
+            memcpy(dst_yuv->data[1] + (uv_py + y) * dst_yuv->linesize[1] + uv_px,
+                   vd->scaled_frame->data[1] + y * vd->scaled_frame->linesize[1], (size_t)uv_dw);
+            memcpy(dst_yuv->data[2] + (uv_py + y) * dst_yuv->linesize[2] + uv_px,
+                   vd->scaled_frame->data[2] + y * vd->scaled_frame->linesize[2], (size_t)uv_dw);
+        }
+    }
+    return true;
+}
+
+// Finds the highest-priority visible video clip on the timeline at `t_sec`
+static AudioItem* find_timeline_video_clip_at_time(ProjectTab *p, double t_sec,
+                                                   bool any_solo, bool any_video_trk_sel, bool any_video_item_sel) {
+    if (!p) return NULL;
+    AudioItem *best_it = NULL;
+    int best_trk = 999999;
+    for (int i = 0; i < p->num_items; i++) {
+        if (!is_item_included_in_video_export(p, i, any_solo, any_video_trk_sel, any_video_item_sel)) continue;
+        AudioItem *it = &p->items[i];
+        if (t_sec >= it->start_time && t_sec < it->start_time + it->duration) {
+            if (it->track_idx < best_trk) {
+                best_trk = it->track_idx;
+                best_it = it;
+            }
+        }
+    }
+    return best_it;
+}
+
+// Native In-Process C FFmpeg MP4 Video + AAC Audio Export Engine (like REAPER / Premiere / DaVinci Resolve)
+// Decodes timeline video clips frame-by-frame, scales/pads to target resolution, encodes H.264/MPEG-4 video + AAC audio,
+// and muxes directly into `final_out_path` without spawning broken shell scripts or corrupting the output file.
+static bool render_timeline_mp4_native_ffmpeg(ProjectTab *p, SDL_Renderer *ren,
+                                              const char *wav_src_path, const char *final_out_path,
+                                              double exp_start, double exp_end,
+                                              int out_w, int out_h, double fps,
+                                              int v_kbps, int a_kbps,
+                                              int target_sr, int channels,
+                                              bool two_pass, int pct_start, int pct_end) {
+    if (!p || !wav_src_path || !final_out_path) return false;
+    if (out_w <= 0) out_w = 1920;
+    if (out_h <= 0) out_h = 1080;
+    if (out_w % 2 != 0) out_w++;
+    if (out_h % 2 != 0) out_h++;
+    if (fps < 1.0 || fps > 240.0) fps = 25.0;
+    if (v_kbps < 100) v_kbps = 2048;
+    if (a_kbps < 64)  a_kbps = 192;
+
+    ensure_all_timeline_video_flags_probed(p);
+
+    bool any_solo = false;
+    bool any_video_trk_sel = false;
+    bool any_video_item_sel = false;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->tracks[t].solo && !is_track_hidden(t)) any_solo = true;
+    }
+    for (int i = 0; i < p->num_items; i++) {
+        AudioItem *it = &p->items[i];
+        if (!it->has_video) continue;
+        if (it->is_selected) any_video_item_sel = true;
+        if (it->track_idx >= 0 && it->track_idx < p->num_tracks && p->track_selected[it->track_idx]) {
+            any_video_trk_sel = true;
+        }
+    }
+
+    double total_dur = exp_end - exp_start;
+    if (total_dur <= 0.02) total_dur = 1.0;
+    int64_t total_v_frames = (int64_t)(total_dur * fps + 0.5);
+    if (total_v_frames < 1) total_v_frames = 1;
+
+    int encode_pct_start = pct_start;
+    double complexity_boost = 1.0;
+
+    // Pass 1 of 2-Pass Video Rendering: analyze video frame motion & spatial complexity across timeline segments
+    if (two_pass) {
+        int pass1_end = pct_start + (pct_end - pct_start) * 20 / 100;
+        encode_pct_start = pass1_end;
+        update_export_progress_ui(ren, pct_start, "Pass 1/2: Analyzing video frame complexity & motion...", true);
+
+        ExportVideoClipDecoder scan_dec;
+        memset(&scan_dec, 0, sizeof(scan_dec));
+        scan_dec.video_stream_idx = -1;
+        AVFrame *scan_yuv = av_frame_alloc();
+        scan_yuv->format = AV_PIX_FMT_YUV420P;
+        scan_yuv->width  = out_w;
+        scan_yuv->height = out_h;
+        av_frame_get_buffer(scan_yuv, 32);
+
+        int64_t step = (total_v_frames > 60) ? (total_v_frames / 30) : 1;
+        double accum_var = 0.0;
+        int sampled = 0;
+        for (int64_t vf = 0; vf < total_v_frames; vf += step) {
+            double t_sec = exp_start + ((double)vf / fps);
+            AudioItem *vc = find_timeline_video_clip_at_time(p, t_sec, any_solo, any_video_trk_sel, any_video_item_sel);
+            if (vc && open_export_video_clip_decoder(&scan_dec, vc->file_path, out_w, out_h)) {
+                double clip_t = (t_sec - vc->start_time) + vc->offset_in_file;
+                if (decode_clip_frame_into_yuv420p(&scan_dec, clip_t, scan_yuv, out_w, out_h)) {
+                    uint64_t diff_sum = 0;
+                    int stride = scan_yuv->linesize[0];
+                    for (int y = 0; y < out_h; y += 8) {
+                        const uint8_t *row = scan_yuv->data[0] + y * stride;
+                        for (int x = 8; x < out_w; x += 8) {
+                            diff_sum += (uint64_t)abs((int)row[x] - (int)row[x - 8]);
+                        }
+                    }
+                    accum_var += (double)diff_sum / (double)((out_w / 8) * (out_h / 8) + 1);
+                    sampled++;
+                }
+            }
+            int cur_p = pct_start + (int)(((double)vf / (double)total_v_frames) * (pass1_end - pct_start));
+            update_export_progress_ui(ren, cur_p, "Pass 1/2: Analyzing video frame complexity & motion...", false);
+        }
+        av_frame_free(&scan_yuv);
+        close_export_video_clip_decoder(&scan_dec);
+        if (sampled > 0) {
+            double avg_var = accum_var / (double)sampled;
+            if (avg_var > 12.0) complexity_boost = 1.18;
+            else if (avg_var > 6.0) complexity_boost = 1.08;
+        }
+    }
+
+    // Locate best H.264 or MPEG-4 Video Encoder in linked FFmpeg libraries
+    const AVCodec *v_codec = avcodec_find_encoder_by_name("libx264");
+    if (!v_codec) v_codec = avcodec_find_encoder_by_name("h264_mf");
+    if (!v_codec) v_codec = avcodec_find_encoder_by_name("h264_nvenc");
+    if (!v_codec) v_codec = avcodec_find_encoder_by_name("h264_qsv");
+    if (!v_codec) v_codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!v_codec) v_codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
+
+    // Locate AAC Audio Encoder (Requirement 4: Keep only AAC format for MP4 video export)
+    const AVCodec *a_codec = avcodec_find_encoder_by_name("aac");
+    if (!a_codec) a_codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+
+    if (!v_codec || !a_codec) {
+        return false;
+    }
+
+    AVFormatContext *oc = NULL;
+    if (avformat_alloc_output_context2(&oc, NULL, "mp4", final_out_path) < 0 || !oc) {
+        return false;
+    }
+
+    // 1. Configure Video Stream
+    AVStream *v_st = avformat_new_stream(oc, NULL);
+    AVCodecContext *v_ctx = avcodec_alloc_context3(v_codec);
+    if (!v_st || !v_ctx) {
+        if (v_ctx) avcodec_free_context(&v_ctx);
+        avformat_free_context(oc);
+        return false;
+    }
+    int fps_num = (int)(fps * 100.0 + 0.5);
+    int fps_den = 100;
+    v_ctx->width  = out_w;
+    v_ctx->height = out_h;
+    v_ctx->time_base = (AVRational){ fps_den, fps_num };
+    v_ctx->framerate = (AVRational){ fps_num, fps_den };
+    v_ctx->gop_size  = (int)(fps + 0.5);
+    v_ctx->max_b_frames = 0;
+    v_ctx->pix_fmt   = AV_PIX_FMT_YUV420P;
+    v_ctx->bit_rate  = (int64_t)((double)v_kbps * 1000.0 * complexity_boost);
+    v_ctx->rc_max_rate = (int64_t)((double)v_ctx->bit_rate * 1.35);
+    v_ctx->rc_buffer_size = (int)(v_ctx->bit_rate * 2);
+    v_ctx->thread_count = 2;
+    if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
+        v_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    if (v_codec->id == AV_CODEC_ID_H264) {
+        av_opt_set(v_ctx->priv_data, "preset", two_pass ? "medium" : "veryfast", 0);
+        av_opt_set(v_ctx->priv_data, "profile", "high", 0);
+    }
+    if (avcodec_open2(v_ctx, v_codec, NULL) < 0) {
+        avcodec_free_context(&v_ctx);
+        avformat_free_context(oc);
+        return false;
+    }
+    avcodec_parameters_from_context(v_st->codecpar, v_ctx);
+    v_st->time_base = v_ctx->time_base;
+    v_st->avg_frame_rate = v_ctx->framerate;
+
+    // 2. Configure AAC Audio Stream
+    AVStream *a_st = avformat_new_stream(oc, NULL);
+    AVCodecContext *a_ctx = avcodec_alloc_context3(a_codec);
+    if (!a_st || !a_ctx) {
+        if (a_ctx) avcodec_free_context(&a_ctx);
+        avcodec_free_context(&v_ctx);
+        avformat_free_context(oc);
+        return false;
+    }
+    a_ctx->sample_rate = (target_sr == 44100 || target_sr == 48000) ? target_sr : 48000;
+    av_channel_layout_default(&a_ctx->ch_layout, (channels == 1) ? 1 : 2);
+    a_ctx->bit_rate = (int64_t)a_kbps * 1000;
+    a_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    if (a_codec->sample_fmts) {
+        a_ctx->sample_fmt = a_codec->sample_fmts[0];
+        for (int i = 0; a_codec->sample_fmts[i] != AV_SAMPLE_FMT_NONE; i++) {
+            if (a_codec->sample_fmts[i] == AV_SAMPLE_FMT_FLTP) {
+                a_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+                break;
+            }
+        }
+    }
+    a_ctx->time_base = (AVRational){ 1, a_ctx->sample_rate };
+    if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
+        a_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    if (avcodec_open2(a_ctx, a_codec, NULL) < 0) {
+        avcodec_free_context(&a_ctx);
+        avcodec_free_context(&v_ctx);
+        avformat_free_context(oc);
+        return false;
+    }
+    avcodec_parameters_from_context(a_st->codecpar, a_ctx);
+    a_st->time_base = a_ctx->time_base;
+
+    if (!(oc->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&oc->pb, final_out_path, AVIO_FLAG_WRITE) < 0) {
+            avcodec_free_context(&a_ctx);
+            avcodec_free_context(&v_ctx);
+            avformat_free_context(oc);
+            return false;
+        }
+    }
+
+    AVDictionary *mux_opts = NULL;
+    av_dict_set(&mux_opts, "movflags", "+faststart", 0);
+    if (avformat_write_header(oc, &mux_opts) < 0) {
+        av_dict_free(&mux_opts);
+        if (!(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
+        avcodec_free_context(&a_ctx);
+        avcodec_free_context(&v_ctx);
+        avformat_free_context(oc);
+        return false;
+    }
+    av_dict_free(&mux_opts);
+
+    // 3. Open Rendered WAV Input for AAC Audio Encoding
+    AVFormatContext *wav_fmt = NULL;
+    AVCodecContext  *wav_dec_ctx = NULL;
+    SwrContext      *a_swr = NULL;
+    int              wav_st_idx = -1;
+    if (avformat_open_input(&wav_fmt, wav_src_path, NULL, NULL) == 0 &&
+        avformat_find_stream_info(wav_fmt, NULL) >= 0) {
+        for (unsigned int i = 0; i < wav_fmt->nb_streams; i++) {
+            if (wav_fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                wav_st_idx = (int)i;
+                break;
+            }
+        }
+        if (wav_st_idx >= 0) {
+            const AVCodec *wdec = avcodec_find_decoder(wav_fmt->streams[wav_st_idx]->codecpar->codec_id);
+            if (wdec) {
+                wav_dec_ctx = avcodec_alloc_context3(wdec);
+                avcodec_parameters_to_context(wav_dec_ctx, wav_fmt->streams[wav_st_idx]->codecpar);
+                if (avcodec_open2(wav_dec_ctx, wdec, NULL) == 0) {
+                    if (wav_dec_ctx->ch_layout.nb_channels <= 0) {
+                        av_channel_layout_default(&wav_dec_ctx->ch_layout, (channels == 1) ? 1 : 2);
+                    }
+                    swr_alloc_set_opts2(&a_swr, &a_ctx->ch_layout, a_ctx->sample_fmt, a_ctx->sample_rate,
+                                        &wav_dec_ctx->ch_layout, wav_dec_ctx->sample_fmt, wav_dec_ctx->sample_rate, 0, NULL);
+                    swr_init(a_swr);
+                }
+            }
+        }
+    }
+
+    // 4. Encode Video Frames across [exp_start, exp_end]
+    ExportVideoClipDecoder clip_dec;
+    memset(&clip_dec, 0, sizeof(clip_dec));
+    clip_dec.video_stream_idx = -1;
+
+    AVFrame *v_frame = av_frame_alloc();
+    v_frame->format = AV_PIX_FMT_YUV420P;
+    v_frame->width  = out_w;
+    v_frame->height = out_h;
+    av_frame_get_buffer(v_frame, 32);
+
+    AVPacket *enc_pkt = av_packet_alloc();
+    int v_pct_end = pct_end - 8;
+    if (v_pct_end < encode_pct_start + 5) v_pct_end = encode_pct_start + 5;
+
+    for (int64_t vf = 0; vf < total_v_frames; vf++) {
+        double t_sec = exp_start + ((double)vf / fps);
+        av_frame_make_writable(v_frame);
+
+        AudioItem *vc = find_timeline_video_clip_at_time(p, t_sec, any_solo, any_video_trk_sel, any_video_item_sel);
+        bool got_vid = false;
+        if (vc && open_export_video_clip_decoder(&clip_dec, vc->file_path, out_w, out_h)) {
+            double clip_internal_sec = fmax(0.0, (t_sec - vc->start_time) + vc->offset_in_file);
+            got_vid = decode_clip_frame_into_yuv420p(&clip_dec, clip_internal_sec, v_frame, out_w, out_h);
+        }
+        if (!got_vid) {
+            fill_yuv420p_frame_black(v_frame, out_w, out_h);
+        }
+
+        v_frame->pts = vf;
+        if (avcodec_send_frame(v_ctx, v_frame) >= 0) {
+            drain_encoder_packets(v_ctx, v_st, oc, enc_pkt);
+        }
+
+        if ((vf & 3) == 0 || vf + 1 == total_v_frames) {
+            int cur_p = encode_pct_start + (int)(((double)(vf + 1) / (double)total_v_frames) * (v_pct_end - encode_pct_start));
+            update_export_progress_ui(ren, cur_p,
+                two_pass ? "Pass 2/2: Encoding H.264 video & AAC audio..." : "Encoding H.264 video & AAC audio...",
+                false);
+        }
+    }
+
+    avcodec_send_frame(v_ctx, NULL);
+    drain_encoder_packets(v_ctx, v_st, oc, enc_pkt);
+    close_export_video_clip_decoder(&clip_dec);
+    av_frame_free(&v_frame);
+
+    // 5. Encode AAC Audio Stream from rendered WAV
+    if (wav_fmt && wav_dec_ctx && a_swr) {
+        update_export_progress_ui(ren, v_pct_end, "Muxing AAC audio stream into MP4 container...", true);
+        int a_frame_size = (a_ctx->frame_size > 0) ? a_ctx->frame_size : 1024;
+        AVFrame *w_frame = av_frame_alloc();
+        AVFrame *a_frame = av_frame_alloc();
+        a_frame->nb_samples = a_frame_size;
+        a_frame->format = a_ctx->sample_fmt;
+        av_channel_layout_copy(&a_frame->ch_layout, &a_ctx->ch_layout);
+        av_frame_get_buffer(a_frame, 0);
+
+        AVPacket *w_pkt = av_packet_alloc();
+        int64_t a_pts = 0;
+        while (av_read_frame(wav_fmt, w_pkt) >= 0) {
+            if (w_pkt->stream_index == wav_st_idx) {
+                if (avcodec_send_packet(wav_dec_ctx, w_pkt) >= 0) {
+                    while (avcodec_receive_frame(wav_dec_ctx, w_frame) >= 0) {
+                        const uint8_t **in_d = (const uint8_t **)w_frame->extended_data;
+                        int in_n = w_frame->nb_samples;
+                        while (in_n > 0 || swr_get_delay(a_swr, a_ctx->sample_rate) >= a_frame_size) {
+                            av_frame_make_writable(a_frame);
+                            int conv = swr_convert(a_swr, a_frame->data, a_frame_size, in_d, in_n);
+                            in_d = NULL;
+                            in_n = 0;
+                            if (conv <= 0) break;
+                            a_frame->nb_samples = conv;
+                            a_frame->pts = a_pts;
+                            a_pts += conv;
+                            if (avcodec_send_frame(a_ctx, a_frame) >= 0) {
+                                drain_encoder_packets(a_ctx, a_st, oc, enc_pkt);
+                            }
+                        }
+                    }
+                }
+            }
+            av_packet_unref(w_pkt);
+        }
+        avcodec_send_frame(a_ctx, NULL);
+        drain_encoder_packets(a_ctx, a_st, oc, enc_pkt);
+        av_packet_free(&w_pkt);
+        av_frame_free(&w_frame);
+        av_frame_free(&a_frame);
+    }
+
+    av_write_trailer(oc);
+
+    av_packet_free(&enc_pkt);
+    if (a_swr) swr_free(&a_swr);
+    if (wav_dec_ctx) avcodec_free_context(&wav_dec_ctx);
+    if (wav_fmt) avformat_close_input(&wav_fmt);
+    if (!(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
+    avcodec_free_context(&a_ctx);
+    avcodec_free_context(&v_ctx);
+    avformat_free_context(oc);
+
+    // Verify the output MP4 file is valid and non-empty
+    FILE *chk = fopen(final_out_path, "rb");
+    if (!chk) return false;
+    fseek(chk, 0, SEEK_END);
+    long out_sz = ftell(chk);
+    fclose(chk);
+    return (out_sz > 256);
+}
+
+// Fallback CLI FFmpeg Video + AAC Renderer (only invoked if the user's FFmpeg shared DLLs were built without an H.264 encoder)
+// Never overwrites `.mp4` with raw `.wav` data!
+static bool render_timeline_mp4_cli_fallback(ProjectTab *p, SDL_Renderer *ren,
+                                             const char *wav_src_path, const char *final_out_path,
+                                             double exp_start, double exp_end,
+                                             int w, int h, double fps, int v_kbps, int a_kbps,
+                                             int pct_encode) {
+    update_export_progress_ui(ren, pct_encode, "Encoding MP4 video & AAC audio via FFmpeg...", true);
+    bool any_solo = false, any_video_trk_sel = false, any_video_item_sel = false;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->tracks[t].solo && !is_track_hidden(t)) any_solo = true;
+    }
+    for (int i = 0; i < p->num_items; i++) {
+        if (!p->items[i].has_video) continue;
+        if (p->items[i].is_selected) any_video_item_sel = true;
+        if (p->items[i].track_idx >= 0 && p->items[i].track_idx < p->num_tracks && p->track_selected[p->items[i].track_idx]) {
+            any_video_trk_sel = true;
+        }
+    }
+
+    // Decode frames via our native C FFmpeg decoder and pipe raw YUV420P frames into ffmpeg CLI if available
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "ffmpeg -y -loglevel error -f rawvideo -pix_fmt yuv420p -s %dx%d -r %.2f -i - "
+             "-i \"%s\" -c:v libx264 -pix_fmt yuv420p -b:v %dk -c:a aac -b:a %dk -ar %d -ac %d -movflags +faststart -shortest \"%s\"",
+             w, h, fps, wav_src_path, v_kbps, a_kbps, g_export.sample_rate, g_export.channels, final_out_path);
+#ifdef _WIN32
+    FILE *pipe = _popen(cmd, "wb");
+#else
+    FILE *pipe = popen(cmd, "w");
+#endif
+    if (!pipe) return false;
+
+    double total_dur = fmax(0.04, exp_end - exp_start);
+    int64_t total_v_frames = (int64_t)(total_dur * fps + 0.5);
+    if (total_v_frames < 1) total_v_frames = 1;
+
+    ExportVideoClipDecoder clip_dec;
+    memset(&clip_dec, 0, sizeof(clip_dec));
+    clip_dec.video_stream_idx = -1;
+
+    AVFrame *v_frame = av_frame_alloc();
+    v_frame->format = AV_PIX_FMT_YUV420P;
+    v_frame->width  = w;
+    v_frame->height = h;
+    av_frame_get_buffer(v_frame, 32);
+
+    for (int64_t vf = 0; vf < total_v_frames; vf++) {
+        double t_sec = exp_start + ((double)vf / fps);
+        AudioItem *vc = find_timeline_video_clip_at_time(p, t_sec, any_solo, any_video_trk_sel, any_video_item_sel);
+        bool got_vid = false;
+        if (vc && open_export_video_clip_decoder(&clip_dec, vc->file_path, w, h)) {
+            double clip_internal_sec = fmax(0.0, (t_sec - vc->start_time) + vc->offset_in_file);
+            got_vid = decode_clip_frame_into_yuv420p(&clip_dec, clip_internal_sec, v_frame, w, h);
+        }
+        if (!got_vid) fill_yuv420p_frame_black(v_frame, w, h);
+
+        for (int y = 0; y < h; y++) fwrite(v_frame->data[0] + y * v_frame->linesize[0], 1, (size_t)w, pipe);
+        for (int y = 0; y < h / 2; y++) fwrite(v_frame->data[1] + y * v_frame->linesize[1], 1, (size_t)(w / 2), pipe);
+        for (int y = 0; y < h / 2; y++) fwrite(v_frame->data[2] + y * v_frame->linesize[2], 1, (size_t)(w / 2), pipe);
+
+        if ((vf & 3) == 0 || vf + 1 == total_v_frames) {
+            int cur_p = pct_encode + (int)(((double)(vf + 1) / (double)total_v_frames) * (99 - pct_encode));
+            update_export_progress_ui(ren, cur_p, "Encoding MP4 video & AAC audio...", false);
+        }
+    }
+
+    av_frame_free(&v_frame);
+    close_export_video_clip_decoder(&clip_dec);
+#ifdef _WIN32
+    int rc = _pclose(pipe);
+#else
+    int rc = pclose(pipe);
+#endif
+    return (rc == 0);
+}
+
 static const char* get_export_ext(void) {
     if (g_export.format == EXPORT_FMT_MP3) return "mp3";
     if (g_export.format == EXPORT_FMT_MP4) return "mp4";
     return "wav";
 }
 
-// Executes the unified Export Media workflow based on all settings in g_export with live progress % & processing time
+// Sanitizes the user's File Name (strips any duplicate .wav/.mp3/.mp4 extension) and builds `<dir>/<name>.<ext>`
+// Never appends `_Item_19` or `_Track_1` suffixes!
+static void build_clean_export_filepath(char *out_path, size_t max_len, char *out_clean_base, size_t base_max_len) {
+    const char *ext = get_export_ext();
+    const char *dir = (g_export.directory[0] != '\0') ? g_export.directory : ".";
+    char clean_base[128];
+    snprintf(clean_base, sizeof(clean_base), "%s", (g_export.filename[0] != '\0') ? g_export.filename : "output");
+
+    // Trim trailing spaces
+    size_t blen = strlen(clean_base);
+    while (blen > 0 && (clean_base[blen - 1] == ' ' || clean_base[blen - 1] == '\t')) {
+        clean_base[--blen] = '\0';
+    }
+    // Strip trailing .wav / .mp3 / .mp4 if the user typed an extension in the File Name box
+    char *dot = strrchr(clean_base, '.');
+    if (dot && (daw_strcasecmp_custom(dot, ".wav") == 0 ||
+                daw_strcasecmp_custom(dot, ".mp3") == 0 ||
+                daw_strcasecmp_custom(dot, ".mp4") == 0)) {
+        *dot = '\0';
+    }
+    if (!clean_base[0]) strcpy(clean_base, "output");
+    strncpy(g_export.filename, clean_base, sizeof(g_export.filename) - 1);
+    g_export.filename[sizeof(g_export.filename) - 1] = '\0';
+
+    if (out_clean_base && base_max_len > 0) {
+        snprintf(out_clean_base, base_max_len, "%s", clean_base);
+    }
+
+    size_t dlen = strlen(dir);
+    bool has_Trailing_sep = (dlen > 0 && (dir[dlen - 1] == '\\' || dir[dlen - 1] == '/'));
+#ifdef _WIN32
+    snprintf(out_path, max_len, "%s%s%s.%s", dir, has_Trailing_sep ? "" : "\\", clean_base, ext);
+#else
+    snprintf(out_path, max_len, "%s%s%s.%s", dir, has_Trailing_sep ? "" : "/", clean_base, ext);
+#endif
+}
+
+static bool export_file_already_exists(const char *filepath) {
+    if (!filepath || !filepath[0]) return false;
+    FILE *f = fopen(filepath, "rb");
+    if (f) {
+        fclose(f);
+        return true;
+    }
+    return false;
+}
+
+// Generates a non-conflicting filename suggestion (e.g. "output_1") when the user clicks [Rename File]
+static void suggest_renamed_export_filename(void) {
+    char base[128];
+    snprintf(base, sizeof(base), "%s", g_export.filename[0] ? g_export.filename : "output");
+    // Strip existing _1, _2 suffix if present
+    size_t len = strlen(base);
+    while (len > 1 && isdigit((unsigned char)base[len - 1])) len--;
+    if (len > 1 && base[len - 1] == '_') base[len - 1] = '\0';
+
+    const char *dir = (g_export.directory[0] != '\0') ? g_export.directory : ".";
+    const char *ext = get_export_ext();
+    for (int n = 1; n < 1000; n++) {
+        char cand_name[128];
+        char cand_path[1024];
+        snprintf(cand_name, sizeof(cand_name), "%.110s_%d", base, n);
+#ifdef _WIN32
+        snprintf(cand_path, sizeof(cand_path), "%s\\%s.%s", dir, cand_name, ext);
+#else
+        snprintf(cand_path, sizeof(cand_path), "%s/%s.%s", dir, cand_name, ext);
+#endif
+        if (!export_file_already_exists(cand_path)) {
+            strncpy(g_export.filename, cand_name, sizeof(g_export.filename) - 1);
+            g_export.filename[sizeof(g_export.filename) - 1] = '\0';
+            return;
+        }
+    }
+}
+
+// Executes the unified Export Media workflow based on all settings in g_export with live progress %, green 100% bar & full stability
 static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
     if (!p) return;
 
@@ -5241,25 +6054,46 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
     mkdir(".cache", 0777);
 #endif
 
-    // Pause live playback and lock out the realtime audio mixer callback during export so file handles never race
+    // Pause live playback and pause SDL audio device during export so file handles and mixer never conflict
     p->is_playing = false;
     g_engine_processing = true;
     if (g_daw.audio_device > 0) {
         SDL_LockAudioDevice(g_daw.audio_device);
+        SDL_PauseAudioDevice(g_daw.audio_device, 1);
         SDL_UnlockAudioDevice(g_daw.audio_device);
     }
 
-    const char *ext = get_export_ext();
+    ensure_all_timeline_video_flags_probed(p);
+
     const char *dir = (g_export.directory[0] != '\0') ? g_export.directory : ".";
-    const char *base = (g_export.filename[0] != '\0') ? g_export.filename : "output";
     ensure_recording_directory_exists(dir);
 
+    char final_path[1024];
+    char clean_base[128];
+    build_clean_export_filepath(final_path, sizeof(final_path), clean_base, sizeof(clean_base));
+
+    // Compute exact export time bounds [exp_start, exp_end]
     double exp_start = 0.0;
     double exp_end = 0.0;
     if (is_range_active()) {
         exp_start = get_range_start();
         exp_end   = get_range_end();
-    } else {
+    } else if (g_export.source == EXPORT_SRC_ITEMS) {
+        double min_s = 1e18, max_e = 0.0;
+        for (int i = 0; i < p->num_items; i++) {
+            if (p->items[i].is_selected) {
+                if (p->items[i].start_time < min_s) min_s = p->items[i].start_time;
+                double ie = p->items[i].start_time + p->items[i].duration;
+                if (ie > max_e) max_e = ie;
+            }
+        }
+        if (max_e > min_s + 0.001) {
+            exp_start = min_s;
+            exp_end   = max_e;
+        }
+    }
+    if (exp_end <= exp_start + 0.001) {
+        exp_start = 0.0;
         for (int i = 0; i < p->num_items; i++) {
             double ie = p->items[i].start_time + p->items[i].duration;
             if (ie > exp_end) exp_end = ie;
@@ -5267,108 +6101,113 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
     }
     if (exp_end <= exp_start + 0.001) exp_end = exp_start + 1.0;
 
+    g_export.overwrite_prompt_open = false;
     g_export.is_rendering = true;
     g_export.render_start_ticks = SDL_GetTicks();
     g_export.last_ui_present_ticks = 0;
     update_export_progress_ui(ren, 0, "Starting export...", true);
 
-    int exported_files = 0;
-    bool needs_mux = (g_export.format != EXPORT_FMT_WAV);
+    bool export_ok = false;
 
-    if (g_export.source == EXPORT_SRC_MASTER) {
-        char final_path[1024];
-        snprintf(final_path, sizeof(final_path), "%s/%s.%s", dir, base, ext);
-
-        const char *wav_target = (g_export.format == EXPORT_FMT_WAV) ? final_path : ".cache/export_tmp_master.wav";
-        int wav_pct_end = needs_mux ? 82 : 100;
-        if (render_range_to_wav_file(p, ren, wav_target, exp_start, exp_end, -1, -1,
-                                     g_export.sample_rate, g_export.channels, g_export.wav_bit_depth,
-                                     g_export.two_pass_render, 0, wav_pct_end)) {
-            finalize_format_from_wav(p, ren, wav_target, final_path, exp_start, exp_end, -1, -1, 85);
-            exported_files++;
-        }
-    } else if (g_export.source == EXPORT_SRC_STEMS) {
-        bool any_trk_sel = false;
-        int total_stems = 0;
-        for (int t = 0; t < p->num_tracks; t++) {
-            if (p->track_selected[t]) any_trk_sel = true;
-        }
-        for (int t = 0; t < p->num_tracks; t++) {
-            if (any_trk_sel && !p->track_selected[t]) continue;
-            total_stems++;
-        }
-        if (total_stems < 1) total_stems = 1;
-        int cur_stem = 0;
-        for (int t = 0; t < p->num_tracks; t++) {
-            if (any_trk_sel && !p->track_selected[t]) continue;
-            int slice_s = (cur_stem * 100) / total_stems;
-            int slice_e = ((cur_stem + 1) * 100) / total_stems;
-            int wav_e = needs_mux ? (slice_s + (slice_e - slice_s) * 80 / 100) : slice_e;
-
-            char final_path[1024];
-            snprintf(final_path, sizeof(final_path), "%s/%s_Track_%d.%s", dir, base, t + 1, ext);
-            const char *wav_target = (g_export.format == EXPORT_FMT_WAV) ? final_path : ".cache/export_tmp_stem.wav";
-            if (render_range_to_wav_file(p, ren, wav_target, exp_start, exp_end, t, -1,
-                                         g_export.sample_rate, g_export.channels, g_export.wav_bit_depth,
-                                         g_export.two_pass_render, slice_s, wav_e)) {
-                finalize_format_from_wav(p, ren, wav_target, final_path, exp_start, exp_end, t, -1, wav_e);
-                exported_files++;
+    if (g_export.format == EXPORT_FMT_WAV) {
+        export_ok = render_range_to_wav_file(
+            p, ren, final_path, exp_start, exp_end, -1, -1,
+            g_export.sample_rate, g_export.channels, g_export.wav_bit_depth,
+            g_export.two_pass_render, 0, 100
+        );
+    } else if (g_export.format == EXPORT_FMT_MP3) {
+        const char *tmp_wav = ".cache/export_tmp_audio.wav";
+        if (render_range_to_wav_file(
+                p, ren, tmp_wav, exp_start, exp_end, -1, -1,
+                g_export.sample_rate, g_export.channels, 24,
+                g_export.two_pass_render, 0, 72)) {
+            update_export_progress_ui(ren, 75, "Encoding MP3 audio...", true);
+            export_ok = encode_wav_to_mp3_native_ffmpeg(
+                ren, tmp_wav, final_path,
+                g_export.sample_rate, g_export.channels, g_export.mp3_bitrate, 75, 100
+            );
+            if (!export_ok) {
+                char cmd[2048];
+                snprintf(cmd, sizeof(cmd),
+                         "ffmpeg -y -loglevel error -i \"%s\" -vn -ar %d -ac %d -b:a %dk \"%s\"",
+                         tmp_wav, g_export.sample_rate, g_export.channels, g_export.mp3_bitrate, final_path);
+                export_ok = (system(cmd) == 0);
             }
-            cur_stem++;
+            remove(tmp_wav);
         }
-    } else if (g_export.source == EXPORT_SRC_ITEMS) {
-        bool any_item_sel = false;
-        int total_items = 0;
-        for (int i = 0; i < p->num_items; i++) {
-            if (p->items[i].is_selected) any_item_sel = true;
+    } else if (g_export.format == EXPORT_FMT_MP4) {
+        const char *tmp_wav = ".cache/export_tmp_video_audio.wav";
+        int w = atoi(g_export.mp4_width_str);
+        int h = atoi(g_export.mp4_height_str);
+        if (w <= 0 || h <= 0) {
+            int p_idx = get_current_mp4_res_preset_idx();
+            w = g_mp4_res_presets[p_idx].width;
+            h = g_mp4_res_presets[p_idx].height;
         }
-        for (int i = 0; i < p->num_items; i++) {
-            if (any_item_sel && !p->items[i].is_selected) continue;
-            total_items++;
-        }
-        if (total_items < 1) total_items = 1;
-        int cur_it = 0;
-        for (int i = 0; i < p->num_items; i++) {
-            if (any_item_sel && !p->items[i].is_selected) continue;
-            AudioItem *it = &p->items[i];
-            double it_s = it->start_time;
-            double it_e = it->start_time + it->duration;
-            if (is_range_active()) {
-                if (it_s < exp_start) it_s = exp_start;
-                if (it_e > exp_end)   it_e = exp_end;
-            }
-            if (it_e <= it_s + 0.001) { cur_it++; continue; }
+        double fps = atof(g_export.mp4_fps_str);
+        int v_kbps = atoi(g_export.mp4_video_kbps_str);
+        int a_kbps = atoi(g_export.mp4_audio_kbps_str);
+        if (fps <= 0.0) fps = 25.0;
+        if (v_kbps <= 0) v_kbps = 2048;
+        if (a_kbps <= 0) a_kbps = 192;
 
-            int slice_s = (cur_it * 100) / total_items;
-            int slice_e = ((cur_it + 1) * 100) / total_items;
-            int wav_e = needs_mux ? (slice_s + (slice_e - slice_s) * 80 / 100) : slice_e;
-
-            char final_path[1024];
-            snprintf(final_path, sizeof(final_path), "%s/%s_Item_%d.%s", dir, base, i + 1, ext);
-            const char *wav_target = (g_export.format == EXPORT_FMT_WAV) ? final_path : ".cache/export_tmp_item.wav";
-            if (render_range_to_wav_file(p, ren, wav_target, it_s, it_e, -1, i,
-                                         g_export.sample_rate, g_export.channels, g_export.wav_bit_depth,
-                                         g_export.two_pass_render, slice_s, wav_e)) {
-                finalize_format_from_wav(p, ren, wav_target, final_path, it_s, it_e, -1, i, wav_e);
-                exported_files++;
+        if (render_range_to_wav_file(
+                p, ren, tmp_wav, exp_start, exp_end, -1, -1,
+                g_export.sample_rate, g_export.channels, 24,
+                g_export.two_pass_render, 0, 30)) {
+            export_ok = render_timeline_mp4_native_ffmpeg(
+                p, ren, tmp_wav, final_path, exp_start, exp_end,
+                w, h, fps, v_kbps, a_kbps,
+                g_export.sample_rate, g_export.channels,
+                g_export.two_pass_render, 30, 100
+            );
+            if (!export_ok) {
+                export_ok = render_timeline_mp4_cli_fallback(
+                    p, ren, tmp_wav, final_path, exp_start, exp_end,
+                    w, h, fps, v_kbps, a_kbps, 40
+                );
             }
-            cur_it++;
+            remove(tmp_wav);
         }
     }
 
+    // Resume SDL audio device cleanly after export finishes
+    if (g_daw.audio_device > 0) {
+        SDL_LockAudioDevice(g_daw.audio_device);
+        SDL_PauseAudioDevice(g_daw.audio_device, 0);
+        SDL_UnlockAudioDevice(g_daw.audio_device);
+    }
     g_engine_processing = false;
     g_export.is_rendering = false;
+
     char done_msg[256];
     double final_time = (double)(SDL_GetTicks() - g_export.render_start_ticks) / 1000.0;
-    if (exported_files > 0) {
+    if (export_ok) {
         snprintf(done_msg, sizeof(done_msg),
-                 "Exported %d file(s) to %s/%s*.%s (100%% in %.2fs)",
-                 exported_files, dir, base, ext, final_time);
+                 "Export completed: %s (100%% in %.2fs)",
+                 final_path, final_time);
+        record_project_change("Exported Media File", false);
     } else {
         snprintf(done_msg, sizeof(done_msg),
-                 "No matching audio/media items found to export.");
+                 "Export failed: Could not write %s", final_path);
     }
-    update_export_progress_ui(ren, exported_files > 0 ? 100 : 0, done_msg, true);
+    update_export_progress_ui(ren, export_ok ? 100 : 0, done_msg, true);
+}
+
+// Checks if the target export file already exists in the destination folder:
+// If it exists, opens the "File Already Exists" modal prompt (Replace Existing File / Rename File / Cancel).
+// Otherwise starts `execute_unified_export` immediately.
+static void request_start_unified_export(ProjectTab *p, SDL_Renderer *ren) {
+    if (!p) return;
+    char target_path[1024];
+    build_clean_export_filepath(target_path, sizeof(target_path), NULL, 0);
+    if (export_file_already_exists(target_path)) {
+        strncpy(g_export.pending_conflict_path, target_path, sizeof(g_export.pending_conflict_path) - 1);
+        g_export.pending_conflict_path[sizeof(g_export.pending_conflict_path) - 1] = '\0';
+        g_export.overwrite_prompt_open = true;
+        return;
+    }
+    execute_unified_export(p, ren);
 }
 
 // Opens Windows save/browse dialog to pick output directory & filename for g_export
@@ -5392,13 +6231,14 @@ static void browse_export_directory_and_filename(void) {
             if (fname[0] != '\0') {
                 strncpy(g_export.filename, fname, sizeof(g_export.filename) - 1);
                 g_export.filename[sizeof(g_export.filename) - 1] = '\0';
-                // Strip extension if user typed one
                 char *dot = strrchr(g_export.filename, '.');
                 if (dot) *dot = '\0';
             }
         } else {
             strncpy(g_export.filename, chosen, sizeof(g_export.filename) - 1);
             g_export.filename[sizeof(g_export.filename) - 1] = '\0';
+            char *dot = strrchr(g_export.filename, '.');
+            if (dot) *dot = '\0';
         }
     }
 }
@@ -7051,6 +7891,7 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
                 strncpy(it->label, ext_label[i], sizeof(it->label) - 1);
                 it->label[sizeof(it->label) - 1] = '\0';
             }
+            if (ext_has_video[i]) it->has_video = true;
             it->is_selected = ext_selected[i];
             set_item_fade_in(p, i, ext_fin[i]);
             set_item_fade_out(p, i, ext_fout[i]);
@@ -7860,6 +8701,485 @@ static inline bool point_in_rect(int x, int y, const SDL_Rect *r) {
 
 // Returns true if any modal popup is open OR if the mouse cursor (mx, my) is over any open popup window or dropdown menu.
 // Used to keep mouse cursor and focus strictly on the active popup/menu and never on the background panel.
+// Renders the Unified Export Media Popup Window (including MP4 Resolution Size dropdown, AAC-only MP4 audio,
+// Green Checkmark on Two-pass render, Green 100% completion progress bar, and "File Already Exists" modal prompt)
+static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
+    if (!g_export.is_open || !ren) return;
+    (void)p;
+    SDL_Rect *er = &g_export.win_rect;
+    int ex = er->x, ey = er->y, ew = er->w, eh = er->h;
+    SDL_Color c_white = { 224, 224, 224, 255 };
+    SDL_Color c_muted = { 130, 130, 130, 255 };
+
+    // Subtle drop shadow
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { ex + 6, ey + 6, ew, eh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    // Window Body
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, er);
+    draw_brown_border_rect(ren, er, true, false);
+
+    // Title Bar
+    SDL_Rect hdr = { ex, ey, ew, 30 };
+    SDL_SetRenderDrawColor(ren, 42, 34, 28, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Export Media", ex + 14, ey + 9, c_white);
+    draw_text(ren, "X", ex + ew - 20, ey + 9, c_white);
+
+    // Time Bounds Indicator in Header
+    char bounds_txt[96];
+    if (is_range_active()) {
+        snprintf(bounds_txt, sizeof(bounds_txt), "Bounds: Cycle Range (%.2fs - %.2fs)",
+                 get_range_start(), get_range_end());
+    } else {
+        snprintf(bounds_txt, sizeof(bounds_txt), "Bounds: Entire Project");
+    }
+    draw_text(ren, bounds_txt, ex + 180, ey + 9, c_muted);
+
+    // ---- 1. SOURCE SECTION ----
+    int sy_src = ey + 48;
+    draw_text(ren, "Source:", ex + 18, sy_src + 7, c_white);
+
+    SDL_Rect b_src_master = { ex + 110, sy_src, 135, 26 };
+    SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_MASTER ? 68 : 38,
+                                g_export.source == EXPORT_SRC_MASTER ? 48 : 36,
+                                g_export.source == EXPORT_SRC_MASTER ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_src_master);
+    draw_brown_border_rect(ren, &b_src_master, g_export.source == EXPORT_SRC_MASTER, false);
+    draw_text(ren, "Master mix", ex + 132, sy_src + 7, c_white);
+
+    SDL_Rect b_src_stems = { ex + 255, sy_src, 210, 26 };
+    SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_STEMS ? 68 : 38,
+                                g_export.source == EXPORT_SRC_STEMS ? 48 : 36,
+                                g_export.source == EXPORT_SRC_STEMS ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_src_stems);
+    draw_brown_border_rect(ren, &b_src_stems, g_export.source == EXPORT_SRC_STEMS, false);
+    draw_text(ren, "Selected tracks (stems)", ex + 266, sy_src + 7, c_white);
+
+    SDL_Rect b_src_items = { ex + 475, sy_src, 187, 26 };
+    SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_ITEMS ? 68 : 38,
+                                g_export.source == EXPORT_SRC_ITEMS ? 48 : 36,
+                                g_export.source == EXPORT_SRC_ITEMS ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_src_items);
+    draw_brown_border_rect(ren, &b_src_items, g_export.source == EXPORT_SRC_ITEMS, false);
+    draw_text(ren, "Selected media items", ex + 486, sy_src + 7, c_white);
+
+    // ---- 2. OUTPUT SECTION (Directory + Browse, File Name) ----
+    int sy_dir = ey + 98;
+    draw_text(ren, "Directory:", ex + 18, sy_dir + 7, c_white);
+
+    SDL_Rect box_dir = { ex + 130, sy_dir, 415, 26 };
+    bool ed_dir = (g_export.active_field == EXP_FIELD_DIR);
+    SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+    SDL_RenderFillRect(ren, &box_dir);
+    draw_brown_border_rect(ren, &box_dir, ed_dir, false);
+    SDL_Rect box_dir_clip = { box_dir.x + 4, box_dir.y + 2, box_dir.w - 8, box_dir.h - 4 };
+    if (ed_dir) {
+        daw_draw_text_edit_overlay(ren, g_export.directory, box_dir.x + 6, box_dir.y, box_dir.h, box_dir.x + box_dir.w - 4);
+    }
+    draw_text_clipped(ren, g_export.directory, box_dir.x + 6, sy_dir + 7, c_white, &box_dir_clip, NULL);
+
+    SDL_Rect btn_browse = { ex + 555, sy_dir, 107, 26 };
+    SDL_SetRenderDrawColor(ren, 52, 40, 30, 255);
+    SDL_RenderFillRect(ren, &btn_browse);
+    draw_brown_border_rect(ren, &btn_browse, false, false);
+    draw_text(ren, "Browse...", ex + 572, sy_dir + 7, c_white);
+
+    int sy_fn = ey + 132;
+    draw_text(ren, "File Name:", ex + 18, sy_fn + 7, c_white);
+
+    SDL_Rect box_fn = { ex + 130, sy_fn, 415, 26 };
+    bool ed_fn = (g_export.active_field == EXP_FIELD_FILENAME);
+    SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+    SDL_RenderFillRect(ren, &box_fn);
+    draw_brown_border_rect(ren, &box_fn, ed_fn, false);
+    SDL_Rect box_fn_clip = { box_fn.x + 4, box_fn.y + 2, box_fn.w - 8, box_fn.h - 4 };
+    if (ed_fn) {
+        daw_draw_text_edit_overlay(ren, g_export.filename, box_fn.x + 6, box_fn.y, box_fn.h, box_fn.x + box_fn.w - 4);
+    }
+    draw_text_clipped(ren, g_export.filename, box_fn.x + 6, sy_fn + 7, c_white, &box_fn_clip, NULL);
+    char ext_preview[16];
+    snprintf(ext_preview, sizeof(ext_preview), ".%s", get_export_ext());
+    draw_text(ren, ext_preview, ex + 555, sy_fn + 7, c_muted);
+
+    // ---- 3. SAMPLE RATE & CHANNELS SECTION ----
+    int sy_sr = ey + 182;
+    draw_text(ren, "Sample Rate:", ex + 18, sy_sr + 7, c_white);
+
+    SDL_Rect b_sr_48 = { ex + 130, sy_sr, 105, 26 };
+    SDL_SetRenderDrawColor(ren, g_export.sample_rate == 48000 ? 68 : 38,
+                                g_export.sample_rate == 48000 ? 48 : 36,
+                                g_export.sample_rate == 48000 ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_sr_48);
+    draw_brown_border_rect(ren, &b_sr_48, g_export.sample_rate == 48000, false);
+    draw_text(ren, "48,000 Hz", ex + 146, sy_sr + 7, c_white);
+
+    SDL_Rect b_sr_44 = { ex + 243, sy_sr, 105, 26 };
+    SDL_SetRenderDrawColor(ren, g_export.sample_rate == 44100 ? 68 : 38,
+                                g_export.sample_rate == 44100 ? 48 : 36,
+                                g_export.sample_rate == 44100 ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_sr_44);
+    draw_brown_border_rect(ren, &b_sr_44, g_export.sample_rate == 44100, false);
+    draw_text(ren, "44,100 Hz", ex + 259, sy_sr + 7, c_white);
+
+    draw_text(ren, "Channels:", ex + 372, sy_sr + 7, c_white);
+
+    SDL_Rect b_ch_mono = { ex + 455, sy_sr, 90, 26 };
+    SDL_SetRenderDrawColor(ren, g_export.channels == 1 ? 68 : 38,
+                                g_export.channels == 1 ? 48 : 36,
+                                g_export.channels == 1 ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_ch_mono);
+    draw_brown_border_rect(ren, &b_ch_mono, g_export.channels == 1, false);
+    draw_text(ren, "Mono", ex + 482, sy_sr + 7, c_white);
+
+    SDL_Rect b_ch_stereo = { ex + 553, sy_sr, 102, 26 };
+    SDL_SetRenderDrawColor(ren, g_export.channels == 2 ? 68 : 38,
+                                g_export.channels == 2 ? 48 : 36,
+                                g_export.channels == 2 ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_ch_stereo);
+    draw_brown_border_rect(ren, &b_ch_stereo, g_export.channels == 2, false);
+    draw_text(ren, "Stereo", ex + 578, sy_sr + 7, c_white);
+
+    // ---- 4. FORMAT SECTION ----
+    int sy_fmt = ey + 232;
+    draw_text(ren, "Format:", ex + 18, sy_fmt + 7, c_white);
+
+    SDL_Rect b_fmt_wav = { ex + 130, sy_fmt, 130, 28 };
+    SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_WAV ? 68 : 38,
+                                g_export.format == EXPORT_FMT_WAV ? 48 : 36,
+                                g_export.format == EXPORT_FMT_WAV ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_fmt_wav);
+    draw_brown_border_rect(ren, &b_fmt_wav, g_export.format == EXPORT_FMT_WAV, false);
+    draw_text(ren, "WAV (PCM)", ex + 158, sy_fmt + 8, c_white);
+
+    SDL_Rect b_fmt_mp3 = { ex + 270, sy_fmt, 130, 28 };
+    SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_MP3 ? 68 : 38,
+                                g_export.format == EXPORT_FMT_MP3 ? 48 : 36,
+                                g_export.format == EXPORT_FMT_MP3 ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_fmt_mp3);
+    draw_brown_border_rect(ren, &b_fmt_mp3, g_export.format == EXPORT_FMT_MP3, false);
+    draw_text(ren, "MP3 Audio", ex + 298, sy_fmt + 8, c_white);
+
+    SDL_Rect b_fmt_mp4 = { ex + 410, sy_fmt, 245, 28 };
+    SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_MP4 ? 68 : 38,
+                                g_export.format == EXPORT_FMT_MP4 ? 48 : 36,
+                                g_export.format == EXPORT_FMT_MP4 ? 32 : 34, 255);
+    SDL_RenderFillRect(ren, &b_fmt_mp4);
+    draw_brown_border_rect(ren, &b_fmt_mp4, g_export.format == EXPORT_FMT_MP4, false);
+    draw_text(ren, "MP4 (MPEG-4 Video)", ex + 455, sy_fmt + 8, c_white);
+
+    // Format Details Sub-Panel (ey + 272 .. ey + 422)
+    SDL_Rect sub_panel = { ex + 18, ey + 272, ew - 36, 152 };
+    SDL_SetRenderDrawColor(ren, 20, 19, 18, 255);
+    SDL_RenderFillRect(ren, &sub_panel);
+    draw_brown_border_rect(ren, &sub_panel, false, true);
+
+    int sy_sub = ey + 278;
+    if (g_export.format == EXPORT_FMT_WAV) {
+        draw_text(ren, "WAV Bit Depth:", ex + 34, sy_sub + 19, c_white);
+
+        SDL_Rect b_w16 = { ex + 150, sy_sub + 12, 130, 28 };
+        SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 16 ? 68 : 38,
+                                    g_export.wav_bit_depth == 16 ? 48 : 36,
+                                    g_export.wav_bit_depth == 16 ? 32 : 34, 255);
+        SDL_RenderFillRect(ren, &b_w16);
+        draw_brown_border_rect(ren, &b_w16, g_export.wav_bit_depth == 16, false);
+        draw_text(ren, "16 bit PCM", ex + 174, sy_sub + 20, c_white);
+
+        SDL_Rect b_w24 = { ex + 292, sy_sub + 12, 130, 28 };
+        SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 24 ? 68 : 38,
+                                    g_export.wav_bit_depth == 24 ? 48 : 36,
+                                    g_export.wav_bit_depth == 24 ? 32 : 34, 255);
+        SDL_RenderFillRect(ren, &b_w24);
+        draw_brown_border_rect(ren, &b_w24, g_export.wav_bit_depth == 24, false);
+        draw_text(ren, "24 bit PCM", ex + 316, sy_sub + 20, c_white);
+
+        SDL_Rect b_w32 = { ex + 434, sy_sub + 12, 130, 28 };
+        SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 32 ? 68 : 38,
+                                    g_export.wav_bit_depth == 32 ? 48 : 36,
+                                    g_export.wav_bit_depth == 32 ? 32 : 34, 255);
+        SDL_RenderFillRect(ren, &b_w32);
+        draw_brown_border_rect(ren, &b_w32, g_export.wav_bit_depth == 32, false);
+        draw_text(ren, "32 bit PCM", ex + 458, sy_sub + 20, c_white);
+
+        draw_text(ren, "Uncompressed studio-quality linear PCM WAVE format.", ex + 34, sy_sub + 62, c_muted);
+    } else if (g_export.format == EXPORT_FMT_MP3) {
+        draw_text(ren, "MP3 Bitrate:", ex + 34, sy_sub + 19, c_white);
+
+        SDL_Rect b_m128 = { ex + 150, sy_sub + 12, 130, 28 };
+        SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 128 ? 68 : 38,
+                                    g_export.mp3_bitrate == 128 ? 48 : 36,
+                                    g_export.mp3_bitrate == 128 ? 32 : 34, 255);
+        SDL_RenderFillRect(ren, &b_m128);
+        draw_brown_border_rect(ren, &b_m128, g_export.mp3_bitrate == 128, false);
+        draw_text(ren, "128 kbps", ex + 182, sy_sub + 20, c_white);
+
+        SDL_Rect b_m192 = { ex + 292, sy_sub + 12, 130, 28 };
+        SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 192 ? 68 : 38,
+                                    g_export.mp3_bitrate == 192 ? 48 : 36,
+                                    g_export.mp3_bitrate == 192 ? 32 : 34, 255);
+        SDL_RenderFillRect(ren, &b_m192);
+        draw_brown_border_rect(ren, &b_m192, g_export.mp3_bitrate == 192, false);
+        draw_text(ren, "192 kbps", ex + 324, sy_sub + 20, c_white);
+
+        SDL_Rect b_m320 = { ex + 434, sy_sub + 12, 130, 28 };
+        SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 320 ? 68 : 38,
+                                    g_export.mp3_bitrate == 320 ? 48 : 36,
+                                    g_export.mp3_bitrate == 320 ? 32 : 34, 255);
+        SDL_RenderFillRect(ren, &b_m320);
+        draw_brown_border_rect(ren, &b_m320, g_export.mp3_bitrate == 320, false);
+        draw_text(ren, "320 kbps", ex + 466, sy_sub + 20, c_white);
+
+        draw_text(ren, "MPEG-1/2 Audio Layer III constant bitrate encoding.", ex + 34, sy_sub + 62, c_muted);
+    } else if (g_export.format == EXPORT_FMT_MP4) {
+        // Row 1: File: [ MPEG-4 ]   Size: [ 1920 x 1080 (Full HD)  v ]   Framerate: [ 25.00 ]
+        int r1_y = sy_sub + 8;
+        draw_text(ren, "File:", ex + 34, r1_y + 7, c_white);
+        SDL_Rect box_mpeg4 = { ex + 92, r1_y, 108, 26 };
+        SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+        SDL_RenderFillRect(ren, &box_mpeg4);
+        draw_brown_border_rect(ren, &box_mpeg4, false, false);
+        draw_text(ren, "MPEG-4", ex + 104, r1_y + 7, c_white);
+
+        // Requirement 4: Video export resolution 'Size:' dropdown menu (default 1920 x 1080 (Full HD))
+        draw_text(ren, "Size:", ex + 212, r1_y + 7, c_white);
+        int cur_res_idx = get_current_mp4_res_preset_idx();
+        SDL_Rect box_size_dd = { ex + 260, r1_y, 206, 26 };
+        SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+        SDL_RenderFillRect(ren, &box_size_dd);
+        draw_brown_border_rect(ren, &box_size_dd, g_export.mp4_size_dropdown_open, false);
+        draw_text(ren, g_mp4_res_presets[cur_res_idx].label, box_size_dd.x + 8, r1_y + 7, c_white);
+        draw_text(ren, "v", box_size_dd.x + box_size_dd.w - 16, r1_y + 7, c_muted);
+
+        draw_text(ren, "Framerate:", ex + 478, r1_y + 7, c_white);
+        SDL_Rect box_fps = { ex + 568, r1_y, 80, 26 };
+        bool ed_fps = (g_export.active_field == EXP_FIELD_MP4_FPS);
+        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+        SDL_RenderFillRect(ren, &box_fps);
+        draw_brown_border_rect(ren, &box_fps, ed_fps, false);
+        if (ed_fps) {
+            daw_draw_text_edit_overlay(ren, g_export.mp4_fps_str, box_fps.x + 8, box_fps.y, box_fps.h, box_fps.x + box_fps.w - 4);
+        }
+        draw_text(ren, g_export.mp4_fps_str, box_fps.x + 8, r1_y + 7, c_white);
+
+        // Row 2: Video: [ H.264 ]   [ 2048 ] kbps
+        int r2_y = sy_sub + 46;
+        draw_text(ren, "Video:", ex + 34, r2_y + 7, c_white);
+        SDL_Rect box_vcodec = { ex + 92, r2_y, 152, 26 };
+        SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+        SDL_RenderFillRect(ren, &box_vcodec);
+        draw_brown_border_rect(ren, &box_vcodec, false, false);
+        draw_text(ren, "H.264", ex + 104, r2_y + 7, c_white);
+
+        SDL_Rect box_vkbps = { ex + 260, r2_y, 100, 26 };
+        bool ed_vk = (g_export.active_field == EXP_FIELD_MP4_V_KBPS);
+        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+        SDL_RenderFillRect(ren, &box_vkbps);
+        draw_brown_border_rect(ren, &box_vkbps, ed_vk, false);
+        if (ed_vk) {
+            daw_draw_text_edit_overlay(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, box_vkbps.y, box_vkbps.h, box_vkbps.x + box_vkbps.w - 4);
+        }
+        draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r2_y + 7, c_white);
+        draw_text(ren, "kbps", ex + 370, r2_y + 7, c_white);
+
+        // Row 3 (Requirement 4): Keep ONLY AAC audio format for MP4 video export
+        int r3_y = sy_sub + 84;
+        draw_text(ren, "Audio:", ex + 34, r3_y + 7, c_white);
+
+        SDL_Rect box_ac_aac = { ex + 92, r3_y, 152, 26 };
+        SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+        SDL_RenderFillRect(ren, &box_ac_aac);
+        draw_brown_border_rect(ren, &box_ac_aac, true, false);
+        draw_text(ren, "AAC", ex + 104, r3_y + 7, c_white);
+
+        SDL_Rect box_akbps = { ex + 260, r3_y, 130, 26 };
+        SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+        SDL_RenderFillRect(ren, &box_akbps);
+        draw_brown_border_rect(ren, &box_akbps, g_export.mp4_aac_dropdown_open, false);
+        char aac_rate_lbl[32];
+        snprintf(aac_rate_lbl, sizeof(aac_rate_lbl), "%s kbps", g_export.mp4_audio_kbps_str);
+        draw_text(ren, aac_rate_lbl, box_akbps.x + 10, r3_y + 7, c_white);
+        draw_text(ren, "v", box_akbps.x + box_akbps.w - 18, r3_y + 7, c_muted);
+    }
+
+    // ---- 5. OPTION: TWO-PASS RENDER CHECKBOX (Requirement 5: Green Right Mark ✓ instead of x) ----
+    int sy_opt = ey + 436;
+    SDL_Rect chk_box = { ex + 22, sy_opt + 2, 20, 20 };
+    SDL_SetRenderDrawColor(ren, g_export.two_pass_render ? 22 : 20,
+                                g_export.two_pass_render ? 44 : 20,
+                                g_export.two_pass_render ? 26 : 20, 255);
+    SDL_RenderFillRect(ren, &chk_box);
+    draw_brown_border_rect(ren, &chk_box, g_export.two_pass_render, false);
+    if (g_export.two_pass_render) {
+        draw_green_checkmark_icon(ren, chk_box.x, chk_box.y, chk_box.w, chk_box.h);
+    }
+    draw_text(ren, "Option: Two-pass render", ex + 50, sy_opt + 6, c_white);
+
+    // ---- 6. PROCESSING PROGRESS BAR, PERCENTAGE (%) & PROCESSING TIME ----
+    // Requirement 6: After export processing completed (100%), processing percentage showing bar is GREEN
+    SDL_Rect bar_bg = { ex + 22, ey + 468, ew - 44, 24 };
+    SDL_SetRenderDrawColor(ren, 16, 15, 14, 255);
+    SDL_RenderFillRect(ren, &bar_bg);
+
+    bool is_done_green = (!g_export.is_rendering && g_export.progress_pct >= 100);
+    int fill_w = ((bar_bg.w - 4) * g_export.progress_pct) / 100;
+    if (fill_w > 0) {
+        SDL_Rect bar_fill = { bar_bg.x + 2, bar_bg.y + 2, fill_w, bar_bg.h - 4 };
+        if (is_done_green) {
+            SDL_SetRenderDrawColor(ren, 38, 178, 72, 255);
+        } else {
+            SDL_SetRenderDrawColor(ren, 195, 128, 54, 255);
+        }
+        SDL_RenderFillRect(ren, &bar_fill);
+    }
+    if (is_done_green) {
+        SDL_SetRenderDrawColor(ren, 62, 224, 98, 255);
+        SDL_RenderDrawRect(ren, &bar_bg);
+        SDL_Rect inner_g = { bar_bg.x + 1, bar_bg.y + 1, bar_bg.w - 2, bar_bg.h - 2 };
+        SDL_RenderDrawRect(ren, &inner_g);
+    } else {
+        draw_brown_border_rect(ren, &bar_bg, g_export.progress_pct > 0, false);
+    }
+
+    char pct_time_buf[160];
+    if (g_export.is_rendering) {
+        snprintf(pct_time_buf, sizeof(pct_time_buf),
+                 "Processing: %d%%   |   Time: %.2fs   |   Remaining: ~%.2fs",
+                 g_export.progress_pct, g_export.elapsed_sec, g_export.est_remaining_sec);
+    } else if (g_export.progress_pct >= 100) {
+        snprintf(pct_time_buf, sizeof(pct_time_buf),
+                 "Completed: 100%%   |   Processing Time: %.2fs",
+                 g_export.elapsed_sec);
+    } else {
+        snprintf(pct_time_buf, sizeof(pct_time_buf),
+                 "Progress: %d%%   |   Processing Time: %.2fs",
+                 g_export.progress_pct, g_export.elapsed_sec);
+    }
+    draw_text(ren, pct_time_buf, bar_bg.x + 12, bar_bg.y + 6, c_white);
+
+    if (g_export.status_msg[0] != 0) {
+        SDL_Rect st_clip = { ex + 22, ey + 498, ew - 44, 22 };
+        SDL_Color st_col = is_done_green ? (SDL_Color){ 88, 232, 118, 255 } : c_muted;
+        draw_text_clipped(ren, g_export.status_msg, ex + 22, ey + 500, st_col, &st_clip, NULL);
+    }
+
+    // ---- 7. BOTTOM ACTION BUTTONS ----
+    int btn_y = ey + eh - 44;
+    SDL_Rect btn_render = { ex + ew - 270, btn_y, 145, 32 };
+    SDL_SetRenderDrawColor(ren, 78, 52, 32, 255);
+    SDL_RenderFillRect(ren, &btn_render);
+    draw_brown_border_rect(ren, &btn_render, true, false);
+    draw_text(ren, "Render / Export", ex + ew - 258, btn_y + 10, c_white);
+
+    SDL_Rect btn_close = { ex + ew - 115, btn_y, 95, 32 };
+    SDL_SetRenderDrawColor(ren, 44, 40, 38, 255);
+    SDL_RenderFillRect(ren, &btn_close);
+    draw_brown_border_rect(ren, &btn_close, false, false);
+    draw_text(ren, "Cancel", ex + ew - 92, btn_y + 10, c_white);
+
+    // ---- 8. DROPDOWN OVERLAYS (Drawn after main controls so they appear on top of everything) ----
+    if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
+        int dd_x = ex + 260;
+        int dd_y = sy_sub + 84 + 26;
+        int dd_w = 130;
+        SDL_Rect dd_box = { dd_x, dd_y, dd_w, 78 };
+        SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+        SDL_RenderFillRect(ren, &dd_box);
+        draw_brown_border_rect(ren, &dd_box, true, false);
+
+        const char *rates[3] = { "120", "192", "320" };
+        const char *rate_labels[3] = { "120 kbps", "192 kbps", "320 kbps" };
+        for (int r_i = 0; r_i < 3; r_i++) {
+            bool is_cur = (strcmp(g_export.mp4_audio_kbps_str, rates[r_i]) == 0);
+            SDL_Rect r_item = { dd_x + 2, dd_y + r_i * 26 + 2, dd_w - 4, 22 };
+            SDL_SetRenderDrawColor(ren, is_cur ? 68 : 30, is_cur ? 48 : 28, is_cur ? 32 : 26, 255);
+            SDL_RenderFillRect(ren, &r_item);
+            draw_brown_border_rect(ren, &r_item, is_cur, !is_cur);
+            draw_text(ren, rate_labels[r_i], dd_x + 12, dd_y + r_i * 26 + 7, c_white);
+        }
+    }
+
+    if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_size_dropdown_open) {
+        int sdd_x = ex + 260;
+        int sdd_y = sy_sub + 8 + 26;
+        int sdd_w = 206;
+        int sdd_h = NUM_MP4_RES_PRESETS * 26 + 4;
+        SDL_Rect sdd_box = { sdd_x, sdd_y, sdd_w, sdd_h };
+        SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+        SDL_RenderFillRect(ren, &sdd_box);
+        draw_brown_border_rect(ren, &sdd_box, true, false);
+
+        int cur_res = get_current_mp4_res_preset_idx();
+        for (int ri = 0; ri < NUM_MP4_RES_PRESETS; ri++) {
+            bool is_cur = (ri == cur_res);
+            SDL_Rect r_item = { sdd_x + 2, sdd_y + 2 + ri * 26, sdd_w - 4, 24 };
+            SDL_SetRenderDrawColor(ren, is_cur ? 68 : 30, is_cur ? 48 : 28, is_cur ? 32 : 26, 255);
+            SDL_RenderFillRect(ren, &r_item);
+            draw_brown_border_rect(ren, &r_item, is_cur, !is_cur);
+            draw_text(ren, g_mp4_res_presets[ri].label, sdd_x + 10, sdd_y + 8 + ri * 26, c_white);
+        }
+    }
+
+    // ---- 9. REQUIREMENT 3: "FILE ALREADY EXISTS" MODAL PROMPT (Replace Existing File / Rename File / Cancel) ----
+    if (g_export.overwrite_prompt_open) {
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        SDL_Rect dim = { ex, ey, ew, eh };
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+        SDL_RenderFillRect(ren, &dim);
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+        int mw = 500, mh = 166;
+        int mx_box = ex + (ew - mw) / 2;
+        int my_box = ey + (eh - mh) / 2;
+
+        SDL_Rect mbox = { mx_box, my_box, mw, mh };
+        SDL_SetRenderDrawColor(ren, 30, 26, 24, 255);
+        SDL_RenderFillRect(ren, &mbox);
+        draw_brown_border_rect(ren, &mbox, true, false);
+
+        SDL_Rect mhdr = { mx_box, my_box, mw, 28 };
+        SDL_SetRenderDrawColor(ren, 52, 38, 28, 255);
+        SDL_RenderFillRect(ren, &mhdr);
+        draw_brown_border_rect(ren, &mhdr, false, false);
+        draw_text(ren, "File Already Exists", mx_box + 14, my_box + 8, c_white);
+        draw_text(ren, "X", mx_box + mw - 20, my_box + 8, c_white);
+
+        char msg1[256];
+        snprintf(msg1, sizeof(msg1), "\"%s.%s\" already exists in this folder.",
+                 g_export.filename[0] ? g_export.filename : "output", get_export_ext());
+        SDL_Rect m1_clip = { mx_box + 16, my_box + 40, mw - 32, 20 };
+        draw_text_clipped(ren, msg1, mx_box + 16, my_box + 42, c_white, &m1_clip, NULL);
+        draw_text(ren, "Would you like to replace the existing file or rename it?", mx_box + 16, my_box + 68, c_muted);
+
+        int mby = my_box + mh - 44;
+        // [Replace Existing File]
+        SDL_Rect b_rep = { mx_box + 16, mby, 186, 30 };
+        SDL_SetRenderDrawColor(ren, 88, 54, 30, 255);
+        SDL_RenderFillRect(ren, &b_rep);
+        draw_brown_border_rect(ren, &b_rep, true, false);
+        draw_text(ren, "Replace Existing File", b_rep.x + 10, mby + 9, c_white);
+
+        // [Rename File]
+        SDL_Rect b_ren = { mx_box + 214, mby, 146, 30 };
+        SDL_SetRenderDrawColor(ren, 42, 68, 48, 255);
+        SDL_RenderFillRect(ren, &b_ren);
+        draw_brown_border_rect(ren, &b_ren, true, false);
+        draw_text(ren, "Rename File", b_ren.x + 29, mby + 9, c_white);
+
+        // [Cancel]
+        SDL_Rect b_can = { mx_box + 372, mby, 112, 30 };
+        SDL_SetRenderDrawColor(ren, 46, 42, 38, 255);
+        SDL_RenderFillRect(ren, &b_can);
+        draw_brown_border_rect(ren, &b_can, false, false);
+        draw_text(ren, "Cancel", b_can.x + 32, mby + 9, c_white);
+    }
+}
+
 static bool is_processing_blocking_input(void) {
     return (g_engine_processing || g_processing_popup_open || g_export.is_rendering ||
             g_daw.save_prompt_open || g_track_delete_prompt_open);
@@ -7906,19 +9226,18 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
     if (g_script_popup.is_open && point_in_rect(mx, my, &g_script_popup.win_rect)) return true;
 
     if (g_export.is_open && point_in_rect(mx, my, &g_export.win_rect)) {
-        if (out_cursor) {
+        if (out_cursor && !g_export.overwrite_prompt_open) {
             int ex = g_export.win_rect.x, ey = g_export.win_rect.y;
             bool over_text = false;
             if (my >= ey + 98 && my <= ey + 124 && mx >= ex + 130 && mx <= ex + 545) over_text = true;
             else if (my >= ey + 132 && my <= ey + 158 && mx >= ex + 130 && mx <= ex + 545) over_text = true;
-            else if (g_export.format == EXPORT_FMT_MP4 && !g_export.mp4_aac_dropdown_open) {
+            else if (g_export.format == EXPORT_FMT_MP4 && !g_export.mp4_aac_dropdown_open && !g_export.mp4_size_dropdown_open) {
                 int sy_sub = ey + 278;
                 int r1_y = sy_sub + 8;
                 int r2_y = sy_sub + 46;
-                if (my >= r1_y && my <= r1_y + 26 &&
-                    ((mx >= ex + 295 && mx <= ex + 365) || (mx >= ex + 390 && mx <= ex + 460) || (mx >= ex + 568 && mx <= ex + 648))) {
+                if (my >= r1_y && my <= r1_y + 26 && (mx >= ex + 568 && mx <= ex + 648)) {
                     over_text = true;
-                } else if (my >= r2_y && my <= r2_y + 26 && mx >= ex + 295 && mx <= ex + 395) {
+                } else if (my >= r2_y && my <= r2_y + 26 && (mx >= ex + 260 && mx <= ex + 360)) {
                     over_text = true;
                 }
             }
@@ -8493,7 +9812,16 @@ int main(int argc, char *argv[]) {
                     }
                     continue;
                 }
-                if (g_export.is_open && (g_export.active_field != EXP_FIELD_NONE || point_in_rect(kmx, kmy, &g_export.win_rect))) {
+                if (g_export.is_open && (g_export.overwrite_prompt_open || g_export.active_field != EXP_FIELD_NONE || point_in_rect(kmx, kmy, &g_export.win_rect))) {
+                    if (g_export.overwrite_prompt_open) {
+                        if (e.key.keysym.sym == SDLK_ESCAPE) {
+                            g_export.overwrite_prompt_open = false;
+                        } else if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                            g_export.overwrite_prompt_open = false;
+                            execute_unified_export(p, ren);
+                        }
+                        continue;
+                    }
                     if (g_export.active_field != EXP_FIELD_NONE) {
                         size_t max_len = 0;
                         char *buf = get_active_export_field_buf(&max_len);
@@ -8504,7 +9832,12 @@ int main(int argc, char *argv[]) {
                             daw_text_edit_handle_keydown(buf, max_len, e.key.keysym.sym, mod);
                         }
                     } else if (e.key.keysym.sym == SDLK_ESCAPE) {
-                        g_export.is_open = false;
+                        if (g_export.mp4_size_dropdown_open || g_export.mp4_aac_dropdown_open) {
+                            g_export.mp4_size_dropdown_open = false;
+                            g_export.mp4_aac_dropdown_open = false;
+                        } else {
+                            g_export.is_open = false;
+                        }
                     }
                     continue;
                 }
@@ -9192,6 +10525,39 @@ int main(int argc, char *argv[]) {
                     SDL_Rect *er = &g_export.win_rect;
                     int ex = er->x, ey = er->y, ew = er->w, eh = er->h;
 
+                    // Handle "File Already Exists" modal prompt first if open
+                    if (g_export.overwrite_prompt_open) {
+                        int mw = 500, mh = 166;
+                        int mx_box = ex + (ew - mw) / 2;
+                        int my_box = ey + (eh - mh) / 2;
+                        int mby = my_box + mh - 44;
+
+                        // Close [X] on modal header
+                        if (my >= my_box && my <= my_box + 28 && mx >= mx_box + mw - 28 && mx <= mx_box + mw) {
+                            g_export.overwrite_prompt_open = false;
+                            continue;
+                        }
+                        if (my >= mby && my <= mby + 30) {
+                            if (mx >= mx_box + 16 && mx <= mx_box + 202) {
+                                // [Replace Existing File]
+                                g_export.overwrite_prompt_open = false;
+                                save_themes_settings_json();
+                                execute_unified_export(p, ren);
+                            } else if (mx >= mx_box + 214 && mx <= mx_box + 360) {
+                                // [Rename File] -> Suggest non-conflicting name and focus File Name input box
+                                g_export.overwrite_prompt_open = false;
+                                suggest_renamed_export_filename();
+                                g_export.active_field = EXP_FIELD_FILENAME;
+                                daw_text_edit_focus_buf(g_export.filename, true);
+                                SDL_StartTextInput();
+                            } else if (mx >= mx_box + 372 && mx <= mx_box + 484) {
+                                // [Cancel]
+                                g_export.overwrite_prompt_open = false;
+                            }
+                        }
+                        continue;
+                    }
+
                     // Stop any previous text input unless a field is clicked below
                     g_export.active_field = EXP_FIELD_NONE;
                     SDL_StopTextInput();
@@ -9200,6 +10566,8 @@ int main(int argc, char *argv[]) {
                     if (mx >= ex && mx <= ex + ew && my >= ey && my <= ey + 30) {
                         if (mx >= ex + ew - 34) {
                             g_export.mp4_aac_dropdown_open = false;
+                            g_export.mp4_size_dropdown_open = false;
+                            g_export.overwrite_prompt_open = false;
                             g_export.is_open = false;
                             save_themes_settings_json();
                         } else {
@@ -9211,11 +10579,31 @@ int main(int argc, char *argv[]) {
                     }
 
                     if (mx >= ex && mx <= ex + ew && my >= ey + 30 && my <= ey + eh) {
-                        // First check open MP4 AAC bitrate dropdown menu so it never gets swallowed by rows underneath!
                         int sy_sub = ey + 278;
+                        int r1_y = sy_sub + 8;
+                        int r2_y = sy_sub + 46;
                         int r3_y = sy_sub + 84;
+
+                        // Check open MP4 Size Resolution Dropdown Menu first so it never gets swallowed by rows underneath!
+                        if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_size_dropdown_open) {
+                            int sdd_x = ex + 260;
+                            int sdd_y = r1_y + 26;
+                            int sdd_w = 206;
+                            int sdd_h = NUM_MP4_RES_PRESETS * 26 + 4;
+                            if (mx >= sdd_x && mx <= sdd_x + sdd_w && my >= sdd_y && my <= sdd_y + sdd_h) {
+                                int sel_idx = (my - (sdd_y + 2)) / 26;
+                                if (sel_idx >= 0 && sel_idx < NUM_MP4_RES_PRESETS) {
+                                    apply_mp4_res_preset(sel_idx);
+                                }
+                                g_export.mp4_size_dropdown_open = false;
+                                continue;
+                            }
+                            g_export.mp4_size_dropdown_open = false;
+                        }
+
+                        // Check open MP4 AAC bitrate dropdown menu
                         if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
-                            int dd_x = ex + 295;
+                            int dd_x = ex + 260;
                             int dd_y = r3_y + 26;
                             int dd_w = 130;
                             if (mx >= dd_x && mx <= dd_x + dd_w && my >= dd_y && my <= dd_y + 78) {
@@ -9278,11 +10666,14 @@ int main(int argc, char *argv[]) {
                             if (mx >= ex + 128 && mx <= ex + 262) {
                                 g_export.format = EXPORT_FMT_WAV;
                                 g_export.mp4_aac_dropdown_open = false;
+                                g_export.mp4_size_dropdown_open = false;
                             } else if (mx >= ex + 268 && mx <= ex + 402) {
                                 g_export.format = EXPORT_FMT_MP3;
                                 g_export.mp4_aac_dropdown_open = false;
+                                g_export.mp4_size_dropdown_open = false;
                             } else if (mx >= ex + 408 && mx <= ex + 658) {
                                 g_export.format = EXPORT_FMT_MP4;
+                                g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
                             }
                             continue;
                         }
@@ -9303,29 +10694,11 @@ int main(int argc, char *argv[]) {
                                 continue;
                             }
                         } else if (g_export.format == EXPORT_FMT_MP4) {
-                            // Row 1: File: [MPEG-4]  Size: [1920] x [1080]  Framerate: [25.00]
-                            int r1_y = sy_sub + 8;
+                            // Row 1: File: [MPEG-4]  Size: [ 1920 x 1080 (Full HD) v ]  Framerate: [25.00]
                             if (my >= r1_y - 2 && my <= r1_y + 28) {
-                                if (mx >= ex + 90 && mx <= ex + 230) {
-                                    // Clicking File [MPEG-4] cycles common resolution presets (1080p -> 720p -> 4K)
-                                    if (strcmp(g_export.mp4_width_str, "1920") == 0) {
-                                        strcpy(g_export.mp4_width_str, "1280");
-                                        strcpy(g_export.mp4_height_str, "720");
-                                    } else if (strcmp(g_export.mp4_width_str, "1280") == 0) {
-                                        strcpy(g_export.mp4_width_str, "3840");
-                                        strcpy(g_export.mp4_height_str, "2160");
-                                    } else {
-                                        strcpy(g_export.mp4_width_str, "1920");
-                                        strcpy(g_export.mp4_height_str, "1080");
-                                    }
-                                } else if (mx >= ex + 293 && mx <= ex + 367) {
-                                    g_export.active_field = EXP_FIELD_MP4_WIDTH;
-                                    daw_text_edit_click_cursor(g_export.mp4_width_str, mx, ex + 303);
-                                    SDL_StartTextInput();
-                                } else if (mx >= ex + 388 && mx <= ex + 462) {
-                                    g_export.active_field = EXP_FIELD_MP4_HEIGHT;
-                                    daw_text_edit_click_cursor(g_export.mp4_height_str, mx, ex + 398);
-                                    SDL_StartTextInput();
+                                if (mx >= ex + 260 && mx <= ex + 466) {
+                                    g_export.mp4_size_dropdown_open = !g_export.mp4_size_dropdown_open;
+                                    g_export.mp4_aac_dropdown_open = false;
                                 } else if (mx >= ex + 566 && mx <= ex + 650) {
                                     g_export.active_field = EXP_FIELD_MP4_FPS;
                                     daw_text_edit_click_cursor(g_export.mp4_fps_str, mx, ex + 576);
@@ -9334,30 +10707,26 @@ int main(int argc, char *argv[]) {
                                 continue;
                             }
                             // Row 2: Video: [H.264]  [2048] kbps
-                            int r2_y = sy_sub + 46;
                             if (my >= r2_y - 2 && my <= r2_y + 28) {
-                                if (mx >= ex + 90 && mx <= ex + 270) {
-                                    // Clicking Video [H.264] box cycles standard video bitrates (2048 -> 4096 -> 8192 -> 1024)
+                                if (mx >= ex + 90 && mx <= ex + 244) {
                                     int vk = atoi(g_export.mp4_video_kbps_str);
                                     if (vk < 2048) strcpy(g_export.mp4_video_kbps_str, "2048");
                                     else if (vk < 4096) strcpy(g_export.mp4_video_kbps_str, "4096");
                                     else if (vk < 8192) strcpy(g_export.mp4_video_kbps_str, "8192");
                                     else strcpy(g_export.mp4_video_kbps_str, "1024");
-                                } else if (mx >= ex + 293 && mx <= ex + 398) {
+                                } else if (mx >= ex + 260 && mx <= ex + 362) {
                                     g_export.active_field = EXP_FIELD_MP4_V_KBPS;
-                                    daw_text_edit_click_cursor(g_export.mp4_video_kbps_str, mx, ex + 303);
+                                    daw_text_edit_click_cursor(g_export.mp4_video_kbps_str, mx, ex + 268);
                                     SDL_StartTextInput();
                                 }
                                 continue;
                             }
-                            // Row 3: Audio: [AAC / MP3 / WAV]  [ 120 / 192 / 320 kbps v ] dropdown menu
+                            // Row 3: Audio: [ AAC ] (fixed to AAC only)  [ 120 / 192 / 320 kbps v ] dropdown menu
                             if (my >= r3_y - 2 && my <= r3_y + 28) {
-                                if (mx >= ex + 90 && mx <= ex + 270) {
-                                    g_export.mp4_audio_codec = (ExportMp4AudioCodec)(((int)g_export.mp4_audio_codec + 1) % 3);
-                                    continue;
-                                }
-                                if (mx >= ex + 293 && mx <= ex + 428) {
+                                g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
+                                if (mx >= ex + 260 && mx <= ex + 392) {
                                     g_export.mp4_aac_dropdown_open = !g_export.mp4_aac_dropdown_open;
+                                    g_export.mp4_size_dropdown_open = false;
                                     continue;
                                 }
                             }
@@ -9375,9 +10744,11 @@ int main(int argc, char *argv[]) {
                         if (my >= btn_y - 2 && my <= btn_y + 34) {
                             if (mx >= ex + ew - 272 && mx <= ex + ew - 123) {
                                 save_themes_settings_json();
-                                execute_unified_export(p, ren);
+                                request_start_unified_export(p, ren);
                             } else if (mx >= ex + ew - 117 && mx <= ex + ew - 18) {
                                 g_export.mp4_aac_dropdown_open = false;
+                                g_export.mp4_size_dropdown_open = false;
+                                g_export.overwrite_prompt_open = false;
                                 g_export.is_open = false;
                                 save_themes_settings_json();
                             }
@@ -10062,6 +11433,8 @@ int main(int argc, char *argv[]) {
                             g_export.elapsed_sec = 0.0;
                             g_export.est_remaining_sec = 0.0;
                             g_export.mp4_aac_dropdown_open = false;
+                            g_export.mp4_size_dropdown_open = false;
+                            g_export.overwrite_prompt_open = false;
                             g_export.status_msg[0] = '\0';
                             g_daw.menu_file_open = false;
                             g_daw.submenu_export_audio_open = false;
@@ -11878,6 +13251,7 @@ int main(int argc, char *argv[]) {
         if (win_w > 0 && win_h > 0 && (!g_timeline_cache_tex || g_timeline_cache_w != win_w || g_timeline_cache_h != win_h)) {
             if (g_timeline_cache_tex) SDL_DestroyTexture(g_timeline_cache_tex);
             g_timeline_cache_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, win_w, win_h);
+            g_active_tl_cache_tex = g_timeline_cache_tex;
             g_timeline_cache_w = win_w;
             g_timeline_cache_h = win_h;
             g_timeline_cache_hash = 0;
@@ -12847,407 +14221,7 @@ int main(int argc, char *argv[]) {
 
         // ================= UNIFIED EXPORT MEDIA POPUP WINDOW =================
         if (g_export.is_open) {
-            SDL_Rect *er = &g_export.win_rect;
-            int ex = er->x, ey = er->y, ew = er->w, eh = er->h;
-
-            // Subtle drop shadow
-            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-            SDL_Rect shadow = { ex + 6, ey + 6, ew, eh };
-            SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
-            SDL_RenderFillRect(ren, &shadow);
-            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
-
-            // Window Body
-            SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
-            SDL_RenderFillRect(ren, er);
-            draw_brown_border_rect(ren, er, true, false);
-
-            // Title Bar
-            SDL_Rect hdr = { ex, ey, ew, 30 };
-            SDL_SetRenderDrawColor(ren, 42, 34, 28, 255);
-            SDL_RenderFillRect(ren, &hdr);
-            draw_brown_border_rect(ren, &hdr, false, false);
-            draw_text(ren, "Export Media", ex + 14, ey + 9, c_white);
-            draw_text(ren, "X", ex + ew - 20, ey + 9, c_white);
-
-            // Time Bounds Indicator in Header
-            char bounds_txt[96];
-            if (is_range_active()) {
-                snprintf(bounds_txt, sizeof(bounds_txt), "Bounds: Cycle Range (%.2fs - %.2fs)",
-                         get_range_start(), get_range_end());
-            } else {
-                snprintf(bounds_txt, sizeof(bounds_txt), "Bounds: Entire Project");
-            }
-            draw_text(ren, bounds_txt, ex + 180, ey + 9, c_muted);
-
-            // ---- 1. SOURCE SECTION ----
-            int sy_src = ey + 48;
-            draw_text(ren, "Source:", ex + 18, sy_src + 7, c_white);
-
-            SDL_Rect b_src_master = { ex + 110, sy_src, 135, 26 };
-            SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_MASTER ? 68 : 38,
-                                        g_export.source == EXPORT_SRC_MASTER ? 48 : 36,
-                                        g_export.source == EXPORT_SRC_MASTER ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_src_master);
-            draw_brown_border_rect(ren, &b_src_master, g_export.source == EXPORT_SRC_MASTER, false);
-            draw_text(ren, "Master mix", ex + 132, sy_src + 7, c_white);
-
-            SDL_Rect b_src_stems = { ex + 255, sy_src, 210, 26 };
-            SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_STEMS ? 68 : 38,
-                                        g_export.source == EXPORT_SRC_STEMS ? 48 : 36,
-                                        g_export.source == EXPORT_SRC_STEMS ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_src_stems);
-            draw_brown_border_rect(ren, &b_src_stems, g_export.source == EXPORT_SRC_STEMS, false);
-            draw_text(ren, "Selected tracks (stems)", ex + 266, sy_src + 7, c_white);
-
-            SDL_Rect b_src_items = { ex + 475, sy_src, 187, 26 };
-            SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_ITEMS ? 68 : 38,
-                                        g_export.source == EXPORT_SRC_ITEMS ? 48 : 36,
-                                        g_export.source == EXPORT_SRC_ITEMS ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_src_items);
-            draw_brown_border_rect(ren, &b_src_items, g_export.source == EXPORT_SRC_ITEMS, false);
-            draw_text(ren, "Selected media items", ex + 486, sy_src + 7, c_white);
-
-            // ---- 2. OUTPUT SECTION (Directory + Browse, File Name) ----
-            int sy_dir = ey + 98;
-            draw_text(ren, "Directory:", ex + 18, sy_dir + 7, c_white);
-
-            SDL_Rect box_dir = { ex + 130, sy_dir, 415, 26 };
-            bool ed_dir = (g_export.active_field == EXP_FIELD_DIR);
-            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-            SDL_RenderFillRect(ren, &box_dir);
-            draw_brown_border_rect(ren, &box_dir, ed_dir, false);
-            SDL_Rect box_dir_clip = { box_dir.x + 4, box_dir.y + 2, box_dir.w - 8, box_dir.h - 4 };
-            if (ed_dir) {
-                daw_draw_text_edit_overlay(ren, g_export.directory, box_dir.x + 6, box_dir.y, box_dir.h, box_dir.x + box_dir.w - 4);
-            }
-            draw_text_clipped(ren, g_export.directory, box_dir.x + 6, sy_dir + 7, c_white, &box_dir_clip, NULL);
-
-            SDL_Rect btn_browse = { ex + 555, sy_dir, 107, 26 };
-            SDL_SetRenderDrawColor(ren, 52, 40, 30, 255);
-            SDL_RenderFillRect(ren, &btn_browse);
-            draw_brown_border_rect(ren, &btn_browse, false, false);
-            draw_text(ren, "Browse...", ex + 572, sy_dir + 7, c_white);
-
-            int sy_fn = ey + 132;
-            draw_text(ren, "File Name:", ex + 18, sy_fn + 7, c_white);
-
-            SDL_Rect box_fn = { ex + 130, sy_fn, 415, 26 };
-            bool ed_fn = (g_export.active_field == EXP_FIELD_FILENAME);
-            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-            SDL_RenderFillRect(ren, &box_fn);
-            draw_brown_border_rect(ren, &box_fn, ed_fn, false);
-            SDL_Rect box_fn_clip = { box_fn.x + 4, box_fn.y + 2, box_fn.w - 8, box_fn.h - 4 };
-            if (ed_fn) {
-                daw_draw_text_edit_overlay(ren, g_export.filename, box_fn.x + 6, box_fn.y, box_fn.h, box_fn.x + box_fn.w - 4);
-            }
-            draw_text_clipped(ren, g_export.filename, box_fn.x + 6, sy_fn + 7, c_white, &box_fn_clip, NULL);
-            char ext_preview[16];
-            snprintf(ext_preview, sizeof(ext_preview), ".%s", get_export_ext());
-            draw_text(ren, ext_preview, ex + 555, sy_fn + 7, c_muted);
-
-            // ---- 3. SAMPLE RATE & CHANNELS SECTION ----
-            int sy_sr = ey + 182;
-            draw_text(ren, "Sample Rate:", ex + 18, sy_sr + 7, c_white);
-
-            SDL_Rect b_sr_48 = { ex + 130, sy_sr, 105, 26 };
-            SDL_SetRenderDrawColor(ren, g_export.sample_rate == 48000 ? 68 : 38,
-                                        g_export.sample_rate == 48000 ? 48 : 36,
-                                        g_export.sample_rate == 48000 ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_sr_48);
-            draw_brown_border_rect(ren, &b_sr_48, g_export.sample_rate == 48000, false);
-            draw_text(ren, "48,000 Hz", ex + 146, sy_sr + 7, c_white);
-
-            SDL_Rect b_sr_44 = { ex + 243, sy_sr, 105, 26 };
-            SDL_SetRenderDrawColor(ren, g_export.sample_rate == 44100 ? 68 : 38,
-                                        g_export.sample_rate == 44100 ? 48 : 36,
-                                        g_export.sample_rate == 44100 ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_sr_44);
-            draw_brown_border_rect(ren, &b_sr_44, g_export.sample_rate == 44100, false);
-            draw_text(ren, "44,100 Hz", ex + 259, sy_sr + 7, c_white);
-
-            draw_text(ren, "Channels:", ex + 372, sy_sr + 7, c_white);
-
-            SDL_Rect b_ch_mono = { ex + 455, sy_sr, 90, 26 };
-            SDL_SetRenderDrawColor(ren, g_export.channels == 1 ? 68 : 38,
-                                        g_export.channels == 1 ? 48 : 36,
-                                        g_export.channels == 1 ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_ch_mono);
-            draw_brown_border_rect(ren, &b_ch_mono, g_export.channels == 1, false);
-            draw_text(ren, "Mono", ex + 482, sy_sr + 7, c_white);
-
-            SDL_Rect b_ch_stereo = { ex + 553, sy_sr, 102, 26 };
-            SDL_SetRenderDrawColor(ren, g_export.channels == 2 ? 68 : 38,
-                                        g_export.channels == 2 ? 48 : 36,
-                                        g_export.channels == 2 ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_ch_stereo);
-            draw_brown_border_rect(ren, &b_ch_stereo, g_export.channels == 2, false);
-            draw_text(ren, "Stereo", ex + 578, sy_sr + 7, c_white);
-
-            // ---- 4. FORMAT SECTION ----
-            int sy_fmt = ey + 232;
-            draw_text(ren, "Format:", ex + 18, sy_fmt + 7, c_white);
-
-            SDL_Rect b_fmt_wav = { ex + 130, sy_fmt, 130, 28 };
-            SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_WAV ? 68 : 38,
-                                        g_export.format == EXPORT_FMT_WAV ? 48 : 36,
-                                        g_export.format == EXPORT_FMT_WAV ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_fmt_wav);
-            draw_brown_border_rect(ren, &b_fmt_wav, g_export.format == EXPORT_FMT_WAV, false);
-            draw_text(ren, "WAV (PCM)", ex + 158, sy_fmt + 8, c_white);
-
-            SDL_Rect b_fmt_mp3 = { ex + 270, sy_fmt, 130, 28 };
-            SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_MP3 ? 68 : 38,
-                                        g_export.format == EXPORT_FMT_MP3 ? 48 : 36,
-                                        g_export.format == EXPORT_FMT_MP3 ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_fmt_mp3);
-            draw_brown_border_rect(ren, &b_fmt_mp3, g_export.format == EXPORT_FMT_MP3, false);
-            draw_text(ren, "MP3 Audio", ex + 298, sy_fmt + 8, c_white);
-
-            SDL_Rect b_fmt_mp4 = { ex + 410, sy_fmt, 245, 28 };
-            SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_MP4 ? 68 : 38,
-                                        g_export.format == EXPORT_FMT_MP4 ? 48 : 36,
-                                        g_export.format == EXPORT_FMT_MP4 ? 32 : 34, 255);
-            SDL_RenderFillRect(ren, &b_fmt_mp4);
-            draw_brown_border_rect(ren, &b_fmt_mp4, g_export.format == EXPORT_FMT_MP4, false);
-            draw_text(ren, "MP4 (MPEG-4 Video)", ex + 455, sy_fmt + 8, c_white);
-
-            // Format Details Sub-Panel (ey + 272 .. ey + 422)
-            SDL_Rect sub_panel = { ex + 18, ey + 272, ew - 36, 152 };
-            SDL_SetRenderDrawColor(ren, 20, 19, 18, 255);
-            SDL_RenderFillRect(ren, &sub_panel);
-            draw_brown_border_rect(ren, &sub_panel, false, true);
-
-            int sy_sub = ey + 278;
-            if (g_export.format == EXPORT_FMT_WAV) {
-                draw_text(ren, "WAV Bit Depth:", ex + 34, sy_sub + 19, c_white);
-
-                SDL_Rect b_w16 = { ex + 150, sy_sub + 12, 130, 28 };
-                SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 16 ? 68 : 38,
-                                            g_export.wav_bit_depth == 16 ? 48 : 36,
-                                            g_export.wav_bit_depth == 16 ? 32 : 34, 255);
-                SDL_RenderFillRect(ren, &b_w16);
-                draw_brown_border_rect(ren, &b_w16, g_export.wav_bit_depth == 16, false);
-                draw_text(ren, "16 bit PCM", ex + 174, sy_sub + 20, c_white);
-
-                SDL_Rect b_w24 = { ex + 292, sy_sub + 12, 130, 28 };
-                SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 24 ? 68 : 38,
-                                            g_export.wav_bit_depth == 24 ? 48 : 36,
-                                            g_export.wav_bit_depth == 24 ? 32 : 34, 255);
-                SDL_RenderFillRect(ren, &b_w24);
-                draw_brown_border_rect(ren, &b_w24, g_export.wav_bit_depth == 24, false);
-                draw_text(ren, "24 bit PCM", ex + 316, sy_sub + 20, c_white);
-
-                SDL_Rect b_w32 = { ex + 434, sy_sub + 12, 130, 28 };
-                SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 32 ? 68 : 38,
-                                            g_export.wav_bit_depth == 32 ? 48 : 36,
-                                            g_export.wav_bit_depth == 32 ? 32 : 34, 255);
-                SDL_RenderFillRect(ren, &b_w32);
-                draw_brown_border_rect(ren, &b_w32, g_export.wav_bit_depth == 32, false);
-                draw_text(ren, "32 bit PCM", ex + 458, sy_sub + 20, c_white);
-
-                draw_text(ren, "Uncompressed studio-quality linear PCM WAVE format.", ex + 34, sy_sub + 62, c_muted);
-            } else if (g_export.format == EXPORT_FMT_MP3) {
-                draw_text(ren, "MP3 Bitrate:", ex + 34, sy_sub + 19, c_white);
-
-                SDL_Rect b_m128 = { ex + 150, sy_sub + 12, 130, 28 };
-                SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 128 ? 68 : 38,
-                                            g_export.mp3_bitrate == 128 ? 48 : 36,
-                                            g_export.mp3_bitrate == 128 ? 32 : 34, 255);
-                SDL_RenderFillRect(ren, &b_m128);
-                draw_brown_border_rect(ren, &b_m128, g_export.mp3_bitrate == 128, false);
-                draw_text(ren, "128 kbps", ex + 182, sy_sub + 20, c_white);
-
-                SDL_Rect b_m192 = { ex + 292, sy_sub + 12, 130, 28 };
-                SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 192 ? 68 : 38,
-                                            g_export.mp3_bitrate == 192 ? 48 : 36,
-                                            g_export.mp3_bitrate == 192 ? 32 : 34, 255);
-                SDL_RenderFillRect(ren, &b_m192);
-                draw_brown_border_rect(ren, &b_m192, g_export.mp3_bitrate == 192, false);
-                draw_text(ren, "192 kbps", ex + 324, sy_sub + 20, c_white);
-
-                SDL_Rect b_m320 = { ex + 434, sy_sub + 12, 130, 28 };
-                SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 320 ? 68 : 38,
-                                            g_export.mp3_bitrate == 320 ? 48 : 36,
-                                            g_export.mp3_bitrate == 320 ? 32 : 34, 255);
-                SDL_RenderFillRect(ren, &b_m320);
-                draw_brown_border_rect(ren, &b_m320, g_export.mp3_bitrate == 320, false);
-                draw_text(ren, "320 kbps", ex + 466, sy_sub + 20, c_white);
-
-                draw_text(ren, "MPEG-1/2 Audio Layer III constant bitrate encoding.", ex + 34, sy_sub + 62, c_muted);
-            } else if (g_export.format == EXPORT_FMT_MP4) {
-                // Row 1 (matching image_736e17.png):
-                // File: [ MPEG-4 ]   Size: [ 1920 ] x [ 1080 ]   Framerate: [ 25.00 ]
-                int r1_y = sy_sub + 8;
-                draw_text(ren, "File:", ex + 34, r1_y + 7, c_white);
-                SDL_Rect box_mpeg4 = { ex + 92, r1_y, 136, 26 };
-                SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
-                SDL_RenderFillRect(ren, &box_mpeg4);
-                draw_brown_border_rect(ren, &box_mpeg4, false, false);
-                draw_text(ren, "MPEG-4", ex + 104, r1_y + 7, c_white);
-                draw_text(ren, "v", ex + 210, r1_y + 7, c_muted);
-
-                draw_text(ren, "Size:", ex + 244, r1_y + 7, c_white);
-                SDL_Rect box_w = { ex + 295, r1_y, 70, 26 };
-                bool ed_w = (g_export.active_field == EXP_FIELD_MP4_WIDTH);
-                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-                SDL_RenderFillRect(ren, &box_w);
-                draw_brown_border_rect(ren, &box_w, ed_w, false);
-                if (ed_w) {
-                    daw_draw_text_edit_overlay(ren, g_export.mp4_width_str, box_w.x + 8, box_w.y, box_w.h, box_w.x + box_w.w - 4);
-                }
-                draw_text(ren, g_export.mp4_width_str, box_w.x + 8, r1_y + 7, c_white);
-
-                draw_text(ren, "x", ex + 373, r1_y + 7, c_white);
-
-                SDL_Rect box_h = { ex + 390, r1_y, 70, 26 };
-                bool ed_h = (g_export.active_field == EXP_FIELD_MP4_HEIGHT);
-                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-                SDL_RenderFillRect(ren, &box_h);
-                draw_brown_border_rect(ren, &box_h, ed_h, false);
-                if (ed_h) {
-                    daw_draw_text_edit_overlay(ren, g_export.mp4_height_str, box_h.x + 8, box_h.y, box_h.h, box_h.x + box_h.w - 4);
-                }
-                draw_text(ren, g_export.mp4_height_str, box_h.x + 8, r1_y + 7, c_white);
-
-                draw_text(ren, "Framerate:", ex + 476, r1_y + 7, c_white);
-                SDL_Rect box_fps = { ex + 568, r1_y, 80, 26 };
-                bool ed_fps = (g_export.active_field == EXP_FIELD_MP4_FPS);
-                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-                SDL_RenderFillRect(ren, &box_fps);
-                draw_brown_border_rect(ren, &box_fps, ed_fps, false);
-                if (ed_fps) {
-                    daw_draw_text_edit_overlay(ren, g_export.mp4_fps_str, box_fps.x + 8, box_fps.y, box_fps.h, box_fps.x + box_fps.w - 4);
-                }
-                draw_text(ren, g_export.mp4_fps_str, box_fps.x + 8, r1_y + 7, c_white);
-
-                // Row 2 (matching image_736e58.png):
-                // Video: [ H.264 ]   [ 2048 ] kbps
-                int r2_y = sy_sub + 46;
-                draw_text(ren, "Video:", ex + 34, r2_y + 7, c_white);
-                SDL_Rect box_vcodec = { ex + 92, r2_y, 176, 26 };
-                SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
-                SDL_RenderFillRect(ren, &box_vcodec);
-                draw_brown_border_rect(ren, &box_vcodec, false, false);
-                draw_text(ren, "H.264", ex + 104, r2_y + 7, c_white);
-                draw_text(ren, "v", ex + 250, r2_y + 7, c_muted);
-
-                SDL_Rect box_vkbps = { ex + 295, r2_y, 100, 26 };
-                bool ed_vk = (g_export.active_field == EXP_FIELD_MP4_V_KBPS);
-                SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-                SDL_RenderFillRect(ren, &box_vkbps);
-                draw_brown_border_rect(ren, &box_vkbps, ed_vk, false);
-                if (ed_vk) {
-                    daw_draw_text_edit_overlay(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, box_vkbps.y, box_vkbps.h, box_vkbps.x + box_vkbps.w - 4);
-                }
-                draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r2_y + 7, c_white);
-                draw_text(ren, "kbps", ex + 405, r2_y + 7, c_white);
-
-                // Row 3: Audio: [ AAC ]   [ 120 / 192 / 320 kbps  v ] dropdown menu
-                int r3_y = sy_sub + 84;
-                draw_text(ren, "Audio:", ex + 34, r3_y + 7, c_white);
-
-                SDL_Rect box_ac_aac = { ex + 92, r3_y, 176, 26 };
-                SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
-                SDL_RenderFillRect(ren, &box_ac_aac);
-                draw_brown_border_rect(ren, &box_ac_aac, true, false);
-                const char *ac_lbl = (g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_MP3) ? "MP3 Audio"
-                                   : ((g_export.mp4_audio_codec == EXPORT_MP4_AUDIO_WAV) ? "PCM WAV" : "AAC");
-                draw_text(ren, ac_lbl, ex + 104, r3_y + 7, c_white);
-                draw_text(ren, "v", ex + 250, r3_y + 7, c_muted);
-
-                SDL_Rect box_akbps = { ex + 295, r3_y, 130, 26 };
-                SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
-                SDL_RenderFillRect(ren, &box_akbps);
-                draw_brown_border_rect(ren, &box_akbps, g_export.mp4_aac_dropdown_open, false);
-                char aac_rate_lbl[32];
-                snprintf(aac_rate_lbl, sizeof(aac_rate_lbl), "%s kbps", g_export.mp4_audio_kbps_str);
-                draw_text(ren, aac_rate_lbl, box_akbps.x + 10, r3_y + 7, c_white);
-                draw_text(ren, "v", box_akbps.x + box_akbps.w - 18, r3_y + 7, c_muted);
-            }
-
-            // ---- 5. OPTION: TWO-PASS RENDER CHECKBOX ----
-            int sy_opt = ey + 436;
-            SDL_Rect chk_box = { ex + 22, sy_opt + 2, 20, 20 };
-            SDL_SetRenderDrawColor(ren, g_export.two_pass_render ? 72 : 20,
-                                        g_export.two_pass_render ? 50 : 20,
-                                        g_export.two_pass_render ? 30 : 20, 255);
-            SDL_RenderFillRect(ren, &chk_box);
-            draw_brown_border_rect(ren, &chk_box, g_export.two_pass_render, false);
-            if (g_export.two_pass_render) {
-                draw_text(ren, "x", ex + 28, sy_opt + 5, c_white);
-            }
-            draw_text(ren, "Option: Two-pass render", ex + 50, sy_opt + 6, c_white);
-
-            // Render MP4 AAC Bitrate Dropdown Menu on top if open (120 kbps, 192 kbps, 320 kbps)
-            if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
-                int dd_x = ex + 295;
-                int dd_y = sy_sub + 84 + 26;
-                int dd_w = 130;
-                SDL_Rect dd_box = { dd_x, dd_y, dd_w, 78 };
-                SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
-                SDL_RenderFillRect(ren, &dd_box);
-                draw_brown_border_rect(ren, &dd_box, true, false);
-
-                const char *rates[3] = { "120", "192", "320" };
-                const char *rate_labels[3] = { "120 kbps", "192 kbps", "320 kbps" };
-                for (int r_i = 0; r_i < 3; r_i++) {
-                    bool is_cur = (strcmp(g_export.mp4_audio_kbps_str, rates[r_i]) == 0);
-                    SDL_Rect r_item = { dd_x + 2, dd_y + r_i * 26 + 2, dd_w - 4, 22 };
-                    SDL_SetRenderDrawColor(ren, is_cur ? 68 : 30, is_cur ? 48 : 28, is_cur ? 32 : 26, 255);
-                    SDL_RenderFillRect(ren, &r_item);
-                    draw_brown_border_rect(ren, &r_item, is_cur, !is_cur);
-                    draw_text(ren, rate_labels[r_i], dd_x + 12, dd_y + r_i * 26 + 7, c_white);
-                }
-            }
-
-            // ---- 6. PROCESSING PROGRESS BAR, PERCENTAGE (%) & PROCESSING TIME ----
-            SDL_Rect bar_bg = { ex + 22, ey + 468, ew - 44, 24 };
-            SDL_SetRenderDrawColor(ren, 16, 15, 14, 255);
-            SDL_RenderFillRect(ren, &bar_bg);
-
-            int fill_w = ((bar_bg.w - 4) * g_export.progress_pct) / 100;
-            if (fill_w > 0) {
-                SDL_Rect bar_fill = { bar_bg.x + 2, bar_bg.y + 2, fill_w, bar_bg.h - 4 };
-                SDL_SetRenderDrawColor(ren, 195, 128, 54, 255);
-                SDL_RenderFillRect(ren, &bar_fill);
-            }
-            draw_brown_border_rect(ren, &bar_bg, g_export.progress_pct > 0, false);
-
-            char pct_time_buf[160];
-            if (g_export.is_rendering) {
-                snprintf(pct_time_buf, sizeof(pct_time_buf),
-                         "Processing: %d%%   |   Time: %.2fs   |   Remaining: ~%.2fs",
-                         g_export.progress_pct, g_export.elapsed_sec, g_export.est_remaining_sec);
-            } else if (g_export.progress_pct >= 100) {
-                snprintf(pct_time_buf, sizeof(pct_time_buf),
-                         "Completed: 100%%   |   Processing Time: %.2fs",
-                         g_export.elapsed_sec);
-            } else {
-                snprintf(pct_time_buf, sizeof(pct_time_buf),
-                         "Progress: %d%%   |   Processing Time: %.2fs",
-                         g_export.progress_pct, g_export.elapsed_sec);
-            }
-            draw_text(ren, pct_time_buf, bar_bg.x + 12, bar_bg.y + 6, c_white);
-
-            if (g_export.status_msg[0] != 0) {
-                SDL_Rect st_clip = { ex + 22, ey + 498, ew - 44, 22 };
-                draw_text_clipped(ren, g_export.status_msg, ex + 22, ey + 500, c_muted, &st_clip, NULL);
-            }
-
-            // ---- 7. BOTTOM ACTION BUTTONS ----
-            int btn_y = ey + eh - 44;
-            SDL_Rect btn_render = { ex + ew - 270, btn_y, 145, 32 };
-            SDL_SetRenderDrawColor(ren, 78, 52, 32, 255);
-            SDL_RenderFillRect(ren, &btn_render);
-            draw_brown_border_rect(ren, &btn_render, true, false);
-            draw_text(ren, "Render / Export", ex + ew - 258, btn_y + 10, c_white);
-
-            SDL_Rect btn_close = { ex + ew - 115, btn_y, 95, 32 };
-            SDL_SetRenderDrawColor(ren, 44, 40, 38, 255);
-            SDL_RenderFillRect(ren, &btn_close);
-            draw_brown_border_rect(ren, &btn_close, false, false);
-            draw_text(ren, "Cancel", ex + ew - 92, btn_y + 10, c_white);
+            render_export_popup_window(ren, p);
         }
 
         // ================= HIDE TRACKS POPUP WINDOW (WITH SCROLLING) =================
