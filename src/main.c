@@ -5199,22 +5199,23 @@ static bool encode_wav_to_mp3_native_ffmpeg(SDL_Renderer *ren, const char *wav_s
     enc_ctx->sample_rate = (target_sr > 0) ? target_sr : 48000;
     av_channel_layout_default(&enc_ctx->ch_layout, (channels == 1) ? 1 : 2);
     enc_ctx->bit_rate = (int64_t)(mp3_kbps > 0 ? mp3_kbps : 192) * 1000;
-    enc_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    if (enc->sample_fmts) {
-        enc_ctx->sample_fmt = enc->sample_fmts[0];
-        for (int i = 0; enc->sample_fmts[i] != AV_SAMPLE_FMT_NONE; i++) {
-            if (enc->sample_fmts[i] == AV_SAMPLE_FMT_FLTP || enc->sample_fmts[i] == AV_SAMPLE_FMT_S16P) {
-                enc_ctx->sample_fmt = enc->sample_fmts[i];
-                break;
-            }
-        }
-    }
     enc_ctx->time_base = (AVRational){ 1, enc_ctx->sample_rate };
     if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
         enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    if (avcodec_open2(enc_ctx, enc, NULL) < 0) {
+    static const enum AVSampleFormat k_try_mp3_fmts[] = {
+        AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_S16
+    };
+    bool mp3_opened = false;
+    for (size_t fi = 0; fi < sizeof(k_try_mp3_fmts) / sizeof(k_try_mp3_fmts[0]); fi++) {
+        enc_ctx->sample_fmt = k_try_mp3_fmts[fi];
+        if (avcodec_open2(enc_ctx, enc, NULL) >= 0) {
+            mp3_opened = true;
+            break;
+        }
+    }
+    if (!mp3_opened) {
         avcodec_free_context(&enc_ctx);
         avformat_free_context(oc);
         avcodec_free_context(&dec_ctx);
@@ -5676,14 +5677,19 @@ static bool render_timeline_mp4_native_ffmpeg(ProjectTab *p, SDL_Renderer *ren,
     if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
         v_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
+    AVDictionary *v_opts = NULL;
     if (v_codec->id == AV_CODEC_ID_H264) {
-        av_opt_set(v_ctx->priv_data, "preset", two_pass ? "medium" : "veryfast", 0);
-        av_opt_set(v_ctx->priv_data, "profile", "high", 0);
+        av_dict_set(&v_opts, "preset", two_pass ? "medium" : "veryfast", 0);
+        av_dict_set(&v_opts, "profile", "high", 0);
     }
-    if (avcodec_open2(v_ctx, v_codec, NULL) < 0) {
-        avcodec_free_context(&v_ctx);
-        avformat_free_context(oc);
-        return false;
+    int v_open_ret = avcodec_open2(v_ctx, v_codec, &v_opts);
+    av_dict_free(&v_opts);
+    if (v_open_ret < 0) {
+        if (avcodec_open2(v_ctx, v_codec, NULL) < 0) {
+            avcodec_free_context(&v_ctx);
+            avformat_free_context(oc);
+            return false;
+        }
     }
     avcodec_parameters_from_context(v_st->codecpar, v_ctx);
     v_st->time_base = v_ctx->time_base;
@@ -5701,21 +5707,22 @@ static bool render_timeline_mp4_native_ffmpeg(ProjectTab *p, SDL_Renderer *ren,
     a_ctx->sample_rate = (target_sr == 44100 || target_sr == 48000) ? target_sr : 48000;
     av_channel_layout_default(&a_ctx->ch_layout, (channels == 1) ? 1 : 2);
     a_ctx->bit_rate = (int64_t)a_kbps * 1000;
-    a_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
-    if (a_codec->sample_fmts) {
-        a_ctx->sample_fmt = a_codec->sample_fmts[0];
-        for (int i = 0; a_codec->sample_fmts[i] != AV_SAMPLE_FMT_NONE; i++) {
-            if (a_codec->sample_fmts[i] == AV_SAMPLE_FMT_FLTP) {
-                a_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
-                break;
-            }
-        }
-    }
     a_ctx->time_base = (AVRational){ 1, a_ctx->sample_rate };
     if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
         a_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
-    if (avcodec_open2(a_ctx, a_codec, NULL) < 0) {
+    static const enum AVSampleFormat k_try_aac_fmts[] = {
+        AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_S16
+    };
+    bool aac_opened = false;
+    for (size_t fi = 0; fi < sizeof(k_try_aac_fmts) / sizeof(k_try_aac_fmts[0]); fi++) {
+        a_ctx->sample_fmt = k_try_aac_fmts[fi];
+        if (avcodec_open2(a_ctx, a_codec, NULL) >= 0) {
+            aac_opened = true;
+            break;
+        }
+    }
+    if (!aac_opened) {
         avcodec_free_context(&a_ctx);
         avcodec_free_context(&v_ctx);
         avformat_free_context(oc);
