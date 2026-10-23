@@ -255,7 +255,7 @@ typedef struct {
 
 static ThemeManagerState g_theme = {
     false,
-    { 340, 88, 580, 420 },
+    { 340, 88, 580, 396 },
     false, 0, 0,
     205, 138, 72, 255,
     29.77f, 0.6488f, 0.8039f,
@@ -319,7 +319,7 @@ static bool g_lock_opt_complete_unlock[MAX_TABS] = { false };
 static bool g_lock_opt_prevent_lr[MAX_TABS]      = { false };
 static bool g_lock_opt_prevent_ud[MAX_TABS]      = { false };
 static bool g_lock_popup_open = false;
-static SDL_Rect g_lock_win_rect = { 290, 145, 700, 268 };
+static SDL_Rect g_lock_win_rect = { 260, 140, 740, 256 };
 static bool g_lock_win_dragging = false;
 static int  g_lock_drag_off_x = 0;
 static int  g_lock_drag_off_y = 0;
@@ -5758,6 +5758,8 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             g_export.elapsed_sec = 0.0;
             g_export.est_remaining_sec = 0.0;
             g_export.mp4_aac_dropdown_open = false;
+            g_export.mp4_size_dropdown_open = false;
+            g_export.overwrite_prompt_open = false;
             g_export.status_msg[0] = '\0';
             break;
         }
