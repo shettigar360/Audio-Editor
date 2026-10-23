@@ -691,6 +691,79 @@ static inline void draw_lock_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool
     }
 }
 #endif
+
+#ifndef DAW_APP_VOL_AND_PROJ_SETUP_DEFINED
+#define DAW_APP_VOL_AND_PROJ_SETUP_DEFINED
+// Per-tab App Hearing Volume (0..100%, 0 = infinity mute; hearing level only, saved in .ehs project file)
+static float g_app_master_vol[MAX_TABS] = { 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f };
+static float g_app_track_vol[MAX_TABS][MAX_TRACKS];
+static bool  g_app_vol_initialized = false;
+static inline void ensure_app_vol_defaults_initialized(void) {
+    if (g_app_vol_initialized) return;
+    g_app_vol_initialized = true;
+    for (int t = 0; t < MAX_TABS; t++) {
+        g_app_master_vol[t] = 100.0f;
+        for (int k = 0; k < MAX_TRACKS; k++) {
+            g_app_track_vol[t][k] = 100.0f;
+        }
+    }
+}
+static inline void init_tab_app_volume_defaults(int tab_idx) {
+    ensure_app_vol_defaults_initialized();
+    if (tab_idx < 0 || tab_idx >= MAX_TABS) return;
+    g_app_master_vol[tab_idx] = 100.0f;
+    for (int k = 0; k < MAX_TRACKS; k++) {
+        g_app_track_vol[tab_idx][k] = 100.0f;
+    }
+}
+
+// Per-tab New Project Tab 2-option modal ("Open Project File" / "Create Project File")
+static bool g_tab_needs_project_setup[MAX_TABS] = { true, true, true, true, true, true, true, true };
+#endif
+
+// ================= TINY RANGE POPUP WINDOW STATE (NEAR RANGE BUTTON) =================
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    int active_field; // 0 = none, 1 = Start Time, 2 = End Time
+    char start_buf[32];
+    char end_buf[32];
+} RangePopupState;
+
+static RangePopupState g_range_popup = {
+    false,
+    { 940, 70, 300, 142 },
+    false, 0, 0,
+    0,
+    "00:00:00.000",
+    "00:00:05.000"
+};
+
+// ================= APP HEARING VOLUME POPUP WINDOW STATE =================
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    int scroll_y;
+    bool sb_dragging;
+    int sb_start_my;
+    int sb_orig_scroll;
+    int dragging_slider_idx; // -1 = none, 0 = Master Volume, 1..MAX_TRACKS = Track (idx - 1)
+} AppVolumePopupState;
+
+static AppVolumePopupState g_vol_popup = {
+    false,
+    { 360, 70, 476, 344 },
+    false, 0, 0,
+    0, false, 0, 0,
+    -1
+};
+
 static bool     g_hide_popup_open = false;
 static SDL_Rect g_hide_win_rect = { 450, 110, 380, 340 };
 static bool     g_hide_win_dragging = false;
@@ -863,7 +936,7 @@ typedef struct {
 
 static ExportDialogState g_export = {
     false,
-    { 300, 72, 680, 580 },
+    { 280, 50, 720, 620 },
     false, 0, 0,
     EXPORT_SRC_MASTER,
     ".",
@@ -913,10 +986,7 @@ static int get_current_mp4_res_preset_idx(void) {
             return i;
         }
     }
-    if (g_export.mp4_res_preset_idx < 0 || g_export.mp4_res_preset_idx >= NUM_MP4_RES_PRESETS) {
-        g_export.mp4_res_preset_idx = 3;
-    }
-    return g_export.mp4_res_preset_idx;
+    return -1; // Custom manual Width x Height resolution
 }
 
 static char* get_active_export_field_buf(size_t *out_max_len) {
@@ -1067,6 +1137,15 @@ static inline void set_item_fade_out(ProjectTab *p, int item_idx, double fout) {
 // Activated when clicking the top-bar "Range" button:
 // If any clip(s) are selected, sets the Logic Pro style yellow cycle range to the selected clip(s) bounds.
 // Clicking "Range" again when already matching (or when no clip is selected) toggles the cycle range on/off.
+static void sync_range_popup_buffers_from_tab(void) {
+    if (g_range_popup.active_field != 1) {
+        format_timecode(get_range_start(), g_range_popup.start_buf, sizeof(g_range_popup.start_buf));
+    }
+    if (g_range_popup.active_field != 2) {
+        format_timecode(get_range_end(), g_range_popup.end_buf, sizeof(g_range_popup.end_buf));
+    }
+}
+
 static void handle_top_menu_range_button(ProjectTab *p) {
     if (!p) return;
     int idx = get_valid_tab_idx();
@@ -1103,6 +1182,16 @@ static void handle_top_menu_range_button(ProjectTab *p) {
                 set_tab_range(st, st + 5.0, true);
             }
         }
+    }
+
+    if (g_tab_range_active[idx]) {
+        g_range_popup.is_open = true;
+        g_range_popup.active_field = 0;
+        sync_range_popup_buffers_from_tab();
+    } else {
+        g_range_popup.is_open = false;
+        g_range_popup.active_field = 0;
+        SDL_StopTextInput();
     }
 }
 
@@ -1240,6 +1329,11 @@ static void swap_tracks(ProjectTab *p, int t1, int t2) {
     bool tmp_lck_ud = g_track_lock_ud_only[tab_idx][t1];
     g_track_lock_ud_only[tab_idx][t1] = g_track_lock_ud_only[tab_idx][t2];
     g_track_lock_ud_only[tab_idx][t2] = tmp_lck_ud;
+
+    ensure_app_vol_defaults_initialized();
+    float tmp_avol = g_app_track_vol[tab_idx][t1];
+    g_app_track_vol[tab_idx][t1] = g_app_track_vol[tab_idx][t2];
+    g_app_track_vol[tab_idx][t2] = tmp_avol;
 
     for (int i = 0; i < p->num_items; i++) {
         if (p->items[i].track_idx == t1) p->items[i].track_idx = t2;
@@ -2245,7 +2339,7 @@ static RecordingEngineState g_rec = {
     0, -1, 0.0, 0, 0,
     NULL, NULL,
     "", "",
-    "Temporary Media",
+    "media",
     0.0f, 0.0f, 0, 0, 0,
     false
 };
@@ -2253,30 +2347,8 @@ static RecordingEngineState g_rec = {
 static inline void init_default_recording_folder(void) {
     if (g_rec.folder_initialized) return;
     g_rec.folder_initialized = true;
-    char *base = SDL_GetBasePath();
-    if (base && base[0]) {
-        size_t blen = strlen(base);
-        while (blen > 0 && (base[blen - 1] == '\\' || base[blen - 1] == '/')) {
-            base[--blen] = '\0';
-        }
-#ifdef _WIN32
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Temporary Media", base);
-        CreateDirectoryA(g_rec.folder_path, NULL);
-        CreateDirectoryA("Temporary Media", NULL);
-#else
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s/Temporary Media", base);
-        mkdir(g_rec.folder_path, 0777);
-        mkdir("Temporary Media", 0777);
-#endif
-        SDL_free(base);
-    } else {
-        if (base) SDL_free(base);
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "Temporary Media");
-#ifdef _WIN32
-        CreateDirectoryA("Temporary Media", NULL);
-#else
-        mkdir("Temporary Media", 0777);
-#endif
+    if (!g_rec.folder_path[0]) {
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "media");
     }
 }
 
@@ -4052,6 +4124,33 @@ static inline void draw_play_pause_symbol_icon(SDL_Renderer *ren, int cx, int cy
     }
 }
 
+// Draws crisp Speaker / Volume symbol icon at (cx, cy) for the top-bar App Hearing Volume button
+static inline void draw_volume_speaker_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool is_muted, SDL_Color col) {
+    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
+    // Speaker back box
+    SDL_Rect box = { cx + 1, cy + 5, 4, 6 };
+    SDL_RenderFillRect(ren, &box);
+    // Speaker cone flare
+    for (int dx = 0; dx < 5; dx++) {
+        SDL_RenderDrawLine(ren, cx + 4 + dx, cy + 5 - dx, cx + 4 + dx, cy + 10 + dx);
+    }
+    if (is_muted) {
+        // Draw small mute X on right of speaker cone
+        SDL_SetRenderDrawColor(ren, 235, 75, 75, 255);
+        SDL_RenderDrawLine(ren, cx + 11, cy + 5, cx + 15, cy + 10);
+        SDL_RenderDrawLine(ren, cx + 15, cy + 5, cx + 11, cy + 10);
+    } else {
+        // Sound waves on right of speaker cone
+        SDL_RenderDrawLine(ren, cx + 11, cy + 5, cx + 12, cy + 6);
+        SDL_RenderDrawLine(ren, cx + 12, cy + 6, cx + 12, cy + 9);
+        SDL_RenderDrawLine(ren, cx + 12, cy + 9, cx + 11, cy + 10);
+
+        SDL_RenderDrawLine(ren, cx + 13, cy + 3, cx + 15, cy + 5);
+        SDL_RenderDrawLine(ren, cx + 15, cy + 5, cx + 15, cy + 10);
+        SDL_RenderDrawLine(ren, cx + 15, cy + 10, cx + 13, cy + 12);
+    }
+}
+
 // ================= SETTINGS -> MOUSE POPUP WINDOW (REQUIREMENT 9) =================
 static void render_mouse_settings_window(SDL_Renderer *ren) {
     if (!g_mouse_settings_open) return;
@@ -4262,6 +4361,286 @@ static void render_time_jump_popup_window(SDL_Renderer *ren) {
     SDL_RenderFillRect(ren, &b_can);
     draw_brown_border_rect(ren, &b_can, false, false);
     draw_text(ren, "Cancel", b_can.x + 12, by + 7, c_white);
+}
+
+// ================= REQUIREMENT 2: TINY RANGE POPUP WINDOW NEAR RANGE BUTTON =================
+static void commit_range_popup_edits(void) {
+    double cur_s = get_range_start();
+    double cur_e = get_range_end();
+    double new_s = cur_s;
+    double new_e = cur_e;
+
+    if (g_range_popup.active_field == 1 || g_range_popup.active_field == 0) {
+        double parsed_s = 0.0;
+        if (parse_manual_time_entry_to_seconds(g_range_popup.start_buf, &parsed_s)) {
+            new_s = parsed_s;
+        }
+    }
+    if (g_range_popup.active_field == 2 || g_range_popup.active_field == 0) {
+        double parsed_e = 0.0;
+        if (parse_manual_time_entry_to_seconds(g_range_popup.end_buf, &parsed_e)) {
+            new_e = parsed_e;
+        }
+    }
+    if (new_s < 0.0) new_s = 0.0;
+    if (new_e <= new_s + 0.05) new_e = new_s + 0.05;
+
+    if (fabs(new_s - cur_s) > 1e-4 || fabs(new_e - cur_e) > 1e-4) {
+        push_undo_state();
+        set_tab_range(new_s, new_e, true);
+        record_project_change("Updated Range Start/End Timings", true);
+    }
+    g_range_popup.active_field = 0;
+    SDL_StopTextInput();
+    sync_range_popup_buffers_from_tab();
+}
+
+static void render_range_popup_window(SDL_Renderer *ren, int win_w) {
+    if (!is_range_active()) {
+        if (g_range_popup.is_open) {
+            g_range_popup.is_open = false;
+            g_range_popup.active_field = 0;
+            SDL_StopTextInput();
+        }
+        return;
+    }
+    if (!g_range_popup.is_open || !ren) return;
+
+    // Keep buffers synced with live range whenever not actively typing in that field
+    sync_range_popup_buffers_from_tab();
+
+    SDL_Rect *wr = &g_range_popup.win_rect;
+    if (!g_range_popup.is_dragging && (wr->x + wr->w > win_w - 6 || wr->x < 8)) {
+        wr->x = win_w - wr->w - 14;
+        if (wr->x < 8) wr->x = 8;
+        wr->y = TABBAR_HEIGHT + TOPBAR_HEIGHT + 4;
+    }
+
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 5, wy + 5, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 170);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_Rect hdr = { wx, wy, ww, 26 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Range Timings", wx + 10, wy + 7, c_white);
+    draw_text(ren, "X", wx + ww - 18, wy + 7, c_white);
+
+    // Row 1: Start Time (editable)
+    int r1_y = wy + 34;
+    draw_text(ren, "Start:", wx + 12, r1_y + 7, c_white);
+    SDL_Rect box_s = { wx + 92, r1_y, ww - 104, 24 };
+    bool ed_s = (g_range_popup.active_field == 1);
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &box_s);
+    draw_brown_border_rect(ren, &box_s, ed_s, false);
+    if (ed_s) {
+        daw_draw_text_edit_overlay(ren, g_range_popup.start_buf, box_s.x + 8, box_s.y, box_s.h, box_s.x + box_s.w - 4);
+    }
+    draw_text(ren, g_range_popup.start_buf, box_s.x + 8, r1_y + 6, ed_s ? c_accent : c_white);
+
+    // Row 2: End Time (editable)
+    int r2_y = wy + 64;
+    draw_text(ren, "End:", wx + 12, r2_y + 7, c_white);
+    SDL_Rect box_e = { wx + 92, r2_y, ww - 104, 24 };
+    bool ed_e = (g_range_popup.active_field == 2);
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &box_e);
+    draw_brown_border_rect(ren, &box_e, ed_e, false);
+    if (ed_e) {
+        daw_draw_text_edit_overlay(ren, g_range_popup.end_buf, box_e.x + 8, box_e.y, box_e.h, box_e.x + box_e.w - 4);
+    }
+    draw_text(ren, g_range_popup.end_buf, box_e.x + 8, r2_y + 6, ed_e ? c_accent : c_white);
+
+    // Row 3: Duration (live readout) + [Apply] button
+    int r3_y = wy + 96;
+    double dur_sec = fmax(0.0, get_range_end() - get_range_start());
+    char dur_str[32];
+    format_timecode(dur_sec, dur_str, sizeof(dur_str));
+    draw_text(ren, "Duration:", wx + 12, r3_y + 7, c_muted);
+    draw_text(ren, dur_str, wx + 92, r3_y + 7, c_accent);
+
+    SDL_Rect b_set = { wx + ww - 68, r3_y, 56, 24 };
+    SDL_SetRenderDrawColor(ren, hr + 20, hg + 12, hb + 8, 255);
+    SDL_RenderFillRect(ren, &b_set);
+    draw_brown_border_rect(ren, &b_set, true, false);
+    draw_text(ren, "Apply", b_set.x + 8, r3_y + 6, c_white);
+
+    draw_text(ren, "Click Start/End to edit (Enter to apply)", wx + 12, wy + wh - 16, c_muted);
+}
+
+// ================= REQUIREMENT 4: APP HEARING VOLUME POPUP WINDOW =================
+static void render_app_volume_popup_window(SDL_Renderer *ren, ProjectTab *p) {
+    if (!g_vol_popup.is_open || !ren || !p) return;
+    ensure_app_vol_defaults_initialized();
+    int tab = get_valid_tab_idx();
+
+    SDL_Rect *wr = &g_vol_popup.win_rect;
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_Rect hdr = { wx, wy, ww, 28 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "App Hearing Volume (Monitor Level Only)", wx + 12, wy + 8, c_white);
+    draw_text(ren, "X", wx + ww - 20, wy + 8, c_white);
+
+    // 1. Top Section: Master Volume (0 to 100 slider + Reset)
+    int m_y = wy + 36;
+    SDL_Rect m_box = { wx + 12, m_y, ww - 24, 38 };
+    SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+    SDL_RenderFillRect(ren, &m_box);
+    draw_brown_border_rect(ren, &m_box, true, false);
+
+    draw_text(ren, "Master Volume", wx + 22, m_y + 13, c_white);
+
+    float m_val = g_app_master_vol[tab];
+    if (m_val < 0.0f) m_val = 0.0f;
+    if (m_val > 100.0f) m_val = 100.0f;
+
+    int sl_x = wx + 156;
+    int sl_w = 168;
+    SDL_Rect m_sl_bg = { sl_x, m_y + 12, sl_w, 14 };
+    SDL_SetRenderDrawColor(ren, 15, 14, 13, 255);
+    SDL_RenderFillRect(ren, &m_sl_bg);
+    draw_brown_border_rect(ren, &m_sl_bg, false, false);
+
+    int m_fill_w = (int)((m_val / 100.0f) * (float)(sl_w - 4) + 0.5f);
+    if (m_fill_w > 0) {
+        SDL_Rect m_sl_fill = { sl_x + 2, m_y + 14, m_fill_w, 10 };
+        SDL_SetRenderDrawColor(ren, c_accent.r, c_accent.g, c_accent.b, 255);
+        SDL_RenderFillRect(ren, &m_sl_fill);
+    }
+    int m_knob_x = sl_x + 2 + m_fill_w - 4;
+    if (m_knob_x < sl_x) m_knob_x = sl_x;
+    if (m_knob_x > sl_x + sl_w - 8) m_knob_x = sl_x + sl_w - 8;
+    SDL_Rect m_knob = { m_knob_x, m_y + 10, 8, 18 };
+    SDL_SetRenderDrawColor(ren, 235, 235, 235, 255);
+    SDL_RenderFillRect(ren, &m_knob);
+
+    char m_val_txt[24];
+    if (m_val <= 0.01f) snprintf(m_val_txt, sizeof(m_val_txt), "0 (Mute)");
+    else snprintf(m_val_txt, sizeof(m_val_txt), "%d%%", (int)(m_val + 0.5f));
+    draw_text(ren, m_val_txt, sl_x + sl_w + 10, m_y + 13, (m_val <= 0.01f) ? c_muted : c_accent);
+
+    SDL_Rect m_rst = { wx + ww - 76, m_y + 7, 56, 24 };
+    SDL_SetRenderDrawColor(ren, 52, 42, 34, 255);
+    SDL_RenderFillRect(ren, &m_rst);
+    draw_brown_border_rect(ren, &m_rst, false, false);
+    draw_text(ren, "Reset", m_rst.x + 8, m_y + 13, c_white);
+
+    // 2. Bottom Section: Track Name List (each has 0..100 horizontal slider + Reset)
+    int list_y = wy + 82;
+    int list_h = wh - 122;
+    SDL_Rect list_box = { wx + 12, list_y, ww - 24, list_h };
+    SDL_SetRenderDrawColor(ren, 18, 17, 16, 255);
+    SDL_RenderFillRect(ren, &list_box);
+    draw_brown_border_rect(ren, &list_box, false, true);
+
+    int row_h = 32;
+    int content_h = p->num_tracks * row_h + 8;
+    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+    if (g_vol_popup.scroll_y > max_sc) g_vol_popup.scroll_y = max_sc;
+    if (g_vol_popup.scroll_y < 0) g_vol_popup.scroll_y = 0;
+
+    SDL_Rect rows_clip = { list_box.x + 2, list_box.y + 2, list_box.w - 18, list_box.h - 4 };
+    SDL_RenderSetClipRect(ren, &rows_clip);
+    for (int t = 0; t < p->num_tracks; t++) {
+        int ry = list_box.y + 4 + t * row_h - g_vol_popup.scroll_y;
+        if (ry + row_h < list_box.y || ry > list_box.y + list_box.h) continue;
+
+        SDL_Rect row_r = { list_box.x + 4, ry, list_box.w - 22, row_h - 2 };
+        SDL_SetRenderDrawColor(ren, (t & 1) ? 26 : 22, (t & 1) ? 24 : 20, (t & 1) ? 22 : 18, 255);
+        SDL_RenderFillRect(ren, &row_r);
+        draw_brown_border_rect(ren, &row_r, false, true);
+
+        char trk_lbl[96];
+        snprintf(trk_lbl, sizeof(trk_lbl), "%d. %s", t + 1, p->track_names[t]);
+        SDL_Rect name_clip = { row_r.x + 6, ry + 2, 134, row_h - 6 };
+        draw_text_clipped(ren, trk_lbl, row_r.x + 8, ry + 9, c_white, &name_clip, &rows_clip);
+
+        float t_val = g_app_track_vol[tab][t];
+        if (t_val < 0.0f) t_val = 0.0f;
+        if (t_val > 100.0f) t_val = 100.0f;
+
+        SDL_Rect t_sl_bg = { sl_x, ry + 8, sl_w, 14 };
+        SDL_SetRenderDrawColor(ren, 14, 13, 12, 255);
+        SDL_RenderFillRect(ren, &t_sl_bg);
+        draw_brown_border_rect(ren, &t_sl_bg, false, false);
+
+        int t_fill_w = (int)((t_val / 100.0f) * (float)(sl_w - 4) + 0.5f);
+        if (t_fill_w > 0) {
+            SDL_Rect t_sl_fill = { sl_x + 2, ry + 10, t_fill_w, 10 };
+            SDL_SetRenderDrawColor(ren, c_accent.r, c_accent.g, c_accent.b, 255);
+            SDL_RenderFillRect(ren, &t_sl_fill);
+        }
+        int t_knob_x = sl_x + 2 + t_fill_w - 4;
+        if (t_knob_x < sl_x) t_knob_x = sl_x;
+        if (t_knob_x > sl_x + sl_w - 8) t_knob_x = sl_x + sl_w - 8;
+        SDL_Rect t_knob = { t_knob_x, ry + 6, 8, 18 };
+        SDL_SetRenderDrawColor(ren, 230, 230, 230, 255);
+        SDL_RenderFillRect(ren, &t_knob);
+
+        char t_val_txt[24];
+        if (t_val <= 0.01f) snprintf(t_val_txt, sizeof(t_val_txt), "0 (Mute)");
+        else snprintf(t_val_txt, sizeof(t_val_txt), "%d%%", (int)(t_val + 0.5f));
+        draw_text(ren, t_val_txt, sl_x + sl_w + 10, ry + 9, (t_val <= 0.01f) ? c_muted : c_white);
+
+        SDL_Rect t_rst = { wx + ww - 84, ry + 4, 52, 22 };
+        SDL_SetRenderDrawColor(ren, 48, 38, 30, 255);
+        SDL_RenderFillRect(ren, &t_rst);
+        draw_brown_border_rect(ren, &t_rst, false, false);
+        draw_text(ren, "Reset", t_rst.x + 6, ry + 9, c_white);
+    }
+    SDL_RenderSetClipRect(ren, NULL);
+
+    // Vertical Scrollbar for Track Volume List
+    SDL_Rect sb_track = { list_box.x + list_box.w - 14, list_box.y + 2, 12, list_box.h - 4 };
+    SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+    SDL_RenderFillRect(ren, &sb_track);
+    draw_brown_border_rect(ren, &sb_track, false, true);
+
+    int thumb_h = (content_h > list_h && content_h > 0)
+                  ? fmax(24, (sb_track.h * list_h) / content_h)
+                  : sb_track.h;
+    int thumb_y = sb_track.y + ((max_sc > 0) ? ((g_vol_popup.scroll_y * (sb_track.h - thumb_h)) / max_sc) : 0);
+    SDL_Rect sb_thumb = { sb_track.x + 1, thumb_y, sb_track.w - 2, thumb_h };
+    SDL_SetRenderDrawColor(ren, 92, 64, 42, 255);
+    SDL_RenderFillRect(ren, &sb_thumb);
+    draw_brown_border_rect(ren, &sb_thumb, false, false);
+
+    // Bottom info & Close button
+    int by = wy + wh - 32;
+    draw_text(ren, "Hearing level only (no effect on clip/track dB or export)", wx + 14, by + 6, c_muted);
 }
 
 // ================= VIDEO POPUP GLOBAL PIN OUTSIDE APP (REQUIREMENT 7) =================
@@ -4827,7 +5206,7 @@ static bool is_item_included_in_audio_export(ProjectTab *p, int i, bool any_solo
     AudioItem *it = &p->items[i];
     if (!it->raw_file_handle || g_item_muted[tab][i]) return false;
     if (it->track_idx < 0 || it->track_idx >= p->num_tracks) return false;
-    if (is_track_hidden(it->track_idx) || p->tracks[it->track_idx].mute) return false;
+    if (is_track_hidden(it->track_idx) || (!p->tracks[it->track_idx].solo && p->tracks[it->track_idx].mute)) return false;
 
     if (g_export.source == EXPORT_SRC_MASTER) {
         if (any_solo && !p->tracks[it->track_idx].solo) return false;
@@ -4853,7 +5232,7 @@ static bool is_item_included_in_video_export(ProjectTab *p, int i, bool any_solo
     AudioItem *it = &p->items[i];
     if (!it->has_video || !it->file_path[0] || g_item_muted[tab][i]) return false;
     if (it->track_idx < 0 || it->track_idx >= p->num_tracks) return false;
-    if (is_track_hidden(it->track_idx) || p->tracks[it->track_idx].mute) return false;
+    if (is_track_hidden(it->track_idx) || (!p->tracks[it->track_idx].solo && p->tracks[it->track_idx].mute)) return false;
 
     if (g_export.source == EXPORT_SRC_STEMS && any_video_trk_sel) {
         return p->track_selected[it->track_idx];
@@ -6051,6 +6430,38 @@ static void suggest_renamed_export_filename(void) {
     }
 }
 
+// Computes active export Start, End, and Duration timings for the Export Media header and export engine
+static void get_export_time_bounds(ProjectTab *p, double *out_start, double *out_end) {
+    double exp_start = 0.0;
+    double exp_end   = 0.0;
+    if (is_range_active()) {
+        exp_start = get_range_start();
+        exp_end   = get_range_end();
+    } else if (p && g_export.source == EXPORT_SRC_ITEMS) {
+        double min_s = 1e18, max_e = 0.0;
+        for (int i = 0; i < p->num_items; i++) {
+            if (p->items[i].is_selected) {
+                if (p->items[i].start_time < min_s) min_s = p->items[i].start_time;
+                double ie = p->items[i].start_time + p->items[i].duration;
+                if (ie > max_e) max_e = ie;
+            }
+        }
+        if (max_e > min_s + 0.001) {
+            exp_start = min_s;
+            exp_end   = max_e;
+        }
+    }
+    if (p && exp_end <= exp_start + 0.001) {
+        exp_start = 0.0;
+        for (int i = 0; i < p->num_items; i++) {
+            double ie = p->items[i].start_time + p->items[i].duration;
+            if (ie > exp_end) exp_end = ie;
+        }
+    }
+    if (out_start) *out_start = exp_start;
+    if (out_end)   *out_end   = exp_end;
+}
+
 // Executes the unified Export Media workflow based on all settings in g_export with live progress %, green 100% bar & full stability
 static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
     if (!p) return;
@@ -6082,30 +6493,7 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
     // Compute exact export time bounds [exp_start, exp_end]
     double exp_start = 0.0;
     double exp_end = 0.0;
-    if (is_range_active()) {
-        exp_start = get_range_start();
-        exp_end   = get_range_end();
-    } else if (g_export.source == EXPORT_SRC_ITEMS) {
-        double min_s = 1e18, max_e = 0.0;
-        for (int i = 0; i < p->num_items; i++) {
-            if (p->items[i].is_selected) {
-                if (p->items[i].start_time < min_s) min_s = p->items[i].start_time;
-                double ie = p->items[i].start_time + p->items[i].duration;
-                if (ie > max_e) max_e = ie;
-            }
-        }
-        if (max_e > min_s + 0.001) {
-            exp_start = min_s;
-            exp_end   = max_e;
-        }
-    }
-    if (exp_end <= exp_start + 0.001) {
-        exp_start = 0.0;
-        for (int i = 0; i < p->num_items; i++) {
-            double ie = p->items[i].start_time + p->items[i].duration;
-            if (ie > exp_end) exp_end = ie;
-        }
-    }
+    get_export_time_bounds(p, &exp_start, &exp_end);
     if (exp_end <= exp_start + 0.001) exp_end = exp_start + 1.0;
 
     g_export.overwrite_prompt_open = false;
@@ -6148,9 +6536,16 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
         int h = atoi(g_export.mp4_height_str);
         if (w <= 0 || h <= 0) {
             int p_idx = get_current_mp4_res_preset_idx();
+            if (p_idx < 0 || p_idx >= NUM_MP4_RES_PRESETS) p_idx = 3;
             w = g_mp4_res_presets[p_idx].width;
             h = g_mp4_res_presets[p_idx].height;
         }
+        if (w < 64) w = 64;
+        if (h < 64) h = 64;
+        if (w > 7680) w = 7680;
+        if (h > 4320) h = 4320;
+        if (w & 1) w++;
+        if (h & 1) h++;
         double fps = atof(g_export.mp4_fps_str);
         int v_kbps = atoi(g_export.mp4_video_kbps_str);
         int a_kbps = atoi(g_export.mp4_audio_kbps_str);
@@ -6907,6 +7302,186 @@ static int open_multi_media_dialog(char out_files[][512], int max_files) {
     return count;
 }
 
+static bool daw_paths_equal_norm(const char *a, const char *b);
+static void ensure_recording_directory_exists(const char *dir_path);
+
+// Resolves and creates the current project's <ProjectFolder>/media directory
+static void get_project_media_folder(ProjectTab *p, char *out_media_dir, size_t max_len) {
+    if (!out_media_dir || max_len == 0) return;
+    out_media_dir[0] = '\0';
+
+    if (p && p->project_path[0] != '\0') {
+        char proj_dir[512] = {0};
+        const char *ls1 = strrchr(p->project_path, '\\');
+        const char *ls2 = strrchr(p->project_path, '/');
+        if (ls2 && (!ls1 || ls2 > ls1)) ls1 = ls2;
+        if (ls1) {
+            size_t dl = (size_t)(ls1 - p->project_path);
+            if (dl >= sizeof(proj_dir)) dl = sizeof(proj_dir) - 1;
+            memcpy(proj_dir, p->project_path, dl);
+            proj_dir[dl] = '\0';
+        } else {
+            strcpy(proj_dir, ".");
+        }
+#ifdef _WIN32
+        snprintf(out_media_dir, max_len, "%s\\media", proj_dir);
+#else
+        snprintf(out_media_dir, max_len, "%s/media", proj_dir);
+#endif
+        ensure_recording_directory_exists(proj_dir);
+        ensure_recording_directory_exists(out_media_dir);
+        strncpy(g_rec.folder_path, out_media_dir, sizeof(g_rec.folder_path) - 1);
+        g_rec.folder_path[sizeof(g_rec.folder_path) - 1] = '\0';
+        return;
+    }
+
+    if (g_rec.folder_path[0] != '\0') {
+        snprintf(out_media_dir, max_len, "%s", g_rec.folder_path);
+    } else {
+        snprintf(out_media_dir, max_len, "media");
+    }
+    ensure_recording_directory_exists(out_media_dir);
+}
+
+// Checks if filepath is already directly inside target_dir (so files imported from <Project>/media are not re-copied)
+static bool is_file_already_in_media_dir(const char *filepath, const char *media_dir) {
+    if (!filepath || !filepath[0] || !media_dir || !media_dir[0]) return false;
+    char file_parent[512] = {0};
+    const char *ls1 = strrchr(filepath, '\\');
+    const char *ls2 = strrchr(filepath, '/');
+    if (ls2 && (!ls1 || ls2 > ls1)) ls1 = ls2;
+    if (!ls1) return false;
+    size_t dl = (size_t)(ls1 - filepath);
+    if (dl >= sizeof(file_parent)) dl = sizeof(file_parent) - 1;
+    memcpy(file_parent, filepath, dl);
+    file_parent[dl] = '\0';
+    return daw_paths_equal_norm(file_parent, media_dir);
+}
+
+static int64_t get_file_byte_size_helper(const char *path) {
+    if (!path || !path[0]) return -1;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    if (daw_fseek64(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    int64_t sz = daw_ftell64(fp);
+    fclose(fp);
+    return sz;
+}
+
+static bool copy_binary_file_to_dest(const char *src_path, const char *dst_path) {
+    if (!src_path || !src_path[0] || !dst_path || !dst_path[0]) return false;
+    if (daw_paths_equal_norm(src_path, dst_path)) return true;
+#ifdef _WIN32
+    if (CopyFileA(src_path, dst_path, FALSE)) return true;
+#endif
+    FILE *in = fopen(src_path, "rb");
+    if (!in) return false;
+    FILE *out = fopen(dst_path, "wb");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+    char buf[65536];
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = false;
+            break;
+        }
+    }
+    fflush(out);
+    fclose(in);
+    fclose(out);
+    return ok;
+}
+
+// Requirement 5: Any media item dropped or imported into the app from outside <Project>/media is copied into <Project>/media.
+// If the file is already inside <Project>/media, no need to copy.
+static void copy_media_to_project_media_folder_if_needed(ProjectTab *p, const char *src_path,
+                                                         char *out_path, size_t max_len) {
+    if (!out_path || max_len == 0) return;
+    if (!src_path || !src_path[0]) {
+        out_path[0] = '\0';
+        return;
+    }
+
+    char media_dir[512] = {0};
+    get_project_media_folder(p, media_dir, sizeof(media_dir));
+
+    // If file is already inside <Project>/media, do not copy
+    if (is_file_already_in_media_dir(src_path, media_dir)) {
+        snprintf(out_path, max_len, "%s", src_path);
+        return;
+    }
+
+    const char *fn = strrchr(src_path, '\\');
+    const char *fn2 = strrchr(src_path, '/');
+    if (fn2 && (!fn || fn2 > fn)) fn = fn2;
+    const char *short_name = fn ? (fn + 1) : src_path;
+    if (!short_name[0]) {
+        snprintf(out_path, max_len, "%s", src_path);
+        return;
+    }
+
+    char dst_cand[512] = {0};
+#ifdef _WIN32
+    snprintf(dst_cand, sizeof(dst_cand), "%s\\""%s", media_dir, short_name);
+#else
+    snprintf(dst_cand, sizeof(dst_cand), "%s/%s", media_dir, short_name);
+#endif
+
+    if (daw_paths_equal_norm(src_path, dst_cand)) {
+        snprintf(out_path, max_len, "%s", src_path);
+        return;
+    }
+
+    int64_t src_sz = get_file_byte_size_helper(src_path);
+    int64_t dst_sz = get_file_byte_size_helper(dst_cand);
+    if (dst_sz >= 0) {
+        if (src_sz > 0 && dst_sz == src_sz) {
+            // Identical-sized file already exists in <Project>/media
+            snprintf(out_path, max_len, "%s", dst_cand);
+            return;
+        }
+        // Different file with same name exists: pick <stem>_1.<ext>, <stem>_2.<ext>, ...
+        char stem[128] = {0};
+        char ext[32]   = {0};
+        const char *dot = strrchr(short_name, '.');
+        if (dot && dot > short_name) {
+            size_t sl = (size_t)(dot - short_name);
+            if (sl >= sizeof(stem)) sl = sizeof(stem) - 1;
+            memcpy(stem, short_name, sl);
+            stem[sl] = '\0';
+            snprintf(ext, sizeof(ext), "%s", dot);
+        } else {
+            snprintf(stem, sizeof(stem), "%s", short_name);
+        }
+        for (int k = 1; k < 1000; k++) {
+#ifdef _WIN32
+            snprintf(dst_cand, sizeof(dst_cand), "%s\\%s_%d%s", media_dir, stem, k, ext);
+#else
+            snprintf(dst_cand, sizeof(dst_cand), "%s/%s_%d%s", media_dir, stem, k, ext);
+#endif
+            int64_t c_sz = get_file_byte_size_helper(dst_cand);
+            if (c_sz < 0) break;
+            if (src_sz > 0 && c_sz == src_sz) {
+                snprintf(out_path, max_len, "%s", dst_cand);
+                return;
+            }
+        }
+    }
+
+    if (copy_binary_file_to_dest(src_path, dst_cand)) {
+        snprintf(out_path, max_len, "%s", dst_cand);
+    } else {
+        snprintf(out_path, max_len, "%s", src_path);
+    }
+}
+
 // Imports a single media file onto target_trk at target_time using the progress popup
 static void import_single_media_item(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win,
                                      const char *filepath, int target_trk, double target_time) {
@@ -6921,6 +7496,9 @@ static void import_single_media_item(ProjectTab *p, SDL_Renderer *ren, SDL_Windo
     }
     if (target_trk >= p->num_tracks) target_trk = p->num_tracks - 1;
 
+    char media_filepath[512] = {0};
+    copy_media_to_project_media_folder_if_needed(p, filepath, media_filepath, sizeof(media_filepath));
+
     push_undo_state();
     int new_idx = p->num_items;
     int tab_i = get_valid_tab_idx();
@@ -6929,7 +7507,7 @@ static void import_single_media_item(ProjectTab *p, SDL_Renderer *ren, SDL_Windo
     it->track_idx = target_trk;
     it->start_time = target_time;
 
-    if (import_media_with_progress(ren, win, filepath, it, 1, 1) == 0) {
+    if (import_media_with_progress(ren, win, media_filepath, it, 1, 1) == 0) {
         if (!is_crossfade_active()) {
             it->start_time = clamp_non_overlapping_start(p, new_idx, target_trk, it->start_time, it->duration);
         }
@@ -6988,7 +7566,9 @@ static void execute_multi_media_import(ProjectTab *p, SDL_Renderer *ren, SDL_Win
         it->track_idx = trk;
         it->start_time = (g_multi_import.mode == MULTI_IMPORT_SEPARATE_TRACKS) ? g_multi_import.base_time : seq_time;
 
-        if (import_media_with_progress(ren, win, g_multi_import.files[k], it, k + 1, total) == 0) {
+        char media_filepath[512] = {0};
+        copy_media_to_project_media_folder_if_needed(p, g_multi_import.files[k], media_filepath, sizeof(media_filepath));
+        if (import_media_with_progress(ren, win, media_filepath, it, k + 1, total) == 0) {
             if (g_multi_import.mode == MULTI_IMPORT_SEPARATE_TRACKS) {
                 it->start_time = g_multi_import.base_time;
                 if (!is_crossfade_active()) {
@@ -7022,6 +7602,7 @@ static void execute_multi_media_import(ProjectTab *p, SDL_Renderer *ren, SDL_Win
 #define EHS_EXT_MAGIC  0x45485333U // "EHS3" Extended Project Metadata Signature
 #define EHS_EXT4_MAGIC 0x45485334U // "EHS4" Complete Session, Color, Peak Color & History Signature
 #define EHS_EXT5_MAGIC 0x45485335U // "EHS5" Track Lock & Lock Mode Options Signature
+#define EHS_EXT6_MAGIC 0x45485336U // "EHS6" App Hearing Volume (Master & Per-Track Monitor Level) Signature
 
 static void ensure_recording_directory_exists(const char *dir_path);
 static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
@@ -7299,8 +7880,9 @@ static void delete_all_files_in_temp_dir(const char *dir_path) {
 // Requirement 4: When a project tab or the software exits without saving, auto-delete temporary recorded & glued files
 // inside 'Temporary Media' so the 'Temporary Media' folder becomes completely empty.
 void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
-    init_default_recording_folder();
-
+    (void)is_temp_recordings_clip_path;
+    (void)delete_all_files_in_temp_dir;
+    (void)sweep_and_empty_temp_recordings_dir;
     if (g_rec.is_recording && (delete_all_temp_files || tab_idx < 0 || tab_idx == g_daw.active_tab)) {
         g_rec.is_recording = false;
         if (g_rec.capture_dev > 0) {
@@ -7326,48 +7908,8 @@ void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
                 fclose(it->raw_file_handle);
                 it->raw_file_handle = NULL;
             }
-            if (is_temp_recordings_clip_path(it->file_path)) {
-                bool used_by_other_tab = false;
-                if (!delete_all_temp_files) {
-                    for (int ot = 0; ot < g_daw.num_tabs; ot++) {
-                        if (ot == tab_idx) continue;
-                        for (int oi = 0; oi < g_daw.tabs[ot].num_items; oi++) {
-                            if (daw_paths_equal_norm(g_daw.tabs[ot].items[oi].file_path, it->file_path)) {
-                                used_by_other_tab = true;
-                                break;
-                            }
-                        }
-                        if (used_by_other_tab) break;
-                    }
-                }
-                if (!used_by_other_tab) {
-                    remove(it->file_path);
-                    if (it->raw_audio_path[0]) remove(it->raw_audio_path);
-                }
-            }
         }
         reset_tab_undo_history(tab_idx);
-    }
-
-    // Check if any remaining open tab still references any temporary file
-    bool any_remaining_temp = false;
-    if (!delete_all_temp_files) {
-        for (int t = 0; t < g_daw.num_tabs; t++) {
-            if (t == tab_idx) continue;
-            for (int i = 0; i < g_daw.tabs[t].num_items; i++) {
-                if (is_temp_recordings_clip_path(g_daw.tabs[t].items[i].file_path)) {
-                    any_remaining_temp = true;
-                    break;
-                }
-            }
-            if (any_remaining_temp) break;
-        }
-    }
-
-    if (delete_all_temp_files || !any_remaining_temp) {
-        delete_all_files_in_temp_dir(g_rec.folder_path);
-        delete_all_files_in_temp_dir("Temporary Media");
-        delete_all_files_in_temp_dir("Recordings");
     }
 }
 
@@ -7481,9 +8023,35 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
 #endif
     }
 
-    // Auto-create the project folder and permanently move all temporary Recorded & Glued clips into it
+    // Auto-create the Project folder (<ProjectName>/) and its internal "media" subfolder (<ProjectName>/media/)
+    char media_folder[512] = {0};
+#ifdef _WIN32
+    snprintf(media_folder, sizeof(media_folder), "%s\\media", proj_folder);
+#else
+    snprintf(media_folder, sizeof(media_folder), "%s/media", proj_folder);
+#endif
     ensure_recording_directory_exists(proj_folder);
-    migrate_temp_recordings_to_project_folder(p, proj_folder);
+    ensure_recording_directory_exists(media_folder);
+    strncpy(g_rec.folder_path, media_folder, sizeof(g_rec.folder_path) - 1);
+    g_rec.folder_path[sizeof(g_rec.folder_path) - 1] = '\0';
+    (void)migrate_temp_recordings_to_project_folder;
+
+    // Ensure every clip in the project is copied into <ProjectFolder>/media if it came from outside
+    strncpy(p->project_path, final_ehs_path, sizeof(p->project_path) - 1);
+    p->project_path[sizeof(p->project_path) - 1] = '\0';
+    for (int i = 0; i < p->num_items; i++) {
+        AudioItem *it = &p->items[i];
+        if (it->file_path[0] != '\0' && !is_file_already_in_media_dir(it->file_path, media_folder)) {
+            char old_p[512];
+            strncpy(old_p, it->file_path, sizeof(old_p) - 1);
+            old_p[sizeof(old_p) - 1] = '\0';
+            char new_p[512] = {0};
+            copy_media_to_project_media_folder_if_needed(p, old_p, new_p, sizeof(new_p));
+            if (new_p[0] != '\0' && !daw_paths_equal_norm(old_p, new_p)) {
+                update_clip_filepath_references(old_p, new_p);
+            }
+        }
+    }
 
     FILE *f = fopen(final_ehs_path, "wb");
     if (!f) {
@@ -7577,6 +8145,13 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     fwrite(g_track_lock_ud_only[tab_i], sizeof(bool), MAX_TRACKS, f);
     fwrite(&g_lock_opt_complete_unlock[tab_i], sizeof(bool), 1, f);
 
+    // 5. Write App Hearing Volume Block ("EHS6": Master & Per-Track Monitor Volume 0..100)
+    ensure_app_vol_defaults_initialized();
+    uint32_t magic6 = EHS_EXT6_MAGIC;
+    fwrite(&magic6, sizeof(uint32_t), 1, f);
+    fwrite(&g_app_master_vol[tab_i], sizeof(float), 1, f);
+    fwrite(g_app_track_vol[tab_i], sizeof(float), MAX_TRACKS, f);
+
     fflush(f);
     fclose(f);
 
@@ -7586,8 +8161,29 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     snprintf(p->project_name, sizeof(p->project_name), "%s", proj_base_name);
     strip_ehs_extension(p->project_name);
     p->is_dirty = false;
-    record_project_change("Project Saved (Clips Moved to Project Folder)", false);
+    g_tab_needs_project_setup[tab_i] = false;
+    record_project_change("Project Saved (Media Folder Synced)", false);
     return true;
+}
+
+// Opens Browse/Save dialog for "Create Project File" option on New Project Tab modal:
+// Creates <ParentDir>/<ProjectName>/, <ParentDir>/<ProjectName>/<ProjectName>.ehs, and <ParentDir>/<ProjectName>/media/
+static bool daw_create_new_project_file_dialog(ProjectTab *p) {
+    if (!p) return false;
+    char path[MAX_PATH] = {0};
+    snprintf(path, sizeof(path), "%s.ehs", p->project_name[0] ? p->project_name : "Project_1");
+    if (!open_generic_dialog(path, sizeof(path), "Create Project File (*.ehs)\0*.ehs\0", true)) {
+        return false;
+    }
+    if (!strstr(path, ".ehs") && !strstr(path, ".EHS")) {
+        strncat(path, ".ehs", sizeof(path) - strlen(path) - 1);
+    }
+    if (daw_save_project_to_path(p, path)) {
+        g_tab_needs_project_setup[get_valid_tab_idx()] = false;
+        record_project_change("Created Project Folder & Media Subfolder", false);
+        return true;
+    }
+    return false;
 }
 
 static void daw_save_project_dialog(ProjectTab *p, bool force_dialog) {
@@ -7788,6 +8384,7 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
                 fread(&ext4_group_id[i], sizeof(int), 1, f);
             }
 
+            init_tab_app_volume_defaults(tab_i);
             uint32_t magic5 = 0;
             if (fread(&magic5, sizeof(uint32_t), 1, f) == 1 && magic5 == EHS_EXT5_MAGIC) {
                 fread(g_track_locked[tab_i], sizeof(bool), MAX_TRACKS, f);
@@ -7797,6 +8394,18 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
                 fread(g_track_lock_lr_only[tab_i], sizeof(bool), MAX_TRACKS, f);
                 fread(g_track_lock_ud_only[tab_i], sizeof(bool), MAX_TRACKS, f);
                 fread(&g_lock_opt_complete_unlock[tab_i], sizeof(bool), 1, f);
+
+                uint32_t magic6 = 0;
+                if (fread(&magic6, sizeof(uint32_t), 1, f) == 1 && magic6 == EHS_EXT6_MAGIC) {
+                    fread(&g_app_master_vol[tab_i], sizeof(float), 1, f);
+                    fread(g_app_track_vol[tab_i], sizeof(float), MAX_TRACKS, f);
+                    if (g_app_master_vol[tab_i] < 0.0f) g_app_master_vol[tab_i] = 0.0f;
+                    if (g_app_master_vol[tab_i] > 100.0f) g_app_master_vol[tab_i] = 100.0f;
+                    for (int tv = 0; tv < MAX_TRACKS; tv++) {
+                        if (g_app_track_vol[tab_i][tv] < 0.0f) g_app_track_vol[tab_i][tv] = 0.0f;
+                        if (g_app_track_vol[tab_i][tv] > 100.0f) g_app_track_vol[tab_i][tv] = 100.0f;
+                    }
+                }
             }
         }
     }
@@ -7836,25 +8445,34 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
                 const char *cfn2 = strrchr(saved_fpath[i], '/');
                 if (cfn2 && (!cfn || cfn2 > cfn)) cfn = cfn2;
                 const char *clip_short = cfn ? (cfn + 1) : saved_fpath[i];
-                char cand1[512], cand2[512];
+                char cand0[512], cand1[512], cand2[512];
 #ifdef _WIN32
+                snprintf(cand0, sizeof(cand0), "%s\\media\\%s", ehs_dir, clip_short);
                 snprintf(cand1, sizeof(cand1), "%s\\%s", ehs_dir, clip_short);
                 snprintf(cand2, sizeof(cand2), "%s\\%s\\%s", ehs_dir, ehs_base, clip_short);
 #else
+                snprintf(cand0, sizeof(cand0), "%s/media/%s", ehs_dir, clip_short);
                 snprintf(cand1, sizeof(cand1), "%s/%s", ehs_dir, clip_short);
                 snprintf(cand2, sizeof(cand2), "%s/%s/%s", ehs_dir, ehs_base, clip_short);
 #endif
-                FILE *c1 = fopen(cand1, "rb");
-                if (c1) {
-                    fclose(c1);
-                    strncpy(saved_fpath[i], cand1, sizeof(saved_fpath[i]) - 1);
+                FILE *c0 = fopen(cand0, "rb");
+                if (c0) {
+                    fclose(c0);
+                    strncpy(saved_fpath[i], cand0, sizeof(saved_fpath[i]) - 1);
                     saved_fpath[i][sizeof(saved_fpath[i]) - 1] = '\0';
                 } else {
-                    FILE *c2 = fopen(cand2, "rb");
-                    if (c2) {
-                        fclose(c2);
-                        strncpy(saved_fpath[i], cand2, sizeof(saved_fpath[i]) - 1);
+                    FILE *c1 = fopen(cand1, "rb");
+                    if (c1) {
+                        fclose(c1);
+                        strncpy(saved_fpath[i], cand1, sizeof(saved_fpath[i]) - 1);
                         saved_fpath[i][sizeof(saved_fpath[i]) - 1] = '\0';
+                    } else {
+                        FILE *c2 = fopen(cand2, "rb");
+                        if (c2) {
+                            fclose(c2);
+                            strncpy(saved_fpath[i], cand2, sizeof(saved_fpath[i]) - 1);
+                            saved_fpath[i][sizeof(saved_fpath[i]) - 1] = '\0';
+                        }
                     }
                 }
             }
@@ -7943,11 +8561,16 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
     snprintf(p->project_name, sizeof(p->project_name), "%s", fn ? fn + 1 : path);
     strip_ehs_extension(p->project_name);
 
+    // Ensure <ProjectFolder>/media exists for this loaded project
+    char loaded_media_dir[512] = {0};
+    get_project_media_folder(p, loaded_media_dir, sizeof(loaded_media_dir));
+
     // Reset undo stack to clean loaded state and clear dirty flag
     p->undo_mgr.head = -1;
     p->undo_mgr.count = 0;
     reset_tab_undo_history(tab_i);
     p->is_dirty = false;
+    g_tab_needs_project_setup[tab_i] = false;
     record_project_change("Project Imported", false);
 }
 
@@ -7978,14 +8601,12 @@ static void execute_join_glue_selected_items(ProjectTab *p, SDL_Renderer *ren, S
     }
     if (!has_sel) return;
 
-    init_default_recording_folder();
-    ensure_recording_directory_exists(g_rec.folder_path);
+    char proj_media_dir[512] = {0};
+    get_project_media_folder(p, proj_media_dir, sizeof(proj_media_dir));
 #ifdef _WIN32
     CreateDirectoryA(".cache", NULL);
-    CreateDirectoryA("Temporary Media", NULL);
 #else
     mkdir(".cache", 0777);
-    mkdir("Temporary Media", 0777);
 #endif
 
     p->is_playing = false;
@@ -8023,20 +8644,15 @@ static void execute_join_glue_selected_items(ProjectTab *p, SDL_Renderer *ren, S
         char wav_path[512];
         snprintf(raw_path, sizeof(raw_path), ".cache/glued_%u_t%d.raw", ticks, t + 1);
 #ifdef _WIN32
-        snprintf(wav_path, sizeof(wav_path), "%s\\Glued_Track%d_%u.wav", g_rec.folder_path, t + 1, ticks);
+        snprintf(wav_path, sizeof(wav_path), "%s\\Glued_Track%d_%u.wav", proj_media_dir, t + 1, ticks);
 #else
-        snprintf(wav_path, sizeof(wav_path), "%s/Glued_Track%d_%u.wav", g_rec.folder_path, t + 1, ticks);
+        snprintf(wav_path, sizeof(wav_path), "%s/Glued_Track%d_%u.wav", proj_media_dir, t + 1, ticks);
 #endif
 
         FILE *f_raw = fopen(raw_path, "wb");
         if (!f_raw) continue;
         setvbuf(f_raw, NULL, _IOFBF, 65536);
         FILE *f_wav = fopen(wav_path, "wb");
-        if (!f_wav) {
-            ensure_recording_directory_exists("Temporary Media");
-            snprintf(wav_path, sizeof(wav_path), "Temporary Media/Glued_Track%d_%u.wav", t + 1, ticks);
-            f_wav = fopen(wav_path, "wb");
-        }
         if (f_wav) {
             setvbuf(f_wav, NULL, _IOFBF, 65536);
             write_wav_pcm_header(f_wav, total_frames, SAMPLE_RATE, 2, 24);
@@ -8343,7 +8959,8 @@ static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window
     }
     if (p->num_items >= MAX_ITEMS) return;
 
-    ensure_recording_directory_exists(g_rec.folder_path);
+    char proj_media_dir[512] = {0};
+    get_project_media_folder(p, proj_media_dir, sizeof(proj_media_dir));
 #ifdef _WIN32
     CreateDirectoryA(".cache", NULL);
 #else
@@ -8355,18 +8972,17 @@ static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window
     char ts[32] = "20261021_083000";
     if (lt) strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", lt);
 
+#ifdef _WIN32
     snprintf(g_rec.current_wav_path, sizeof(g_rec.current_wav_path),
-             "%s\\Rec_Track%d_%s.wav", g_rec.folder_path, target_trk + 1, ts);
+             "%s\\Rec_Track%d_%s.wav", proj_media_dir, target_trk + 1, ts);
+#else
+    snprintf(g_rec.current_wav_path, sizeof(g_rec.current_wav_path),
+             "%s/Rec_Track%d_%s.wav", proj_media_dir, target_trk + 1, ts);
+#endif
     snprintf(g_rec.current_raw_path, sizeof(g_rec.current_raw_path),
              ".cache/rec_%u_%s.raw", (unsigned int)SDL_GetTicks(), ts);
 
     g_rec.wav_file = fopen(g_rec.current_wav_path, "wb");
-    if (!g_rec.wav_file) {
-        ensure_recording_directory_exists("Temporary Media");
-        snprintf(g_rec.current_wav_path, sizeof(g_rec.current_wav_path),
-                 "Temporary Media/Rec_Track%d_%s.wav", target_trk + 1, ts);
-        g_rec.wav_file = fopen(g_rec.current_wav_path, "wb");
-    }
     if (g_rec.wav_file) {
         write_wav_pcm_header(g_rec.wav_file, 0, SAMPLE_RATE, 2, 24);
     }
@@ -8458,17 +9074,26 @@ void audio_mixer_callback(void *userdata, Uint8 *stream, int len) {
     double et = st + ((double)frames_needed / (double)SAMPLE_RATE);
     float chunk[1024 * 2];
 
+    ensure_app_vol_defaults_initialized();
+    float app_master_pct = g_app_master_vol[tab];
+    float app_master_gain = (app_master_pct <= 0.001f) ? 0.0f : (app_master_pct / 100.0f);
+
     for (int i = 0; i < p->num_items; i++) {
         AudioItem *it = &p->items[i];
         if (!it->raw_file_handle) continue;
         if (it->track_idx < 0 || it->track_idx >= p->num_tracks) continue;
 
         Track *tr = &p->tracks[it->track_idx];
-        if (tr->mute) continue;
-        if (any_solo && !tr->solo) continue;
+        // Requirement 3: Solo takes first preference over Mute when both are active on a track header
+        if (!tr->solo && (tr->mute || any_solo)) continue;
         if (g_item_muted[tab][i]) continue;
 
-        float linear_gain = db_to_linear(p->track_db[it->track_idx] + g_item_vol_db[tab][i]);
+        // Requirement 4: App Hearing Volume (0 = infinity mute, 0..100% monitoring level only)
+        float app_trk_pct = g_app_track_vol[tab][it->track_idx];
+        if (app_master_gain <= 0.0f || app_trk_pct <= 0.001f) continue;
+        float app_hearing_gain = app_master_gain * (app_trk_pct / 100.0f);
+
+        float linear_gain = db_to_linear(p->track_db[it->track_idx] + g_item_vol_db[tab][i]) * app_hearing_gain;
         double it_s = it->start_time;
         double it_e = it->start_time + it->duration;
 
@@ -8610,8 +9235,8 @@ AudioItem* get_active_video_clip_at_playhead(ProjectTab *p) {
         AudioItem *it = &p->items[i];
         if (!it->has_video) continue;
         if (it->track_idx >= 0 && it->track_idx < p->num_tracks) {
-            if (p->tracks[it->track_idx].mute) continue;
-            if (any_solo && !p->tracks[it->track_idx].solo) continue;
+            Track *tr = &p->tracks[it->track_idx];
+            if (!tr->solo && (tr->mute || any_solo)) continue;
         }
 
         double clip_start = it->start_time;
@@ -8712,16 +9337,18 @@ static inline bool point_in_rect(int x, int y, const SDL_Rect *r) {
 // Green Checkmark on Two-pass render, Green 100% completion progress bar, and "File Already Exists" modal prompt)
 static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
     if (!g_export.is_open || !ren) return;
-    (void)p;
     SDL_Rect *er = &g_export.win_rect;
+    if (er->w < 720) er->w = 720;
+    if (er->h < 620) er->h = 620;
     int ex = er->x, ey = er->y, ew = er->w, eh = er->h;
-    SDL_Color c_white = { 224, 224, 224, 255 };
-    SDL_Color c_muted = { 130, 130, 130, 255 };
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 145, 140, 135, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
 
     // Subtle drop shadow
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_Rect shadow = { ex + 6, ey + 6, ew, eh };
-    SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 165);
     SDL_RenderFillRect(ren, &shadow);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
@@ -8738,49 +9365,66 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
     draw_text(ren, "Export Media", ex + 14, ey + 9, c_white);
     draw_text(ren, "X", ex + ew - 20, ey + 9, c_white);
 
-    // Time Bounds Indicator in Header
-    char bounds_txt[96];
-    if (is_range_active()) {
-        snprintf(bounds_txt, sizeof(bounds_txt), "Bounds: Cycle Range (%.2fs - %.2fs)",
-                 get_range_start(), get_range_end());
-    } else {
-        snprintf(bounds_txt, sizeof(bounds_txt), "Bounds: Entire Project");
-    }
-    draw_text(ren, bounds_txt, ex + 180, ey + 9, c_muted);
+    const char *bounds_mode = is_range_active()
+                              ? "Bounds: Cycle Range"
+                              : (g_export.source == EXPORT_SRC_ITEMS ? "Bounds: Selected Items" : "Bounds: Entire Project");
+    draw_text(ren, bounds_mode, ex + ew - 230, ey + 9, c_muted);
+
+    // ---- TOP EXPORT TIMINGS BAR: Start, End, Duration (Requirement 1) ----
+    double exp_s = 0.0, exp_e = 0.0;
+    get_export_time_bounds(p, &exp_s, &exp_e);
+    double exp_dur = fmax(0.0, exp_e - exp_s);
+    char s_tc[32], e_tc[32], d_tc[32];
+    format_timecode(exp_s, s_tc, sizeof(s_tc));
+    format_timecode(exp_e, e_tc, sizeof(e_tc));
+    format_timecode(exp_dur, d_tc, sizeof(d_tc));
+
+    SDL_Rect t_bar = { ex + 18, ey + 36, ew - 36, 28 };
+    SDL_SetRenderDrawColor(ren, 18, 17, 16, 255);
+    SDL_RenderFillRect(ren, &t_bar);
+    draw_brown_border_rect(ren, &t_bar, false, true);
+
+    char t_start_lbl[64], t_end_lbl[64], t_dur_lbl[64];
+    snprintf(t_start_lbl, sizeof(t_start_lbl), "Start: %s", s_tc);
+    snprintf(t_end_lbl,   sizeof(t_end_lbl),   "End: %s",   e_tc);
+    snprintf(t_dur_lbl,   sizeof(t_dur_lbl),   "Duration: %s", d_tc);
+    draw_text(ren, t_start_lbl, ex + 32,  ey + 44, c_white);
+    draw_text(ren, t_end_lbl,   ex + 258, ey + 44, c_white);
+    draw_text(ren, t_dur_lbl,   ex + 474, ey + 44, c_accent);
 
     // ---- 1. SOURCE SECTION ----
-    int sy_src = ey + 48;
-    draw_text(ren, "Source:", ex + 18, sy_src + 7, c_white);
+    int sy_src = ey + 74;
+    draw_text(ren, "Source:", ex + 18, sy_src + 8, c_white);
 
-    SDL_Rect b_src_master = { ex + 110, sy_src, 135, 26 };
+    SDL_Rect b_src_master = { ex + 130, sy_src, 150, 28 };
     SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_MASTER ? 68 : 38,
                                 g_export.source == EXPORT_SRC_MASTER ? 48 : 36,
                                 g_export.source == EXPORT_SRC_MASTER ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_src_master);
     draw_brown_border_rect(ren, &b_src_master, g_export.source == EXPORT_SRC_MASTER, false);
-    draw_text(ren, "Master mix", ex + 132, sy_src + 7, c_white);
+    draw_text(ren, "Master mix", b_src_master.x + 35, sy_src + 8, c_white);
 
-    SDL_Rect b_src_stems = { ex + 255, sy_src, 210, 26 };
+    SDL_Rect b_src_stems = { ex + 290, sy_src, 210, 28 };
     SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_STEMS ? 68 : 38,
                                 g_export.source == EXPORT_SRC_STEMS ? 48 : 36,
                                 g_export.source == EXPORT_SRC_STEMS ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_src_stems);
     draw_brown_border_rect(ren, &b_src_stems, g_export.source == EXPORT_SRC_STEMS, false);
-    draw_text(ren, "Selected tracks (stems)", ex + 266, sy_src + 7, c_white);
+    draw_text(ren, "Selected tracks (stems)", b_src_stems.x + 13, sy_src + 8, c_white);
 
-    SDL_Rect b_src_items = { ex + 475, sy_src, 187, 26 };
+    SDL_Rect b_src_items = { ex + 510, sy_src, 192, 28 };
     SDL_SetRenderDrawColor(ren, g_export.source == EXPORT_SRC_ITEMS ? 68 : 38,
                                 g_export.source == EXPORT_SRC_ITEMS ? 48 : 36,
                                 g_export.source == EXPORT_SRC_ITEMS ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_src_items);
     draw_brown_border_rect(ren, &b_src_items, g_export.source == EXPORT_SRC_ITEMS, false);
-    draw_text(ren, "Selected media items", ex + 486, sy_src + 7, c_white);
+    draw_text(ren, "Selected media items", b_src_items.x + 16, sy_src + 8, c_white);
 
     // ---- 2. OUTPUT SECTION (Directory + Browse, File Name) ----
-    int sy_dir = ey + 98;
-    draw_text(ren, "Directory:", ex + 18, sy_dir + 7, c_white);
+    int sy_dir = ey + 114;
+    draw_text(ren, "Directory:", ex + 18, sy_dir + 8, c_white);
 
-    SDL_Rect box_dir = { ex + 130, sy_dir, 415, 26 };
+    SDL_Rect box_dir = { ex + 130, sy_dir, 452, 28 };
     bool ed_dir = (g_export.active_field == EXP_FIELD_DIR);
     SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
     SDL_RenderFillRect(ren, &box_dir);
@@ -8789,18 +9433,18 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
     if (ed_dir) {
         daw_draw_text_edit_overlay(ren, g_export.directory, box_dir.x + 6, box_dir.y, box_dir.h, box_dir.x + box_dir.w - 4);
     }
-    draw_text_clipped(ren, g_export.directory, box_dir.x + 6, sy_dir + 7, c_white, &box_dir_clip, NULL);
+    draw_text_clipped(ren, g_export.directory, box_dir.x + 6, sy_dir + 8, c_white, &box_dir_clip, NULL);
 
-    SDL_Rect btn_browse = { ex + 555, sy_dir, 107, 26 };
+    SDL_Rect btn_browse = { ex + 592, sy_dir, 110, 28 };
     SDL_SetRenderDrawColor(ren, 52, 40, 30, 255);
     SDL_RenderFillRect(ren, &btn_browse);
     draw_brown_border_rect(ren, &btn_browse, false, false);
-    draw_text(ren, "Browse...", ex + 572, sy_dir + 7, c_white);
+    draw_text(ren, "Browse...", btn_browse.x + 19, sy_dir + 8, c_white);
 
-    int sy_fn = ey + 132;
-    draw_text(ren, "File Name:", ex + 18, sy_fn + 7, c_white);
+    int sy_fn = ey + 150;
+    draw_text(ren, "File Name:", ex + 18, sy_fn + 8, c_white);
 
-    SDL_Rect box_fn = { ex + 130, sy_fn, 415, 26 };
+    SDL_Rect box_fn = { ex + 130, sy_fn, 452, 28 };
     bool ed_fn = (g_export.active_field == EXP_FIELD_FILENAME);
     SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
     SDL_RenderFillRect(ren, &box_fn);
@@ -8809,162 +9453,169 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
     if (ed_fn) {
         daw_draw_text_edit_overlay(ren, g_export.filename, box_fn.x + 6, box_fn.y, box_fn.h, box_fn.x + box_fn.w - 4);
     }
-    draw_text_clipped(ren, g_export.filename, box_fn.x + 6, sy_fn + 7, c_white, &box_fn_clip, NULL);
+    draw_text_clipped(ren, g_export.filename, box_fn.x + 6, sy_fn + 8, c_white, &box_fn_clip, NULL);
     char ext_preview[16];
     snprintf(ext_preview, sizeof(ext_preview), ".%s", get_export_ext());
-    draw_text(ren, ext_preview, ex + 555, sy_fn + 7, c_muted);
+    draw_text(ren, ext_preview, ex + 594, sy_fn + 8, c_muted);
 
     // ---- 3. SAMPLE RATE & CHANNELS SECTION ----
-    int sy_sr = ey + 182;
-    draw_text(ren, "Sample Rate:", ex + 18, sy_sr + 7, c_white);
+    int sy_sr = ey + 190;
+    draw_text(ren, "Sample Rate:", ex + 18, sy_sr + 8, c_white);
 
-    SDL_Rect b_sr_48 = { ex + 130, sy_sr, 105, 26 };
+    SDL_Rect b_sr_48 = { ex + 130, sy_sr, 110, 28 };
     SDL_SetRenderDrawColor(ren, g_export.sample_rate == 48000 ? 68 : 38,
                                 g_export.sample_rate == 48000 ? 48 : 36,
                                 g_export.sample_rate == 48000 ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_sr_48);
     draw_brown_border_rect(ren, &b_sr_48, g_export.sample_rate == 48000, false);
-    draw_text(ren, "48,000 Hz", ex + 146, sy_sr + 7, c_white);
+    draw_text(ren, "48,000 Hz", b_sr_48.x + 19, sy_sr + 8, c_white);
 
-    SDL_Rect b_sr_44 = { ex + 243, sy_sr, 105, 26 };
+    SDL_Rect b_sr_44 = { ex + 248, sy_sr, 110, 28 };
     SDL_SetRenderDrawColor(ren, g_export.sample_rate == 44100 ? 68 : 38,
                                 g_export.sample_rate == 44100 ? 48 : 36,
                                 g_export.sample_rate == 44100 ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_sr_44);
     draw_brown_border_rect(ren, &b_sr_44, g_export.sample_rate == 44100, false);
-    draw_text(ren, "44,100 Hz", ex + 259, sy_sr + 7, c_white);
+    draw_text(ren, "44,100 Hz", b_sr_44.x + 19, sy_sr + 8, c_white);
 
-    draw_text(ren, "Channels:", ex + 372, sy_sr + 7, c_white);
+    draw_text(ren, "Channels:", ex + 382, sy_sr + 8, c_white);
 
-    SDL_Rect b_ch_mono = { ex + 455, sy_sr, 90, 26 };
+    SDL_Rect b_ch_mono = { ex + 466, sy_sr, 112, 28 };
     SDL_SetRenderDrawColor(ren, g_export.channels == 1 ? 68 : 38,
                                 g_export.channels == 1 ? 48 : 36,
                                 g_export.channels == 1 ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_ch_mono);
     draw_brown_border_rect(ren, &b_ch_mono, g_export.channels == 1, false);
-    draw_text(ren, "Mono", ex + 482, sy_sr + 7, c_white);
+    draw_text(ren, "Mono", b_ch_mono.x + 40, sy_sr + 8, c_white);
 
-    SDL_Rect b_ch_stereo = { ex + 553, sy_sr, 102, 26 };
+    SDL_Rect b_ch_stereo = { ex + 586, sy_sr, 116, 28 };
     SDL_SetRenderDrawColor(ren, g_export.channels == 2 ? 68 : 38,
                                 g_export.channels == 2 ? 48 : 36,
                                 g_export.channels == 2 ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_ch_stereo);
     draw_brown_border_rect(ren, &b_ch_stereo, g_export.channels == 2, false);
-    draw_text(ren, "Stereo", ex + 578, sy_sr + 7, c_white);
+    draw_text(ren, "Stereo", b_ch_stereo.x + 34, sy_sr + 8, c_white);
 
     // ---- 4. FORMAT SECTION ----
-    int sy_fmt = ey + 232;
-    draw_text(ren, "Format:", ex + 18, sy_fmt + 7, c_white);
+    int sy_fmt = ey + 230;
+    draw_text(ren, "Format:", ex + 18, sy_fmt + 8, c_white);
 
-    SDL_Rect b_fmt_wav = { ex + 130, sy_fmt, 130, 28 };
+    SDL_Rect b_fmt_wav = { ex + 130, sy_fmt, 160, 28 };
     SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_WAV ? 68 : 38,
                                 g_export.format == EXPORT_FMT_WAV ? 48 : 36,
                                 g_export.format == EXPORT_FMT_WAV ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_fmt_wav);
     draw_brown_border_rect(ren, &b_fmt_wav, g_export.format == EXPORT_FMT_WAV, false);
-    draw_text(ren, "WAV (PCM)", ex + 158, sy_fmt + 8, c_white);
+    draw_text(ren, "WAV (PCM)", b_fmt_wav.x + 44, sy_fmt + 8, c_white);
 
-    SDL_Rect b_fmt_mp3 = { ex + 270, sy_fmt, 130, 28 };
+    SDL_Rect b_fmt_mp3 = { ex + 300, sy_fmt, 160, 28 };
     SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_MP3 ? 68 : 38,
                                 g_export.format == EXPORT_FMT_MP3 ? 48 : 36,
                                 g_export.format == EXPORT_FMT_MP3 ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_fmt_mp3);
     draw_brown_border_rect(ren, &b_fmt_mp3, g_export.format == EXPORT_FMT_MP3, false);
-    draw_text(ren, "MP3 Audio", ex + 298, sy_fmt + 8, c_white);
+    draw_text(ren, "MP3 Audio", b_fmt_mp3.x + 44, sy_fmt + 8, c_white);
 
-    SDL_Rect b_fmt_mp4 = { ex + 410, sy_fmt, 245, 28 };
+    SDL_Rect b_fmt_mp4 = { ex + 470, sy_fmt, 232, 28 };
     SDL_SetRenderDrawColor(ren, g_export.format == EXPORT_FMT_MP4 ? 68 : 38,
                                 g_export.format == EXPORT_FMT_MP4 ? 48 : 36,
                                 g_export.format == EXPORT_FMT_MP4 ? 32 : 34, 255);
     SDL_RenderFillRect(ren, &b_fmt_mp4);
     draw_brown_border_rect(ren, &b_fmt_mp4, g_export.format == EXPORT_FMT_MP4, false);
-    draw_text(ren, "MP4 (MPEG-4 Video)", ex + 455, sy_fmt + 8, c_white);
+    draw_text(ren, "MP4 (MPEG-4 Video)", b_fmt_mp4.x + 44, sy_fmt + 8, c_white);
 
-    // Format Details Sub-Panel (ey + 272 .. ey + 422)
-    SDL_Rect sub_panel = { ex + 18, ey + 272, ew - 36, 152 };
+    // Format Details Sub-Panel (ey + 268 .. ey + 442)
+    SDL_Rect sub_panel = { ex + 18, ey + 268, ew - 36, 174 };
     SDL_SetRenderDrawColor(ren, 20, 19, 18, 255);
     SDL_RenderFillRect(ren, &sub_panel);
     draw_brown_border_rect(ren, &sub_panel, false, true);
 
-    int sy_sub = ey + 278;
+    int sy_sub = ey + 274;
     if (g_export.format == EXPORT_FMT_WAV) {
-        draw_text(ren, "WAV Bit Depth:", ex + 34, sy_sub + 19, c_white);
+        draw_text(ren, "WAV Bit Depth:", ex + 34, sy_sub + 22, c_white);
 
-        SDL_Rect b_w16 = { ex + 150, sy_sub + 12, 130, 28 };
+        SDL_Rect b_w16 = { ex + 160, sy_sub + 14, 150, 28 };
         SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 16 ? 68 : 38,
                                     g_export.wav_bit_depth == 16 ? 48 : 36,
                                     g_export.wav_bit_depth == 16 ? 32 : 34, 255);
         SDL_RenderFillRect(ren, &b_w16);
         draw_brown_border_rect(ren, &b_w16, g_export.wav_bit_depth == 16, false);
-        draw_text(ren, "16 bit PCM", ex + 174, sy_sub + 20, c_white);
+        draw_text(ren, "16 bit PCM", b_w16.x + 35, sy_sub + 22, c_white);
 
-        SDL_Rect b_w24 = { ex + 292, sy_sub + 12, 130, 28 };
+        SDL_Rect b_w24 = { ex + 322, sy_sub + 14, 150, 28 };
         SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 24 ? 68 : 38,
                                     g_export.wav_bit_depth == 24 ? 48 : 36,
                                     g_export.wav_bit_depth == 24 ? 32 : 34, 255);
         SDL_RenderFillRect(ren, &b_w24);
         draw_brown_border_rect(ren, &b_w24, g_export.wav_bit_depth == 24, false);
-        draw_text(ren, "24 bit PCM", ex + 316, sy_sub + 20, c_white);
+        draw_text(ren, "24 bit PCM", b_w24.x + 35, sy_sub + 22, c_white);
 
-        SDL_Rect b_w32 = { ex + 434, sy_sub + 12, 130, 28 };
+        SDL_Rect b_w32 = { ex + 484, sy_sub + 14, 150, 28 };
         SDL_SetRenderDrawColor(ren, g_export.wav_bit_depth == 32 ? 68 : 38,
                                     g_export.wav_bit_depth == 32 ? 48 : 36,
                                     g_export.wav_bit_depth == 32 ? 32 : 34, 255);
         SDL_RenderFillRect(ren, &b_w32);
         draw_brown_border_rect(ren, &b_w32, g_export.wav_bit_depth == 32, false);
-        draw_text(ren, "32 bit PCM", ex + 458, sy_sub + 20, c_white);
+        draw_text(ren, "32 bit PCM", b_w32.x + 35, sy_sub + 22, c_white);
 
-        draw_text(ren, "Uncompressed studio-quality linear PCM WAVE format.", ex + 34, sy_sub + 62, c_muted);
+        draw_text(ren, "Uncompressed studio-quality linear PCM WAVE format.", ex + 34, sy_sub + 70, c_muted);
     } else if (g_export.format == EXPORT_FMT_MP3) {
-        draw_text(ren, "MP3 Bitrate:", ex + 34, sy_sub + 19, c_white);
+        draw_text(ren, "MP3 Bitrate:", ex + 34, sy_sub + 22, c_white);
 
-        SDL_Rect b_m128 = { ex + 150, sy_sub + 12, 130, 28 };
+        SDL_Rect b_m128 = { ex + 160, sy_sub + 14, 150, 28 };
         SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 128 ? 68 : 38,
                                     g_export.mp3_bitrate == 128 ? 48 : 36,
                                     g_export.mp3_bitrate == 128 ? 32 : 34, 255);
         SDL_RenderFillRect(ren, &b_m128);
         draw_brown_border_rect(ren, &b_m128, g_export.mp3_bitrate == 128, false);
-        draw_text(ren, "128 kbps", ex + 182, sy_sub + 20, c_white);
+        draw_text(ren, "128 kbps", b_m128.x + 43, sy_sub + 22, c_white);
 
-        SDL_Rect b_m192 = { ex + 292, sy_sub + 12, 130, 28 };
+        SDL_Rect b_m192 = { ex + 322, sy_sub + 14, 150, 28 };
         SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 192 ? 68 : 38,
                                     g_export.mp3_bitrate == 192 ? 48 : 36,
                                     g_export.mp3_bitrate == 192 ? 32 : 34, 255);
         SDL_RenderFillRect(ren, &b_m192);
         draw_brown_border_rect(ren, &b_m192, g_export.mp3_bitrate == 192, false);
-        draw_text(ren, "192 kbps", ex + 324, sy_sub + 20, c_white);
+        draw_text(ren, "192 kbps", b_m192.x + 43, sy_sub + 22, c_white);
 
-        SDL_Rect b_m320 = { ex + 434, sy_sub + 12, 130, 28 };
+        SDL_Rect b_m320 = { ex + 484, sy_sub + 14, 150, 28 };
         SDL_SetRenderDrawColor(ren, g_export.mp3_bitrate == 320 ? 68 : 38,
                                     g_export.mp3_bitrate == 320 ? 48 : 36,
                                     g_export.mp3_bitrate == 320 ? 32 : 34, 255);
         SDL_RenderFillRect(ren, &b_m320);
         draw_brown_border_rect(ren, &b_m320, g_export.mp3_bitrate == 320, false);
-        draw_text(ren, "320 kbps", ex + 466, sy_sub + 20, c_white);
+        draw_text(ren, "320 kbps", b_m320.x + 43, sy_sub + 22, c_white);
 
-        draw_text(ren, "MPEG-1/2 Audio Layer III constant bitrate encoding.", ex + 34, sy_sub + 62, c_muted);
+        draw_text(ren, "MPEG-1/2 Audio Layer III constant bitrate encoding.", ex + 34, sy_sub + 70, c_muted);
     } else if (g_export.format == EXPORT_FMT_MP4) {
-        // Row 1: File: [ MPEG-4 ]   Size: [ 1920 x 1080 (Full HD)  v ]   Framerate: [ 25.00 ]
-        int r1_y = sy_sub + 8;
+        // Row 1: File: [ MPEG-4 ]   Size: [ Preset Dropdown v ]   FPS: [ 25.00 ] fps
+        int r1_y = sy_sub + 6;
         draw_text(ren, "File:", ex + 34, r1_y + 7, c_white);
-        SDL_Rect box_mpeg4 = { ex + 92, r1_y, 108, 26 };
+        SDL_Rect box_mpeg4 = { ex + 96, r1_y, 110, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_mpeg4);
         draw_brown_border_rect(ren, &box_mpeg4, false, false);
-        draw_text(ren, "MPEG-4", ex + 104, r1_y + 7, c_white);
+        draw_text(ren, "MPEG-4", box_mpeg4.x + 31, r1_y + 7, c_white);
 
-        // Requirement 4: Video export resolution 'Size:' dropdown menu (default 1920 x 1080 (Full HD))
-        draw_text(ren, "Size:", ex + 212, r1_y + 7, c_white);
+        draw_text(ren, "Size:", ex + 224, r1_y + 7, c_white);
         int cur_res_idx = get_current_mp4_res_preset_idx();
-        SDL_Rect box_size_dd = { ex + 260, r1_y, 206, 26 };
+        SDL_Rect box_size_dd = { ex + 272, r1_y, 216, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_size_dd);
         draw_brown_border_rect(ren, &box_size_dd, g_export.mp4_size_dropdown_open, false);
-        draw_text(ren, g_mp4_res_presets[cur_res_idx].label, box_size_dd.x + 8, r1_y + 7, c_white);
+        char size_dd_lbl[48];
+        if (cur_res_idx >= 0 && cur_res_idx < NUM_MP4_RES_PRESETS) {
+            snprintf(size_dd_lbl, sizeof(size_dd_lbl), "%s", g_mp4_res_presets[cur_res_idx].label);
+        } else {
+            snprintf(size_dd_lbl, sizeof(size_dd_lbl), "Custom (%s x %s)",
+                     g_export.mp4_width_str[0] ? g_export.mp4_width_str : "1920",
+                     g_export.mp4_height_str[0] ? g_export.mp4_height_str : "1080");
+        }
+        draw_text(ren, size_dd_lbl, box_size_dd.x + 8, r1_y + 7, c_white);
         draw_text(ren, "v", box_size_dd.x + box_size_dd.w - 16, r1_y + 7, c_muted);
 
-        draw_text(ren, "Framerate:", ex + 478, r1_y + 7, c_white);
-        SDL_Rect box_fps = { ex + 568, r1_y, 80, 26 };
+        draw_text(ren, "FPS:", ex + 504, r1_y + 7, c_white);
+        SDL_Rect box_fps = { ex + 544, r1_y, 92, 26 };
         bool ed_fps = (g_export.active_field == EXP_FIELD_MP4_FPS);
         SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
         SDL_RenderFillRect(ren, &box_fps);
@@ -8973,17 +9624,48 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
             daw_draw_text_edit_overlay(ren, g_export.mp4_fps_str, box_fps.x + 8, box_fps.y, box_fps.h, box_fps.x + box_fps.w - 4);
         }
         draw_text(ren, g_export.mp4_fps_str, box_fps.x + 8, r1_y + 7, c_white);
+        draw_text(ren, "fps", ex + 644, r1_y + 7, c_muted);
 
-        // Row 2: Video: [ H.264 ]   [ 2048 ] kbps
+        // Row 2 (Requirement 1): Manual Resolution Input (Width x Height)
         int r2_y = sy_sub + 46;
-        draw_text(ren, "Video:", ex + 34, r2_y + 7, c_white);
-        SDL_Rect box_vcodec = { ex + 92, r2_y, 152, 26 };
+        draw_text(ren, "Resolution:", ex + 34, r2_y + 7, c_white);
+        draw_text(ren, "Width:", ex + 132, r2_y + 7, c_muted);
+
+        SDL_Rect box_mp4_w = { ex + 186, r2_y, 92, 26 };
+        bool ed_w = (g_export.active_field == EXP_FIELD_MP4_WIDTH);
+        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+        SDL_RenderFillRect(ren, &box_mp4_w);
+        draw_brown_border_rect(ren, &box_mp4_w, ed_w, false);
+        if (ed_w) {
+            daw_draw_text_edit_overlay(ren, g_export.mp4_width_str, box_mp4_w.x + 8, box_mp4_w.y, box_mp4_w.h, box_mp4_w.x + box_mp4_w.w - 4);
+        }
+        draw_text(ren, g_export.mp4_width_str, box_mp4_w.x + 8, r2_y + 7, ed_w ? c_accent : c_white);
+
+        draw_text(ren, "x", ex + 288, r2_y + 7, c_white);
+        draw_text(ren, "Height:", ex + 308, r2_y + 7, c_muted);
+
+        SDL_Rect box_mp4_h = { ex + 370, r2_y, 92, 26 };
+        bool ed_h = (g_export.active_field == EXP_FIELD_MP4_HEIGHT);
+        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+        SDL_RenderFillRect(ren, &box_mp4_h);
+        draw_brown_border_rect(ren, &box_mp4_h, ed_h, false);
+        if (ed_h) {
+            daw_draw_text_edit_overlay(ren, g_export.mp4_height_str, box_mp4_h.x + 8, box_mp4_h.y, box_mp4_h.h, box_mp4_h.x + box_mp4_h.w - 4);
+        }
+        draw_text(ren, g_export.mp4_height_str, box_mp4_h.x + 8, r2_y + 7, ed_h ? c_accent : c_white);
+        draw_text(ren, "px (Manual Size Input)", ex + 474, r2_y + 7, c_muted);
+
+        // Row 3: Video: [ H.264 ]   Bitrate: [ 2048 ] kbps
+        int r3_y = sy_sub + 86;
+        draw_text(ren, "Video:", ex + 34, r3_y + 7, c_white);
+        SDL_Rect box_vcodec = { ex + 96, r3_y, 110, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_vcodec);
         draw_brown_border_rect(ren, &box_vcodec, false, false);
-        draw_text(ren, "H.264", ex + 104, r2_y + 7, c_white);
+        draw_text(ren, "H.264", box_vcodec.x + 35, r3_y + 7, c_white);
 
-        SDL_Rect box_vkbps = { ex + 260, r2_y, 100, 26 };
+        draw_text(ren, "Bitrate:", ex + 224, r3_y + 7, c_white);
+        SDL_Rect box_vkbps = { ex + 292, r3_y, 100, 26 };
         bool ed_vk = (g_export.active_field == EXP_FIELD_MP4_V_KBPS);
         SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
         SDL_RenderFillRect(ren, &box_vkbps);
@@ -8991,31 +9673,32 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
         if (ed_vk) {
             daw_draw_text_edit_overlay(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, box_vkbps.y, box_vkbps.h, box_vkbps.x + box_vkbps.w - 4);
         }
-        draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r2_y + 7, c_white);
-        draw_text(ren, "kbps", ex + 370, r2_y + 7, c_white);
+        draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r3_y + 7, c_white);
+        draw_text(ren, "kbps", ex + 402, r3_y + 7, c_muted);
 
-        // Row 3 (Requirement 4): Keep ONLY AAC audio format for MP4 video export
-        int r3_y = sy_sub + 84;
-        draw_text(ren, "Audio:", ex + 34, r3_y + 7, c_white);
+        // Row 4: Audio: [ AAC ]   Bitrate: [ 192 kbps v ]
+        int r4_y = sy_sub + 126;
+        draw_text(ren, "Audio:", ex + 34, r4_y + 7, c_white);
 
-        SDL_Rect box_ac_aac = { ex + 92, r3_y, 152, 26 };
+        SDL_Rect box_ac_aac = { ex + 96, r4_y, 110, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_ac_aac);
         draw_brown_border_rect(ren, &box_ac_aac, true, false);
-        draw_text(ren, "AAC", ex + 104, r3_y + 7, c_white);
+        draw_text(ren, "AAC", box_ac_aac.x + 43, r4_y + 7, c_white);
 
-        SDL_Rect box_akbps = { ex + 260, r3_y, 130, 26 };
+        draw_text(ren, "Bitrate:", ex + 224, r4_y + 7, c_white);
+        SDL_Rect box_akbps = { ex + 292, r4_y, 136, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_akbps);
         draw_brown_border_rect(ren, &box_akbps, g_export.mp4_aac_dropdown_open, false);
         char aac_rate_lbl[32];
         snprintf(aac_rate_lbl, sizeof(aac_rate_lbl), "%s kbps", g_export.mp4_audio_kbps_str);
-        draw_text(ren, aac_rate_lbl, box_akbps.x + 10, r3_y + 7, c_white);
-        draw_text(ren, "v", box_akbps.x + box_akbps.w - 18, r3_y + 7, c_muted);
+        draw_text(ren, aac_rate_lbl, box_akbps.x + 12, r4_y + 7, c_white);
+        draw_text(ren, "v", box_akbps.x + box_akbps.w - 18, r4_y + 7, c_muted);
     }
 
-    // ---- 5. OPTION: TWO-PASS RENDER CHECKBOX (Requirement 5: Green Right Mark ✓ instead of x) ----
-    int sy_opt = ey + 436;
+    // ---- 5. OPTION: TWO-PASS RENDER CHECKBOX (Green Right Mark) ----
+    int sy_opt = ey + 454;
     SDL_Rect chk_box = { ex + 22, sy_opt + 2, 20, 20 };
     SDL_SetRenderDrawColor(ren, g_export.two_pass_render ? 22 : 20,
                                 g_export.two_pass_render ? 44 : 20,
@@ -9028,8 +9711,7 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
     draw_text(ren, "Option: Two-pass render", ex + 50, sy_opt + 6, c_white);
 
     // ---- 6. PROCESSING PROGRESS BAR, PERCENTAGE (%) & PROCESSING TIME ----
-    // Requirement 6: After export processing completed (100%), processing percentage showing bar is GREEN
-    SDL_Rect bar_bg = { ex + 22, ey + 468, ew - 44, 24 };
+    SDL_Rect bar_bg = { ex + 22, ey + 486, ew - 44, 26 };
     SDL_SetRenderDrawColor(ren, 16, 15, 14, 255);
     SDL_RenderFillRect(ren, &bar_bg);
 
@@ -9067,12 +9749,12 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
                  "Progress: %d%%   |   Processing Time: %.2fs",
                  g_export.progress_pct, g_export.elapsed_sec);
     }
-    draw_text(ren, pct_time_buf, bar_bg.x + 12, bar_bg.y + 6, c_white);
+    draw_text(ren, pct_time_buf, bar_bg.x + 12, bar_bg.y + 7, c_white);
 
     if (g_export.status_msg[0] != 0) {
-        SDL_Rect st_clip = { ex + 22, ey + 498, ew - 44, 22 };
+        SDL_Rect st_clip = { ex + 22, ey + 518, ew - 44, 22 };
         SDL_Color st_col = is_done_green ? (SDL_Color){ 88, 232, 118, 255 } : c_muted;
-        draw_text_clipped(ren, g_export.status_msg, ex + 22, ey + 500, st_col, &st_clip, NULL);
+        draw_text_clipped(ren, g_export.status_msg, ex + 22, ey + 520, st_col, &st_clip, NULL);
     }
 
     // ---- 7. BOTTOM ACTION BUTTONS ----
@@ -9081,19 +9763,19 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
     SDL_SetRenderDrawColor(ren, 78, 52, 32, 255);
     SDL_RenderFillRect(ren, &btn_render);
     draw_brown_border_rect(ren, &btn_render, true, false);
-    draw_text(ren, "Render / Export", ex + ew - 258, btn_y + 10, c_white);
+    draw_text(ren, "Render / Export", btn_render.x + 13, btn_y + 10, c_white);
 
     SDL_Rect btn_close = { ex + ew - 115, btn_y, 95, 32 };
     SDL_SetRenderDrawColor(ren, 44, 40, 38, 255);
     SDL_RenderFillRect(ren, &btn_close);
     draw_brown_border_rect(ren, &btn_close, false, false);
-    draw_text(ren, "Cancel", ex + ew - 92, btn_y + 10, c_white);
+    draw_text(ren, "Cancel", btn_close.x + 23, btn_y + 10, c_white);
 
     // ---- 8. DROPDOWN OVERLAYS (Drawn after main controls so they appear on top of everything) ----
     if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
-        int dd_x = ex + 260;
-        int dd_y = sy_sub + 84 + 26;
-        int dd_w = 130;
+        int dd_x = ex + 292;
+        int dd_y = sy_sub + 126 + 26;
+        int dd_w = 136;
         SDL_Rect dd_box = { dd_x, dd_y, dd_w, 78 };
         SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
         SDL_RenderFillRect(ren, &dd_box);
@@ -9112,9 +9794,9 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
     }
 
     if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_size_dropdown_open) {
-        int sdd_x = ex + 260;
-        int sdd_y = sy_sub + 8 + 26;
-        int sdd_w = 206;
+        int sdd_x = ex + 272;
+        int sdd_y = sy_sub + 6 + 26;
+        int sdd_w = 216;
         int sdd_h = NUM_MP4_RES_PRESETS * 26 + 4;
         SDL_Rect sdd_box = { sdd_x, sdd_y, sdd_w, sdd_h };
         SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
@@ -9132,7 +9814,7 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
         }
     }
 
-    // ---- 9. REQUIREMENT 3: "FILE ALREADY EXISTS" MODAL PROMPT (Replace Existing File / Rename File / Cancel) ----
+    // ---- 9. "FILE ALREADY EXISTS" MODAL PROMPT (Replace Existing File / Rename File / Cancel) ----
     if (g_export.overwrite_prompt_open) {
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
         SDL_Rect dim = { ex, ey, ew, eh };
@@ -9206,8 +9888,20 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
         return true;
     }
 
+    if (p && (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0')) return true;
     if (g_lock_popup_open && point_in_rect(mx, my, &g_lock_win_rect)) return true;
     if (g_multi_import.is_open && point_in_rect(mx, my, &g_multi_import.win_rect)) return true;
+    if (g_vol_popup.is_open && point_in_rect(mx, my, &g_vol_popup.win_rect)) return true;
+    if (g_range_popup.is_open && is_range_active() && point_in_rect(mx, my, &g_range_popup.win_rect)) {
+        if (out_cursor) {
+            int wx = g_range_popup.win_rect.x, wy = g_range_popup.win_rect.y, ww = g_range_popup.win_rect.w;
+            if (mx >= wx + 92 && mx <= wx + ww - 12 &&
+                ((my >= wy + 34 && my <= wy + 58) || (my >= wy + 64 && my <= wy + 88))) {
+                *out_cursor = g_cursor_ibeam;
+            }
+        }
+        return true;
+    }
 
     if (g_time_jump_open) {
         if (out_cursor) {
@@ -9386,11 +10080,16 @@ int main(int argc, char *argv[]) {
 
     set_daw_window_thumbnail_icon(win);
     init_default_recording_folder();
+    ensure_app_vol_defaults_initialized();
+    for (int st_i = 0; st_i < MAX_TABS; st_i++) {
+        init_tab_app_volume_defaults(st_i);
+        g_tab_needs_project_setup[st_i] = true;
+    }
     init_tab_defaults(0, "Project 1");
     init_keyboard_actions_system();
     reset_tab_undo_history(0);
     g_daw.tabs[0].is_dirty = false;
-    record_project_change("Project Initialized", false);
+    record_project_change("Project Initialized - Select Open or Create Project", false);
 
     SDL_AudioSpec want;
     SDL_zero(want);
@@ -9491,8 +10190,19 @@ int main(int argc, char *argv[]) {
             } else if (e.type == SDL_MOUSEWHEEL) {
                 int mx, my; SDL_GetMouseState(&mx, &my);
                 if (is_processing_blocking_input()) continue;
+                if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') continue;
                 if (g_export.is_open && point_in_rect(mx, my, &g_export.win_rect)) continue;
                 if (g_multi_import.is_open && point_in_rect(mx, my, &g_multi_import.win_rect)) continue;
+                if (g_range_popup.is_open && is_range_active() && point_in_rect(mx, my, &g_range_popup.win_rect)) continue;
+                if (g_vol_popup.is_open && point_in_rect(mx, my, &g_vol_popup.win_rect)) {
+                    int list_h = g_vol_popup.win_rect.h - 122;
+                    int content_h = p->num_tracks * 32 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    g_vol_popup.scroll_y -= e.wheel.y * 32;
+                    if (g_vol_popup.scroll_y < 0) g_vol_popup.scroll_y = 0;
+                    if (g_vol_popup.scroll_y > max_sc) g_vol_popup.scroll_y = max_sc;
+                    continue;
+                }
                 if (g_hide_popup_open && point_in_rect(mx, my, &g_hide_win_rect)) {
                     int list_h = g_hide_win_rect.h - 106;
                     int content_h = p->num_tracks * 26 + 8;
@@ -9580,6 +10290,20 @@ int main(int argc, char *argv[]) {
                 }
             } else if (e.type == SDL_TEXTINPUT) {
                 if (g_daw.save_prompt_open || g_track_delete_prompt_open || g_processing_popup_open) continue;
+                if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') continue;
+                if (g_range_popup.is_open && is_range_active() && g_range_popup.active_field != 0) {
+                    char clean_t[32] = {0};
+                    size_t j = 0;
+                    for (const char *c = e.text.text; *c && j + 1 < sizeof(clean_t); c++) {
+                        if (isdigit((unsigned char)*c) || *c == ':' || *c == '.') clean_t[j++] = *c;
+                    }
+                    clean_t[j] = '\0';
+                    if (clean_t[0]) {
+                        char *rbuf = (g_range_popup.active_field == 1) ? g_range_popup.start_buf : g_range_popup.end_buf;
+                        daw_text_edit_insert_text(rbuf, 31, clean_t);
+                    }
+                    continue;
+                }
                 if (g_time_jump_open) {
                     char clean_t[32] = {0};
                     size_t j = 0;
@@ -9648,7 +10372,8 @@ int main(int argc, char *argv[]) {
                     g_daw.editing_marker_buf[63] = '\0';
                 }
             } else if (e.type == SDL_DROPFILE) {
-                if (g_daw.save_prompt_open || g_export.is_open || g_multi_import.is_open) {
+                if (g_daw.save_prompt_open || g_export.is_open || g_multi_import.is_open ||
+                    g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') {
                     SDL_free(e.drop.file);
                     continue;
                 }
@@ -9684,6 +10409,37 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 SDL_Keymod mod = SDL_GetModState();
+                if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') {
+                    if (e.key.keysym.sym == SDLK_ESCAPE && g_daw.num_tabs > 1) {
+                        g_tab_needs_project_setup[g_daw.active_tab] = false;
+                        request_close_tab(g_daw.active_tab);
+                    }
+                    continue;
+                }
+                if (g_range_popup.is_open && is_range_active() &&
+                    (g_range_popup.active_field != 0 || point_in_rect(kmx, kmy, &g_range_popup.win_rect))) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        if (g_range_popup.active_field != 0) {
+                            g_range_popup.active_field = 0;
+                            SDL_StopTextInput();
+                            sync_range_popup_buffers_from_tab();
+                        } else {
+                            g_range_popup.is_open = false;
+                        }
+                    } else if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        commit_range_popup_edits();
+                    } else if (g_range_popup.active_field != 0) {
+                        char *rbuf = (g_range_popup.active_field == 1) ? g_range_popup.start_buf : g_range_popup.end_buf;
+                        daw_text_edit_handle_keydown(rbuf, 31, e.key.keysym.sym, mod);
+                    }
+                    continue;
+                }
+                if (g_vol_popup.is_open && point_in_rect(kmx, kmy, &g_vol_popup.win_rect)) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        g_vol_popup.is_open = false;
+                    }
+                    continue;
+                }
                 if (g_time_jump_open) {
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
                         g_time_jump_open = false;
@@ -9947,6 +10703,174 @@ int main(int argc, char *argv[]) {
 
                 // Requirement 4: When any kind of processing is active, mouse cursor/clicks must not work on panel
                 if (g_engine_processing || g_processing_popup_open || g_export.is_rendering) {
+                    continue;
+                }
+
+                // Requirement 5: New Project Tab 2-Option Modal ("Open Project File" / "Create Project File")
+                if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') {
+                    // Allow clicking top tab bar to switch between open tabs or close extra tab
+                    if (my < TABBAR_HEIGHT) {
+                        int max_tab_w = 160;
+                        int add_btn_w = 34;
+                        int cur_tab_w = max_tab_w;
+                        if (g_daw.num_tabs > 0) {
+                            int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
+                            if (calc_w < cur_tab_w) cur_tab_w = calc_w;
+                            if (cur_tab_w < 70) cur_tab_w = 70;
+                        }
+                        int cur_tab_x = 0;
+                        for (int t = 0; t < g_daw.num_tabs; t++) {
+                            if (mx >= cur_tab_x && mx < cur_tab_x + cur_tab_w) {
+                                if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4 && g_daw.num_tabs > 1) {
+                                    g_tab_needs_project_setup[t] = false;
+                                    request_close_tab(t);
+                                } else {
+                                    g_daw.active_tab = t;
+                                    g_selected_marker_idx = -1;
+                                }
+                                break;
+                            }
+                            cur_tab_x += cur_tab_w;
+                        }
+                        continue;
+                    }
+
+                    int mw = 480, mh = 210;
+                    int mx_box = (win_w - mw) / 2;
+                    int my_box = (win_h - mh) / 2;
+                    // Optional [X] close on extra tab (when num_tabs > 1)
+                    if (g_daw.num_tabs > 1 && my >= my_box && my <= my_box + 30 && mx >= mx_box + mw - 30 && mx <= mx_box + mw) {
+                        g_tab_needs_project_setup[g_daw.active_tab] = false;
+                        request_close_tab(g_daw.active_tab);
+                        continue;
+                    }
+                    int btn_y = my_box + 118;
+                    // Option 1: [ Open Project File ]
+                    if (mx >= mx_box + 28 && mx <= mx_box + 230 && my >= btn_y && my <= btn_y + 42) {
+                        daw_load_project_dialog(p, ren, win);
+                        if (p->project_path[0] != '\0') {
+                            g_tab_needs_project_setup[get_valid_tab_idx()] = false;
+                        }
+                        continue;
+                    }
+                    // Option 2: [ Create Project File ]
+                    if (mx >= mx_box + 250 && mx <= mx_box + mw - 28 && my >= btn_y && my <= btn_y + 42) {
+                        daw_create_new_project_file_dialog(p);
+                        continue;
+                    }
+                    continue;
+                }
+
+                // Requirement 2: Tiny Range Popup Window near Range Button
+                if (g_range_popup.is_open && is_range_active() && point_in_rect(mx, my, &g_range_popup.win_rect)) {
+                    SDL_Rect *wr = &g_range_popup.win_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 26) {
+                        if (mx >= wx + ww - 24) {
+                            // Close popup window only; keep yellow Range active on screen until 2nd click on Range button
+                            if (g_range_popup.active_field != 0) {
+                                commit_range_popup_edits();
+                            }
+                            g_range_popup.is_open = false;
+                            g_range_popup.active_field = 0;
+                            SDL_StopTextInput();
+                        } else {
+                            g_range_popup.is_dragging = true;
+                            g_range_popup.drag_off_x = mx - wx;
+                            g_range_popup.drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+                    if (mx >= wx && mx <= wx + ww && my >= wy + 26 && my <= wy + wh) {
+                        int r1_y = wy + 34;
+                        int r2_y = wy + 64;
+                        int r3_y = wy + 96;
+                        if (my >= r1_y && my <= r1_y + 24 && mx >= wx + 92 && mx <= wx + ww - 12) {
+                            if (g_range_popup.active_field == 2) commit_range_popup_edits();
+                            g_range_popup.active_field = 1;
+                            daw_text_edit_click_cursor(g_range_popup.start_buf, mx, wx + 100);
+                            SDL_StartTextInput();
+                        } else if (my >= r2_y && my <= r2_y + 24 && mx >= wx + 92 && mx <= wx + ww - 12) {
+                            if (g_range_popup.active_field == 1) commit_range_popup_edits();
+                            g_range_popup.active_field = 2;
+                            daw_text_edit_click_cursor(g_range_popup.end_buf, mx, wx + 100);
+                            SDL_StartTextInput();
+                        } else if (my >= r3_y && my <= r3_y + 24 && mx >= wx + ww - 68 && mx <= wx + ww - 12) {
+                            commit_range_popup_edits();
+                        } else {
+                            if (g_range_popup.active_field != 0) {
+                                commit_range_popup_edits();
+                            }
+                        }
+                        continue;
+                    }
+                    continue;
+                } else if (g_range_popup.active_field != 0) {
+                    commit_range_popup_edits();
+                }
+
+                // Requirement 4: App Hearing Volume Popup Window
+                if (g_vol_popup.is_open && point_in_rect(mx, my, &g_vol_popup.win_rect)) {
+                    ensure_app_vol_defaults_initialized();
+                    SDL_Rect *wr = &g_vol_popup.win_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    int vtab = get_valid_tab_idx();
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 28) {
+                        if (mx >= wx + ww - 26) {
+                            g_vol_popup.is_open = false;
+                            g_vol_popup.dragging_slider_idx = -1;
+                        } else {
+                            g_vol_popup.is_dragging = true;
+                            g_vol_popup.drag_off_x = mx - wx;
+                            g_vol_popup.drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+                    int m_y = wy + 36;
+                    int sl_x = wx + 156;
+                    int sl_w = 168;
+                    // Master Volume slider or [Reset]
+                    if (my >= m_y && my <= m_y + 38) {
+                        if (mx >= wx + ww - 76 && mx <= wx + ww - 20) {
+                            g_app_master_vol[vtab] = 100.0f;
+                            p->is_dirty = true;
+                            record_project_change("Reset App Master Hearing Volume to 100%", true);
+                        } else if (mx >= sl_x - 6 && mx <= sl_x + sl_w + 6) {
+                            g_vol_popup.dragging_slider_idx = 0;
+                            float u = (float)(mx - sl_x) / (float)sl_w;
+                            if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                            g_app_master_vol[vtab] = floorf(u * 100.0f + 0.5f);
+                            p->is_dirty = true;
+                        }
+                        continue;
+                    }
+                    // Track list sliders, [Reset] buttons, or scrollbar
+                    int list_y = wy + 82;
+                    int list_h = wh - 122;
+                    int sb_x = wx + ww - 26;
+                    if (my >= list_y && my <= list_y + list_h) {
+                        if (mx >= sb_x && mx <= wx + ww - 12) {
+                            g_vol_popup.sb_dragging = true;
+                            g_vol_popup.sb_start_my = my;
+                            g_vol_popup.sb_orig_scroll = g_vol_popup.scroll_y;
+                            continue;
+                        }
+                        int r = (my - (list_y + 4) + g_vol_popup.scroll_y) / 32;
+                        if (r >= 0 && r < p->num_tracks) {
+                            if (mx >= wx + ww - 84 && mx <= wx + ww - 32) {
+                                g_app_track_vol[vtab][r] = 100.0f;
+                                p->is_dirty = true;
+                                record_project_change("Reset Track App Hearing Volume to 100%", true);
+                            } else if (mx >= sl_x - 6 && mx <= sl_x + sl_w + 6) {
+                                g_vol_popup.dragging_slider_idx = r + 1;
+                                float u = (float)(mx - sl_x) / (float)sl_w;
+                                if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                                g_app_track_vol[vtab][r] = floorf(u * 100.0f + 0.5f);
+                                p->is_dirty = true;
+                            }
+                        }
+                        continue;
+                    }
                     continue;
                 }
 
@@ -10586,16 +11510,17 @@ int main(int argc, char *argv[]) {
                     }
 
                     if (mx >= ex && mx <= ex + ew && my >= ey + 30 && my <= ey + eh) {
-                        int sy_sub = ey + 278;
-                        int r1_y = sy_sub + 8;
+                        int sy_sub = ey + 274;
+                        int r1_y = sy_sub + 6;
                         int r2_y = sy_sub + 46;
-                        int r3_y = sy_sub + 84;
+                        int r3_y = sy_sub + 86;
+                        int r4_y = sy_sub + 126;
 
                         // Check open MP4 Size Resolution Dropdown Menu first so it never gets swallowed by rows underneath!
                         if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_size_dropdown_open) {
-                            int sdd_x = ex + 260;
+                            int sdd_x = ex + 272;
                             int sdd_y = r1_y + 26;
-                            int sdd_w = 206;
+                            int sdd_w = 216;
                             int sdd_h = NUM_MP4_RES_PRESETS * 26 + 4;
                             if (mx >= sdd_x && mx <= sdd_x + sdd_w && my >= sdd_y && my <= sdd_y + sdd_h) {
                                 int sel_idx = (my - (sdd_y + 2)) / 26;
@@ -10610,9 +11535,9 @@ int main(int argc, char *argv[]) {
 
                         // Check open MP4 AAC bitrate dropdown menu
                         if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
-                            int dd_x = ex + 260;
-                            int dd_y = r3_y + 26;
-                            int dd_w = 130;
+                            int dd_x = ex + 292;
+                            int dd_y = r4_y + 26;
+                            int dd_w = 136;
                             if (mx >= dd_x && mx <= dd_x + dd_w && my >= dd_y && my <= dd_y + 78) {
                                 int sel_row = (my - dd_y) / 26;
                                 if (sel_row == 0) strcpy(g_export.mp4_audio_kbps_str, "120");
@@ -10624,32 +11549,32 @@ int main(int argc, char *argv[]) {
                             g_export.mp4_aac_dropdown_open = false;
                         }
 
-                        // 1. Source row (ey + 46 .. ey + 78)
-                        int sy_src = ey + 48;
-                        if (my >= sy_src - 2 && my <= sy_src + 28) {
-                            if (mx >= ex + 108 && mx <= ex + 247) g_export.source = EXPORT_SRC_MASTER;
-                            else if (mx >= ex + 253 && mx <= ex + 467) g_export.source = EXPORT_SRC_STEMS;
-                            else if (mx >= ex + 473 && mx <= ex + 664) g_export.source = EXPORT_SRC_ITEMS;
+                        // 1. Source row (ey + 74)
+                        int sy_src = ey + 74;
+                        if (my >= sy_src - 2 && my <= sy_src + 30) {
+                            if (mx >= ex + 130 && mx <= ex + 280) g_export.source = EXPORT_SRC_MASTER;
+                            else if (mx >= ex + 290 && mx <= ex + 500) g_export.source = EXPORT_SRC_STEMS;
+                            else if (mx >= ex + 510 && mx <= ex + 702) g_export.source = EXPORT_SRC_ITEMS;
                             continue;
                         }
 
-                        // 2. Output Directory row (ey + 96 .. ey + 126) & [Browse...] button
-                        int sy_dir = ey + 98;
-                        if (my >= sy_dir - 2 && my <= sy_dir + 28) {
-                            if (mx >= ex + 128 && mx <= ex + 547) {
+                        // 2. Output Directory row (ey + 114) & [Browse...] button
+                        int sy_dir = ey + 114;
+                        if (my >= sy_dir - 2 && my <= sy_dir + 30) {
+                            if (mx >= ex + 130 && mx <= ex + 582) {
                                 g_export.active_field = EXP_FIELD_DIR;
                                 daw_text_edit_click_cursor(g_export.directory, mx, ex + 136);
                                 SDL_StartTextInput();
-                            } else if (mx >= ex + 553 && mx <= ex + 664) {
+                            } else if (mx >= ex + 592 && mx <= ex + 702) {
                                 browse_export_directory_and_filename();
                             }
                             continue;
                         }
 
-                        // 3. Output File Name row (ey + 130 .. ey + 160)
-                        int sy_fn = ey + 132;
-                        if (my >= sy_fn - 2 && my <= sy_fn + 28) {
-                            if (mx >= ex + 128 && mx <= ex + 547) {
+                        // 3. Output File Name row (ey + 150)
+                        int sy_fn = ey + 150;
+                        if (my >= sy_fn - 2 && my <= sy_fn + 30) {
+                            if (mx >= ex + 130 && mx <= ex + 582) {
                                 g_export.active_field = EXP_FIELD_FILENAME;
                                 daw_text_edit_click_cursor(g_export.filename, mx, ex + 136);
                                 SDL_StartTextInput();
@@ -10657,81 +11582,94 @@ int main(int argc, char *argv[]) {
                             continue;
                         }
 
-                        // 4. Sample Rate (48,000 / 44,100) & Channels (Mono / Stereo) row (ey + 180 .. ey + 210)
-                        int sy_sr = ey + 182;
-                        if (my >= sy_sr - 2 && my <= sy_sr + 28) {
-                            if (mx >= ex + 128 && mx <= ex + 237) g_export.sample_rate = 48000;
-                            else if (mx >= ex + 241 && mx <= ex + 350) g_export.sample_rate = 44100;
-                            else if (mx >= ex + 453 && mx <= ex + 547) g_export.channels = 1;
-                            else if (mx >= ex + 551 && mx <= ex + 658) g_export.channels = 2;
+                        // 4. Sample Rate (48,000 / 44,100) & Channels (Mono / Stereo) row (ey + 190)
+                        int sy_sr = ey + 190;
+                        if (my >= sy_sr - 2 && my <= sy_sr + 30) {
+                            if (mx >= ex + 130 && mx <= ex + 240) g_export.sample_rate = 48000;
+                            else if (mx >= ex + 248 && mx <= ex + 358) g_export.sample_rate = 44100;
+                            else if (mx >= ex + 466 && mx <= ex + 578) g_export.channels = 1;
+                            else if (mx >= ex + 586 && mx <= ex + 702) g_export.channels = 2;
                             continue;
                         }
 
-                        // 5. Format Tabs: WAV / MP3 / MP4 (ey + 230 .. ey + 262)
-                        int sy_fmt = ey + 232;
+                        // 5. Format Tabs: WAV / MP3 / MP4 (ey + 230)
+                        int sy_fmt = ey + 230;
                         if (my >= sy_fmt - 2 && my <= sy_fmt + 30) {
-                            if (mx >= ex + 128 && mx <= ex + 262) {
+                            if (mx >= ex + 130 && mx <= ex + 290) {
                                 g_export.format = EXPORT_FMT_WAV;
                                 g_export.mp4_aac_dropdown_open = false;
                                 g_export.mp4_size_dropdown_open = false;
-                            } else if (mx >= ex + 268 && mx <= ex + 402) {
+                            } else if (mx >= ex + 300 && mx <= ex + 460) {
                                 g_export.format = EXPORT_FMT_MP3;
                                 g_export.mp4_aac_dropdown_open = false;
                                 g_export.mp4_size_dropdown_open = false;
-                            } else if (mx >= ex + 408 && mx <= ex + 658) {
+                            } else if (mx >= ex + 470 && mx <= ex + 702) {
                                 g_export.format = EXPORT_FMT_MP4;
                                 g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
                             }
                             continue;
                         }
 
-                        // 6. Format-specific sub-options (ey + 272 .. ey + 424)
+                        // 6. Format-specific sub-options (ey + 268 .. ey + 442)
                         if (g_export.format == EXPORT_FMT_WAV) {
-                            if (my >= sy_sub + 8 && my <= sy_sub + 44) {
-                                if (mx >= ex + 148 && mx <= ex + 282) g_export.wav_bit_depth = 16;
-                                else if (mx >= ex + 290 && mx <= ex + 424) g_export.wav_bit_depth = 24;
-                                else if (mx >= ex + 432 && mx <= ex + 568) g_export.wav_bit_depth = 32;
+                            if (my >= sy_sub + 10 && my <= sy_sub + 46) {
+                                if (mx >= ex + 160 && mx <= ex + 310) g_export.wav_bit_depth = 16;
+                                else if (mx >= ex + 322 && mx <= ex + 472) g_export.wav_bit_depth = 24;
+                                else if (mx >= ex + 484 && mx <= ex + 634) g_export.wav_bit_depth = 32;
                                 continue;
                             }
                         } else if (g_export.format == EXPORT_FMT_MP3) {
-                            if (my >= sy_sub + 8 && my <= sy_sub + 44) {
-                                if (mx >= ex + 148 && mx <= ex + 282) g_export.mp3_bitrate = 128;
-                                else if (mx >= ex + 290 && mx <= ex + 424) g_export.mp3_bitrate = 192;
-                                else if (mx >= ex + 432 && mx <= ex + 568) g_export.mp3_bitrate = 320;
+                            if (my >= sy_sub + 10 && my <= sy_sub + 46) {
+                                if (mx >= ex + 160 && mx <= ex + 310) g_export.mp3_bitrate = 128;
+                                else if (mx >= ex + 322 && mx <= ex + 472) g_export.mp3_bitrate = 192;
+                                else if (mx >= ex + 484 && mx <= ex + 634) g_export.mp3_bitrate = 320;
                                 continue;
                             }
                         } else if (g_export.format == EXPORT_FMT_MP4) {
-                            // Row 1: File: [MPEG-4]  Size: [ 1920 x 1080 (Full HD) v ]  Framerate: [25.00]
+                            // Row 1: File: [MPEG-4]  Size: [ Preset Dropdown v ]  FPS: [25.00]
                             if (my >= r1_y - 2 && my <= r1_y + 28) {
-                                if (mx >= ex + 260 && mx <= ex + 466) {
+                                if (mx >= ex + 272 && mx <= ex + 488) {
                                     g_export.mp4_size_dropdown_open = !g_export.mp4_size_dropdown_open;
                                     g_export.mp4_aac_dropdown_open = false;
-                                } else if (mx >= ex + 566 && mx <= ex + 650) {
+                                } else if (mx >= ex + 544 && mx <= ex + 636) {
                                     g_export.active_field = EXP_FIELD_MP4_FPS;
-                                    daw_text_edit_click_cursor(g_export.mp4_fps_str, mx, ex + 576);
+                                    daw_text_edit_click_cursor(g_export.mp4_fps_str, mx, ex + 552);
                                     SDL_StartTextInput();
                                 }
                                 continue;
                             }
-                            // Row 2: Video: [H.264]  [2048] kbps
+                            // Row 2 (Requirement 1): Manual Resolution Width x Height input boxes
                             if (my >= r2_y - 2 && my <= r2_y + 28) {
-                                if (mx >= ex + 90 && mx <= ex + 244) {
+                                if (mx >= ex + 186 && mx <= ex + 278) {
+                                    g_export.active_field = EXP_FIELD_MP4_WIDTH;
+                                    daw_text_edit_click_cursor(g_export.mp4_width_str, mx, ex + 194);
+                                    SDL_StartTextInput();
+                                } else if (mx >= ex + 370 && mx <= ex + 462) {
+                                    g_export.active_field = EXP_FIELD_MP4_HEIGHT;
+                                    daw_text_edit_click_cursor(g_export.mp4_height_str, mx, ex + 378);
+                                    SDL_StartTextInput();
+                                }
+                                continue;
+                            }
+                            // Row 3: Video: [H.264]  Bitrate: [2048] kbps
+                            if (my >= r3_y - 2 && my <= r3_y + 28) {
+                                if (mx >= ex + 96 && mx <= ex + 206) {
                                     int vk = atoi(g_export.mp4_video_kbps_str);
                                     if (vk < 2048) strcpy(g_export.mp4_video_kbps_str, "2048");
                                     else if (vk < 4096) strcpy(g_export.mp4_video_kbps_str, "4096");
                                     else if (vk < 8192) strcpy(g_export.mp4_video_kbps_str, "8192");
                                     else strcpy(g_export.mp4_video_kbps_str, "1024");
-                                } else if (mx >= ex + 260 && mx <= ex + 362) {
+                                } else if (mx >= ex + 292 && mx <= ex + 392) {
                                     g_export.active_field = EXP_FIELD_MP4_V_KBPS;
-                                    daw_text_edit_click_cursor(g_export.mp4_video_kbps_str, mx, ex + 268);
+                                    daw_text_edit_click_cursor(g_export.mp4_video_kbps_str, mx, ex + 300);
                                     SDL_StartTextInput();
                                 }
                                 continue;
                             }
-                            // Row 3: Audio: [ AAC ] (fixed to AAC only)  [ 120 / 192 / 320 kbps v ] dropdown menu
-                            if (my >= r3_y - 2 && my <= r3_y + 28) {
+                            // Row 4: Audio: [ AAC ]  Bitrate: [ 120 / 192 / 320 kbps v ] dropdown menu
+                            if (my >= r4_y - 2 && my <= r4_y + 28) {
                                 g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
-                                if (mx >= ex + 260 && mx <= ex + 392) {
+                                if (mx >= ex + 292 && mx <= ex + 428) {
                                     g_export.mp4_aac_dropdown_open = !g_export.mp4_aac_dropdown_open;
                                     g_export.mp4_size_dropdown_open = false;
                                     continue;
@@ -10739,8 +11677,8 @@ int main(int argc, char *argv[]) {
                             }
                         }
 
-                        // 7. Option: Two-pass render checkbox (ey + 434 .. ey + 462)
-                        int sy_opt = ey + 436;
+                        // 7. Option: Two-pass render checkbox (ey + 454)
+                        int sy_opt = ey + 454;
                         if (my >= sy_opt - 2 && my <= sy_opt + 26 && mx >= ex + 20 && mx <= ex + 280) {
                             g_export.two_pass_render = !g_export.two_pass_render;
                             continue;
@@ -11259,9 +12197,11 @@ int main(int argc, char *argv[]) {
                         memset(g_tab_history[g_daw.num_tabs], 0, sizeof(g_tab_history[0]));
                         g_tab_history_count[g_daw.num_tabs] = 0;
                         g_tab_notification[g_daw.num_tabs][0] = '\0';
+                        init_tab_app_volume_defaults(g_daw.num_tabs);
+                        g_tab_needs_project_setup[g_daw.num_tabs] = true;
                         g_daw.active_tab = g_daw.num_tabs++;
                         g_selected_marker_idx = -1;
-                        record_project_change("Project Created", false);
+                        record_project_change("New Project Tab Opened", false);
                     }
                     continue;
                 }
@@ -11583,9 +12523,10 @@ int main(int argc, char *argv[]) {
                 if (my >= TABBAR_HEIGHT && my <= TABBAR_HEIGHT + TOPBAR_HEIGHT) {
                     int left_menu_end = 400;
                     int right_menu_start = win_w - 380;
-                    int clock_x = left_menu_end + ((right_menu_start - left_menu_end) / 2) - 80;
-                    if (clock_x < left_menu_end + 42) clock_x = left_menu_end + 42;
+                    int clock_x = left_menu_end + ((right_menu_start - left_menu_end) / 2) - 68;
+                    if (clock_x < left_menu_end + 82) clock_x = left_menu_end + 82;
                     int play_btn_x  = clock_x - 46;
+                    int vol_btn_x   = play_btn_x - 38;
                     int clock_box_x = clock_x - 10;
                     int rec_btn_x   = clock_box_x + 128 + 6;
                     int rec_onoff_x = rec_btn_x + 52;
@@ -11638,6 +12579,18 @@ int main(int argc, char *argv[]) {
                         g_menu_edit_open = false;
                         g_menu_settings_open = false;
                     }
+                    // Requirement 4: Volume symbol button near top-left side of Play/Pause button
+                    else if (mx >= vol_btn_x && mx <= vol_btn_x + 32) {
+                        g_vol_popup.is_open = !g_vol_popup.is_open;
+                        if (g_vol_popup.is_open) {
+                            g_vol_popup.win_rect.x = vol_btn_x - 40;
+                            if (g_vol_popup.win_rect.x < 12) g_vol_popup.win_rect.x = 12;
+                            if (g_vol_popup.win_rect.x + g_vol_popup.win_rect.w > win_w - 12) {
+                                g_vol_popup.win_rect.x = win_w - g_vol_popup.win_rect.w - 12;
+                            }
+                            g_vol_popup.win_rect.y = TABBAR_HEIGHT + TOPBAR_HEIGHT + 4;
+                        }
+                    }
                     // Requirement 12: Play/Pause symbol button near left side of Time Clock
                     else if (mx >= play_btn_x && mx <= play_btn_x + 32) {
                         if (g_rec.is_recording) start_or_stop_recording(p, ren, win);
@@ -11668,7 +12621,15 @@ int main(int argc, char *argv[]) {
                     // Right-side top menu: [Undo Symbol] | [Redo Symbol] | Range | Crossfade | Save
                     else if (mx >= win_w - 314 && mx <= win_w - 274) { perform_undo(); record_project_change("Undo Action", true); }
                     else if (mx >= win_w - 268 && mx <= win_w - 228) { perform_redo(); record_project_change("Redo Action", true); }
-                    else if (mx >= win_w - 222 && mx <= win_w - 162) { push_undo_state(); handle_top_menu_range_button(p); }
+                    else if (mx >= win_w - 222 && mx <= win_w - 162) {
+                        push_undo_state();
+                        handle_top_menu_range_button(p);
+                        if (g_range_popup.is_open) {
+                            g_range_popup.win_rect.x = win_w - g_range_popup.win_rect.w - 14;
+                            if (g_range_popup.win_rect.x < 10) g_range_popup.win_rect.x = 10;
+                            g_range_popup.win_rect.y = TABBAR_HEIGHT + TOPBAR_HEIGHT + 4;
+                        }
+                    }
                     else if (mx >= win_w - 156 && mx <= win_w - 66)  { push_undo_state(); set_crossfade_active(!is_crossfade_active()); }
                     else if (mx >= win_w - 60 && mx <= win_w - 8) {
                         daw_save_project_dialog(p, false);
@@ -12044,6 +13005,10 @@ int main(int argc, char *argv[]) {
                 g_mouse_win_dragging = false;
                 g_lock_win_dragging = false;
                 g_time_jump_dragging = false;
+                g_range_popup.is_dragging = false;
+                g_vol_popup.is_dragging = false;
+                g_vol_popup.sb_dragging = false;
+                g_vol_popup.dragging_slider_idx = -1;
                 g_script_popup.is_dragging = false;
                 g_script_popup.dragging_slider_idx = -1;
                 if (dragging_item_idx != -1) {
@@ -12099,6 +13064,51 @@ int main(int argc, char *argv[]) {
                 if (g_color_picker.is_open && g_color_picker.is_dragging) {
                     g_color_picker.win_rect.x = mx - g_color_picker.drag_off_x;
                     g_color_picker.win_rect.y = my - g_color_picker.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_range_popup.is_open && g_range_popup.is_dragging) {
+                    g_range_popup.win_rect.x = mx - g_range_popup.drag_off_x;
+                    g_range_popup.win_rect.y = my - g_range_popup.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_vol_popup.is_open && g_vol_popup.is_dragging) {
+                    g_vol_popup.win_rect.x = mx - g_vol_popup.drag_off_x;
+                    g_vol_popup.win_rect.y = my - g_vol_popup.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_vol_popup.is_open && g_vol_popup.dragging_slider_idx >= 0) {
+                    ensure_app_vol_defaults_initialized();
+                    int vtab = get_valid_tab_idx();
+                    int sl_x = g_vol_popup.win_rect.x + 156;
+                    int sl_w = 168;
+                    float u = (float)(mx - sl_x) / (float)sl_w;
+                    if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+                    float val = floorf(u * 100.0f + 0.5f);
+                    if (g_vol_popup.dragging_slider_idx == 0) {
+                        g_app_master_vol[vtab] = val;
+                    } else {
+                        int trk_i = g_vol_popup.dragging_slider_idx - 1;
+                        if (trk_i >= 0 && trk_i < MAX_TRACKS) {
+                            g_app_track_vol[vtab][trk_i] = val;
+                        }
+                    }
+                    p->is_dirty = true;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
+                if (g_vol_popup.is_open && g_vol_popup.sb_dragging) {
+                    int list_h = g_vol_popup.win_rect.h - 122;
+                    int content_h = p->num_tracks * 32 + 8;
+                    int max_sc = (content_h > list_h) ? (content_h - list_h) : 0;
+                    if (max_sc > 0 && list_h > 0) {
+                        int delta_y = my - g_vol_popup.sb_start_my;
+                        g_vol_popup.scroll_y = g_vol_popup.sb_orig_scroll + (delta_y * content_h) / list_h;
+                        if (g_vol_popup.scroll_y < 0) g_vol_popup.scroll_y = 0;
+                        if (g_vol_popup.scroll_y > max_sc) g_vol_popup.scroll_y = max_sc;
+                    }
                     SDL_SetCursor(g_cursor_arrow);
                     continue;
                 }
@@ -12909,12 +13919,25 @@ int main(int argc, char *argv[]) {
         format_timecode(p->playhead_seconds, clock_buf, sizeof(clock_buf));
         int left_menu_end = 400;
         int right_menu_start = win_w - 380;
-        int clock_x = left_menu_end + ((right_menu_start - left_menu_end) / 2) - 80;
-        if (clock_x < left_menu_end + 42) clock_x = left_menu_end + 42;
+        int clock_x = left_menu_end + ((right_menu_start - left_menu_end) / 2) - 68;
+        if (clock_x < left_menu_end + 82) clock_x = left_menu_end + 82;
         int play_btn_x  = clock_x - 46;
+        int vol_btn_x   = play_btn_x - 38;
         int clock_box_x = clock_x - 10;
         int rec_btn_x   = clock_box_x + 128 + 6;
         int rec_onoff_x = rec_btn_x + 52;
+
+        // Requirement 4: Volume Symbol Button near top-left side of Play/Pause button
+        ensure_app_vol_defaults_initialized();
+        bool app_vol_muted = (g_app_master_vol[get_valid_tab_idx()] <= 0.01f);
+        SDL_Rect btn_vol_sym = { vol_btn_x, TABBAR_HEIGHT + 5, 32, 26 };
+        SDL_SetRenderDrawColor(ren, g_vol_popup.is_open ? 68 : 42,
+                                    g_vol_popup.is_open ? 50 : 40,
+                                    g_vol_popup.is_open ? 34 : 38, 255);
+        SDL_RenderFillRect(ren, &btn_vol_sym);
+        draw_brown_border_rect(ren, &btn_vol_sym, g_vol_popup.is_open, false);
+        draw_volume_speaker_symbol_icon(ren, vol_btn_x + 8, TABBAR_HEIGHT + 10, app_vol_muted,
+                                        g_vol_popup.is_open ? get_theme_accent_sdl_color() : c_white);
 
         // Requirement 12: Play/Pause symbol-only button near left side of Time Clock
         SDL_Rect btn_play_sym = { play_btn_x, TABBAR_HEIGHT + 5, 32, 26 };
@@ -14534,6 +15557,63 @@ int main(int argc, char *argv[]) {
         // Double-Click Time Clock Manual Timings Entry Popup (Requirement 14)
         if (g_time_jump_open) {
             render_time_jump_popup_window(ren);
+        }
+
+        // Tiny Range Timings Popup Window near Range Button (Requirement 2)
+        if (g_range_popup.is_open) {
+            render_range_popup_window(ren, win_w);
+        }
+
+        // App Hearing Volume Popup Window near Play/Pause Button (Requirement 4)
+        if (g_vol_popup.is_open) {
+            render_app_volume_popup_window(ren, p);
+        }
+
+        // Requirement 5: New Project Tab 2-Option Modal ("Open Project File" & "Create Project File")
+        if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') {
+            SDL_Rect dim_overlay = { 0, TABBAR_HEIGHT, win_w, win_h - TABBAR_HEIGHT };
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 185);
+            SDL_RenderFillRect(ren, &dim_overlay);
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+            int mw = 480, mh = 210;
+            int mx_box = (win_w - mw) / 2;
+            int my_box = (win_h - mh) / 2;
+
+            SDL_Rect mbox = { mx_box, my_box, mw, mh };
+            SDL_SetRenderDrawColor(ren, 28, 25, 22, 255);
+            SDL_RenderFillRect(ren, &mbox);
+            draw_brown_border_rect(ren, &mbox, true, false);
+
+            SDL_Rect mhdr = { mx_box, my_box, mw, 32 };
+            SDL_SetRenderDrawColor(ren, 48, 36, 28, 255);
+            SDL_RenderFillRect(ren, &mhdr);
+            draw_brown_border_rect(ren, &mhdr, false, false);
+            draw_text(ren, "New Project Tab - Select Project Option", mx_box + 16, my_box + 10, c_white);
+            if (g_daw.num_tabs > 1) {
+                draw_text(ren, "X", mx_box + mw - 20, my_box + 10, c_white);
+            }
+
+            draw_text(ren, "Choose an option to start working in this project tab:", mx_box + 28, my_box + 52, c_white);
+            draw_text(ren, "Creating a project creates <Project>/, <Project>.ehs & <Project>/media/", mx_box + 28, my_box + 78, c_muted);
+
+            int btn_y = my_box + 118;
+            // Option 1: [ Open Project File ]
+            SDL_Rect b_open = { mx_box + 28, btn_y, 202, 42 };
+            SDL_SetRenderDrawColor(ren, 46, 58, 72, 255);
+            SDL_RenderFillRect(ren, &b_open);
+            draw_brown_border_rect(ren, &b_open, true, false);
+            draw_text(ren, "Open Project File", b_open.x + 33, btn_y + 15, c_white);
+
+            // Option 2: [ Create Project File ]
+            SDL_Rect b_create = { mx_box + 250, btn_y, 202, 42 };
+            SDL_SetRenderDrawColor(ren, 82, 54, 32, 255);
+            SDL_RenderFillRect(ren, &b_create);
+            draw_brown_border_rect(ren, &b_create, true, false);
+            draw_text(ren, "Create Project File", b_create.x + 25, btn_y + 15, c_white);
+
+            draw_text(ren, "All imported, recorded & glued media are stored in <Project>/media/", mx_box + 28, my_box + mh - 26, c_muted);
         }
 
         // Sync & render Global Pinned Video Monitor window if active (Requirement 7)
