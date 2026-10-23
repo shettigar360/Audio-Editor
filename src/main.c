@@ -6,6 +6,8 @@
 #include <SDL2/SDL_syswm.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
+#include <setjmp.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
@@ -735,7 +737,7 @@ typedef struct {
 
 static RangePopupState g_range_popup = {
     false,
-    { 940, 70, 300, 142 },
+    { 940, 70, 300, 128 },
     false, 0, 0,
     0,
     "00:00:00.000",
@@ -758,14 +760,14 @@ typedef struct {
 
 static AppVolumePopupState g_vol_popup = {
     false,
-    { 360, 70, 476, 344 },
+    { 360, 70, 500, 344 },
     false, 0, 0,
     0, false, 0, 0,
     -1
 };
 
 static bool     g_hide_popup_open = false;
-static SDL_Rect g_hide_win_rect = { 450, 110, 380, 340 };
+static SDL_Rect g_hide_win_rect = { 450, 110, 440, 340 };
 static bool     g_hide_win_dragging = false;
 static int      g_hide_drag_off_x = 0;
 static int      g_hide_drag_off_y = 0;
@@ -876,6 +878,11 @@ static const Mp4ResolutionPreset g_mp4_res_presets[NUM_MP4_RES_PRESETS] = {
     { "3840 x 2160 (4K)",      3840, 2160 }
 };
 
+#define NUM_MP4_V_KBPS_PRESETS 6
+static const int g_mp4_v_kbps_presets[NUM_MP4_V_KBPS_PRESETS] = {
+    1024, 2048, 4096, 8192, 12000, 16000
+};
+
 typedef enum {
     EXP_FIELD_NONE = 0,
     EXP_FIELD_DIR,
@@ -915,6 +922,9 @@ typedef struct {
     bool mp4_aac_dropdown_open;     // Dropdown for 120 / 192 / 320 kbps
     int  mp4_res_preset_idx;        // Default 3 -> 1920 x 1080 (Full HD)
     bool mp4_size_dropdown_open;    // Resolution Size dropdown menu open
+    bool mp4_size_manual_mode;      // True when Manual is selected at end of Size dropdown
+    bool mp4_v_kbps_dropdown_open;  // Video Bitrate dropdown menu open
+    bool mp4_v_kbps_manual_mode;    // True when Manual is selected at end of Video Bitrate dropdown
 
     bool two_pass_render;           // Option: two pass render
 
@@ -957,6 +967,9 @@ static ExportDialogState g_export = {
     false,
     false,
     false,
+    false,
+    false,
+    false,
     0,
     0.0,
     0.0,
@@ -973,11 +986,13 @@ static SDL_Texture *g_active_tl_cache_tex = NULL;
 static void apply_mp4_res_preset(int idx) {
     if (idx < 0 || idx >= NUM_MP4_RES_PRESETS) idx = 3;
     g_export.mp4_res_preset_idx = idx;
+    g_export.mp4_size_manual_mode = false;
     snprintf(g_export.mp4_width_str, sizeof(g_export.mp4_width_str), "%d", g_mp4_res_presets[idx].width);
     snprintf(g_export.mp4_height_str, sizeof(g_export.mp4_height_str), "%d", g_mp4_res_presets[idx].height);
 }
 
 static int get_current_mp4_res_preset_idx(void) {
+    if (g_export.mp4_size_manual_mode) return -1;
     int w = atoi(g_export.mp4_width_str);
     int h = atoi(g_export.mp4_height_str);
     for (int i = 0; i < NUM_MP4_RES_PRESETS; i++) {
@@ -987,6 +1002,17 @@ static int get_current_mp4_res_preset_idx(void) {
         }
     }
     return -1; // Custom manual Width x Height resolution
+}
+
+static int get_current_mp4_v_kbps_preset_idx(void) {
+    if (g_export.mp4_v_kbps_manual_mode) return -1;
+    int vk = atoi(g_export.mp4_video_kbps_str);
+    for (int i = 0; i < NUM_MP4_V_KBPS_PRESETS; i++) {
+        if (g_mp4_v_kbps_presets[i] == vk) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static char* get_active_export_field_buf(size_t *out_max_len) {
@@ -1369,6 +1395,56 @@ static bool g_submenu_tools_record_open = false;
 
 // Track vs Clip Copy/Paste Mode Flag
 static bool g_last_copied_is_track = false;
+
+static SDL_Window   *g_main_win = NULL;
+static SDL_Renderer *g_main_ren = NULL;
+static bool          g_autosave_in_progress = false;
+
+// Requirement 6: Per-Tab & Per-Track "Infinity -dB" ON/OFF State (REAPER-style -inf dB silence)
+static bool  g_track_inf_db[MAX_TABS][MAX_TRACKS];
+static float g_track_pre_inf_db[MAX_TABS][MAX_TRACKS];
+
+// Requirement 8: Crash Prevention & Stabilization Recovery State
+static jmp_buf               g_crash_recovery_jmp;
+static volatile sig_atomic_t g_crash_jmp_armed = 0;
+static volatile sig_atomic_t g_fault_recovered_flag = 0;
+
+static void daw_fault_signal_handler(int sig) {
+    signal(sig, daw_fault_signal_handler);
+    if (g_crash_jmp_armed) {
+        g_fault_recovered_flag = sig;
+        longjmp(g_crash_recovery_jmp, 1);
+    }
+}
+
+// Requirement 10: Project Auto Save Settings & 30-Minute Save-to-Save Cycle State
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    bool enabled;                // Auto Save ON/OFF tick box (default true -> ON)
+    int interval_minutes;        // Save-to-save cycle in minutes (default 30 minutes)
+    char interval_buf[16];       // Manual timing entry buffer ("30")
+    bool interval_focused;       // Text input focus
+    Uint32 last_save_ticks;      // Timestamp of last project save
+    bool pending_autosave;       // True when cycle elapsed during a major action and is waiting to run
+    char status_msg[128];
+} AutoSaveSettingsState;
+
+static AutoSaveSettingsState g_autosave = {
+    false,
+    { 400, 170, 480, 244 },
+    false, 0, 0,
+    true,
+    30,
+    "30",
+    false,
+    0,
+    false,
+    ""
+};
 #endif
 
 // ================= BULLETPROOF DEEP UNDO / REDO ENGINE (100% AUDIO, PEAK & METADATA RECOVERY) =================
@@ -2120,7 +2196,7 @@ typedef struct {
 
 static ThemeManagerState g_theme = {
     false,
-    { 340, 88, 580, 396 },
+    { 340, 88, 648, 396 },
     false, 0, 0,
     205, 138, 72, 255,
     29.77f, 0.6488f, 0.8039f,
@@ -2161,7 +2237,7 @@ static bool g_mouse_win_dragging = false;
 static int  g_mouse_drag_off_x = 0;
 static int  g_mouse_drag_off_y = 0;
 static bool g_time_jump_open = false;
-static SDL_Rect g_time_jump_rect = { 510, 82, 268, 124 };
+static SDL_Rect g_time_jump_rect = { 510, 82, 308, 124 };
 static bool g_time_jump_dragging = false;
 static int  g_time_jump_drag_off_x = 0;
 static int  g_time_jump_drag_off_y = 0;
@@ -3031,12 +3107,27 @@ static void set_daw_window_thumbnail_icon(SDL_Window *win) {
 }
 
 // Renders the "Processing, please wait..." stability popup window and pumps SDL events so the app never freezes
+static void ensure_popup_fits_text_width(SDL_Rect *wr, int min_w, int min_h, const char *txt, int pad_w) {
+    if (!wr) return;
+    if (wr->w < min_w) wr->w = min_w;
+    if (wr->h < min_h) wr->h = min_h;
+    if (txt && txt[0]) {
+        int needed = (int)strlen(txt) * 8 + pad_w;
+        if (wr->w < needed) wr->w = needed;
+    }
+}
+
 static void render_processing_wait_overlay(SDL_Renderer *ren, SDL_Window *win) {
     if (!g_processing_popup_open || !ren || !win) return;
     int win_w = 1280, win_h = 720;
     SDL_GetWindowSize(win, &win_w, &win_h);
 
-    int pw = 440, ph = 136;
+    int pw = 500, ph = 136;
+    int t_need = (int)strlen(g_processing_title) * 8 + 48;
+    int d_need = (int)strlen(g_processing_detail) * 8 + 48;
+    if (pw < t_need) pw = t_need;
+    if (pw < d_need) pw = d_need;
+    if (pw > win_w - 32 && win_w > 360) pw = win_w - 32;
     int px = (win_w - pw) / 2;
     int py = (win_h - ph) / 2;
 
@@ -3116,6 +3207,82 @@ static void finish_processing_wait_modal(Uint32 hold_ms) {
     } else {
         g_processing_close_at_ticks = SDL_GetTicks() + hold_ms;
     }
+}
+
+// Requirement 6: Check if selected track has "Infinity -dB" (-inf dB) enabled
+static bool is_selected_track_infinity_db_on(ProjectTab *p) {
+    if (!p || p->num_tracks <= 0) return false;
+    int tab = get_valid_tab_idx();
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->track_selected[t]) {
+            return (g_track_inf_db[tab][t] || p->track_db[t] <= -60.0f);
+        }
+    }
+    int fb = (g_last_clicked_track_idx >= 0 && g_last_clicked_track_idx < p->num_tracks) ? g_last_clicked_track_idx : 0;
+    return (g_track_inf_db[tab][fb] || p->track_db[fb] <= -60.0f);
+}
+
+// Requirement 6: Toggle "Infinity -dB" ON/OFF for the selected track(s) (like REAPER -inf dB)
+static void toggle_selected_track_infinity_db(ProjectTab *p) {
+    if (!p || p->num_tracks <= 0) return;
+    int tab = get_valid_tab_idx();
+    bool any_sel = false;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->track_selected[t]) {
+            any_sel = true;
+            break;
+        }
+    }
+    if (!any_sel) {
+        int fb = (g_last_clicked_track_idx >= 0 && g_last_clicked_track_idx < p->num_tracks) ? g_last_clicked_track_idx : 0;
+        p->track_selected[fb] = true;
+    }
+    bool turn_on = !is_selected_track_infinity_db_on(p);
+    push_undo_state();
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (!p->track_selected[t]) continue;
+        if (turn_on) {
+            if (p->track_db[t] > -59.0f) {
+                g_track_pre_inf_db[tab][t] = p->track_db[t];
+            } else if (g_track_pre_inf_db[tab][t] <= -59.0f) {
+                g_track_pre_inf_db[tab][t] = 0.0f;
+            }
+            g_track_inf_db[tab][t] = true;
+            p->track_db[t] = -120.0f; // -inf dB silence
+        } else {
+            g_track_inf_db[tab][t] = false;
+            float restore_db = g_track_pre_inf_db[tab][t];
+            if (restore_db <= -59.0f || restore_db > 24.0f) restore_db = 0.0f;
+            p->track_db[t] = restore_db;
+        }
+    }
+    p->is_dirty = true;
+    record_project_change(turn_on ? "Track Infinity -dB: ON (-inf dB)" : "Track Infinity -dB: OFF (Restored dB)", true);
+}
+
+// Requirement 8: Stabilize application state on any unexpected fault or stall and show Wait Processing popup
+static void stabilize_app_state_and_recover(ProjectTab *p, const char *reason) {
+    g_engine_processing = false;
+    if (g_daw.active_tab < 0 || g_daw.active_tab >= MAX_TABS) g_daw.active_tab = 0;
+    if (g_daw.num_tabs <= 0 || g_daw.num_tabs > MAX_TABS) g_daw.num_tabs = 1;
+    if (p) {
+        if (p->num_tracks <= 0) p->num_tracks = 1;
+        if (p->num_tracks > MAX_TRACKS) p->num_tracks = MAX_TRACKS;
+        if (p->num_items < 0) p->num_items = 0;
+        if (p->num_items > MAX_ITEMS) p->num_items = MAX_ITEMS;
+        if (p->num_markers < 0) p->num_markers = 0;
+        if (p->num_markers > MAX_MARKERS) p->num_markers = MAX_MARKERS;
+        if (!(p->pixels_per_second >= 0.01f && p->pixels_per_second <= 5000.0f)) p->pixels_per_second = 50.0f;
+        if (!(p->playhead_seconds >= 0.0 && p->playhead_seconds < 864000.0)) p->playhead_seconds = 0.0;
+        if (!(p->scroll_x_sec >= 0.0 && p->scroll_x_sec < 864000.0)) p->scroll_x_sec = 0.0;
+    }
+    show_processing_wait_modal(
+        g_main_ren, g_main_win,
+        "Wait - Processing / Stabilizing...",
+        reason ? reason : "Stabilizing application state, please wait...",
+        100
+    );
+    finish_processing_wait_modal(550);
 }
 
 // Renders the Simple, Stabilized Box-Based "Dynamic split" popup window (Requirement #8)
@@ -4479,8 +4646,6 @@ static void render_range_popup_window(SDL_Renderer *ren, int win_w) {
     SDL_RenderFillRect(ren, &b_set);
     draw_brown_border_rect(ren, &b_set, true, false);
     draw_text(ren, "Apply", b_set.x + 8, r3_y + 6, c_white);
-
-    draw_text(ren, "Click Start/End to edit (Enter to apply)", wx + 12, wy + wh - 16, c_muted);
 }
 
 // ================= REQUIREMENT 4: APP HEARING VOLUME POPUP WINDOW =================
@@ -7973,6 +8138,14 @@ static void migrate_temp_recordings_to_project_folder(ProjectTab *p, const char 
 static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     if (!p || !path || !path[0]) return false;
 
+    const char *save_modal_title = g_autosave_in_progress ? "Project Auto Saving..." : "Project Saving...";
+    show_processing_wait_modal(
+        g_main_ren, g_main_win,
+        save_modal_title,
+        "Saving project file (.ehs) and syncing media folder...",
+        35
+    );
+
     // Resolve designated directory, project base name, and same-named project folder
     char parent_dir[512] = {0};
     char proj_base_name[128] = {0};
@@ -8155,6 +8328,10 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     fflush(f);
     fclose(f);
 
+    for (int tr = 0; tr < MAX_TRACKS; tr++) {
+        g_track_inf_db[tab_i][tr] = (p->track_db[tr] <= -60.0f);
+    }
+
     strncpy(p->project_path, final_ehs_path, sizeof(p->project_path) - 1);
     p->project_path[sizeof(p->project_path) - 1] = '\0';
 
@@ -8162,7 +8339,20 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     strip_ehs_extension(p->project_name);
     p->is_dirty = false;
     g_tab_needs_project_setup[tab_i] = false;
-    record_project_change("Project Saved (Media Folder Synced)", false);
+    g_autosave.last_save_ticks = SDL_GetTicks();
+    g_autosave.pending_autosave = false;
+
+    show_processing_wait_modal(
+        g_main_ren, g_main_win,
+        save_modal_title,
+        "Project saved.",
+        100
+    );
+    if (g_main_ren && g_main_win) {
+        SDL_Delay(140);
+    }
+    finish_processing_wait_modal(260);
+    record_project_change(g_autosave_in_progress ? "Project Auto Saved" : "Project Saved (Media Folder Synced)", false);
     return true;
 }
 
@@ -9588,31 +9778,54 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
 
         draw_text(ren, "MPEG-1/2 Audio Layer III constant bitrate encoding.", ex + 34, sy_sub + 70, c_muted);
     } else if (g_export.format == EXPORT_FMT_MP4) {
-        // Row 1: File: [ MPEG-4 ]   Size: [ Preset Dropdown v ]   FPS: [ 25.00 ] fps
-        int r1_y = sy_sub + 6;
+        // Row 1 (Requirement 4): File: [ MPEG-4 ]   Size: [ Dropdown with "Manual" at end ]   FPS: [ 25.00 ] fps
+        int r1_y = sy_sub + 14;
         draw_text(ren, "File:", ex + 34, r1_y + 7, c_white);
-        SDL_Rect box_mpeg4 = { ex + 96, r1_y, 110, 26 };
+        SDL_Rect box_mpeg4 = { ex + 96, r1_y, 108, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_mpeg4);
         draw_brown_border_rect(ren, &box_mpeg4, false, false);
-        draw_text(ren, "MPEG-4", box_mpeg4.x + 31, r1_y + 7, c_white);
+        draw_text(ren, "MPEG-4", box_mpeg4.x + 30, r1_y + 7, c_white);
 
-        draw_text(ren, "Size:", ex + 224, r1_y + 7, c_white);
+        draw_text(ren, "Size:", ex + 218, r1_y + 7, c_white);
         int cur_res_idx = get_current_mp4_res_preset_idx();
-        SDL_Rect box_size_dd = { ex + 272, r1_y, 216, 26 };
-        SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
-        SDL_RenderFillRect(ren, &box_size_dd);
-        draw_brown_border_rect(ren, &box_size_dd, g_export.mp4_size_dropdown_open, false);
-        char size_dd_lbl[48];
-        if (cur_res_idx >= 0 && cur_res_idx < NUM_MP4_RES_PRESETS) {
-            snprintf(size_dd_lbl, sizeof(size_dd_lbl), "%s", g_mp4_res_presets[cur_res_idx].label);
+        if (!g_export.mp4_size_manual_mode && cur_res_idx >= 0 && cur_res_idx < NUM_MP4_RES_PRESETS) {
+            SDL_Rect box_size_dd = { ex + 266, r1_y, 226, 26 };
+            SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+            SDL_RenderFillRect(ren, &box_size_dd);
+            draw_brown_border_rect(ren, &box_size_dd, g_export.mp4_size_dropdown_open, false);
+            draw_text(ren, g_mp4_res_presets[cur_res_idx].label, box_size_dd.x + 8, r1_y + 7, c_white);
+            draw_text(ren, "v", box_size_dd.x + box_size_dd.w - 16, r1_y + 7, c_muted);
         } else {
-            snprintf(size_dd_lbl, sizeof(size_dd_lbl), "Custom (%s x %s)",
-                     g_export.mp4_width_str[0] ? g_export.mp4_width_str : "1920",
-                     g_export.mp4_height_str[0] ? g_export.mp4_height_str : "1080");
+            // Inline Manual Width x Height input right in the Size slot + [v] dropdown toggle button
+            SDL_Rect box_mp4_w = { ex + 266, r1_y, 84, 26 };
+            bool ed_w = (g_export.active_field == EXP_FIELD_MP4_WIDTH);
+            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+            SDL_RenderFillRect(ren, &box_mp4_w);
+            draw_brown_border_rect(ren, &box_mp4_w, ed_w, false);
+            if (ed_w) {
+                daw_draw_text_edit_overlay(ren, g_export.mp4_width_str, box_mp4_w.x + 8, box_mp4_w.y, box_mp4_w.h, box_mp4_w.x + box_mp4_w.w - 4);
+            }
+            draw_text(ren, g_export.mp4_width_str, box_mp4_w.x + 8, r1_y + 7, ed_w ? c_accent : c_white);
+
+            draw_text(ren, "x", ex + 356, r1_y + 7, c_white);
+
+            SDL_Rect box_mp4_h = { ex + 370, r1_y, 84, 26 };
+            bool ed_h = (g_export.active_field == EXP_FIELD_MP4_HEIGHT);
+            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+            SDL_RenderFillRect(ren, &box_mp4_h);
+            draw_brown_border_rect(ren, &box_mp4_h, ed_h, false);
+            if (ed_h) {
+                daw_draw_text_edit_overlay(ren, g_export.mp4_height_str, box_mp4_h.x + 8, box_mp4_h.y, box_mp4_h.h, box_mp4_h.x + box_mp4_h.w - 4);
+            }
+            draw_text(ren, g_export.mp4_height_str, box_mp4_h.x + 8, r1_y + 7, ed_h ? c_accent : c_white);
+
+            SDL_Rect btn_sdd = { ex + 458, r1_y, 34, 26 };
+            SDL_SetRenderDrawColor(ren, 44, 36, 30, 255);
+            SDL_RenderFillRect(ren, &btn_sdd);
+            draw_brown_border_rect(ren, &btn_sdd, g_export.mp4_size_dropdown_open, false);
+            draw_text(ren, "v", btn_sdd.x + 13, r1_y + 7, c_white);
         }
-        draw_text(ren, size_dd_lbl, box_size_dd.x + 8, r1_y + 7, c_white);
-        draw_text(ren, "v", box_size_dd.x + box_size_dd.w - 16, r1_y + 7, c_muted);
 
         draw_text(ren, "FPS:", ex + 504, r1_y + 7, c_white);
         SDL_Rect box_fps = { ex + 544, r1_y, 92, 26 };
@@ -9626,75 +9839,65 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
         draw_text(ren, g_export.mp4_fps_str, box_fps.x + 8, r1_y + 7, c_white);
         draw_text(ren, "fps", ex + 644, r1_y + 7, c_muted);
 
-        // Row 2 (Requirement 1): Manual Resolution Input (Width x Height)
-        int r2_y = sy_sub + 46;
-        draw_text(ren, "Resolution:", ex + 34, r2_y + 7, c_white);
-        draw_text(ren, "Width:", ex + 132, r2_y + 7, c_muted);
-
-        SDL_Rect box_mp4_w = { ex + 186, r2_y, 92, 26 };
-        bool ed_w = (g_export.active_field == EXP_FIELD_MP4_WIDTH);
-        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-        SDL_RenderFillRect(ren, &box_mp4_w);
-        draw_brown_border_rect(ren, &box_mp4_w, ed_w, false);
-        if (ed_w) {
-            daw_draw_text_edit_overlay(ren, g_export.mp4_width_str, box_mp4_w.x + 8, box_mp4_w.y, box_mp4_w.h, box_mp4_w.x + box_mp4_w.w - 4);
-        }
-        draw_text(ren, g_export.mp4_width_str, box_mp4_w.x + 8, r2_y + 7, ed_w ? c_accent : c_white);
-
-        draw_text(ren, "x", ex + 288, r2_y + 7, c_white);
-        draw_text(ren, "Height:", ex + 308, r2_y + 7, c_muted);
-
-        SDL_Rect box_mp4_h = { ex + 370, r2_y, 92, 26 };
-        bool ed_h = (g_export.active_field == EXP_FIELD_MP4_HEIGHT);
-        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-        SDL_RenderFillRect(ren, &box_mp4_h);
-        draw_brown_border_rect(ren, &box_mp4_h, ed_h, false);
-        if (ed_h) {
-            daw_draw_text_edit_overlay(ren, g_export.mp4_height_str, box_mp4_h.x + 8, box_mp4_h.y, box_mp4_h.h, box_mp4_h.x + box_mp4_h.w - 4);
-        }
-        draw_text(ren, g_export.mp4_height_str, box_mp4_h.x + 8, r2_y + 7, ed_h ? c_accent : c_white);
-        draw_text(ren, "px (Manual Size Input)", ex + 474, r2_y + 7, c_muted);
-
-        // Row 3: Video: [ H.264 ]   Bitrate: [ 2048 ] kbps
-        int r3_y = sy_sub + 86;
-        draw_text(ren, "Video:", ex + 34, r3_y + 7, c_white);
-        SDL_Rect box_vcodec = { ex + 96, r3_y, 110, 26 };
+        // Row 2 (Requirement 5): Video: [ H.264 ]   Bitrate: [ Dropdown with "Manual" at end ]
+        int r2_y = sy_sub + 58;
+        draw_text(ren, "Video:", ex + 34, r2_y + 7, c_white);
+        SDL_Rect box_vcodec = { ex + 96, r2_y, 108, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_vcodec);
         draw_brown_border_rect(ren, &box_vcodec, false, false);
-        draw_text(ren, "H.264", box_vcodec.x + 35, r3_y + 7, c_white);
+        draw_text(ren, "H.264", box_vcodec.x + 34, r2_y + 7, c_white);
 
-        draw_text(ren, "Bitrate:", ex + 224, r3_y + 7, c_white);
-        SDL_Rect box_vkbps = { ex + 292, r3_y, 100, 26 };
-        bool ed_vk = (g_export.active_field == EXP_FIELD_MP4_V_KBPS);
-        SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
-        SDL_RenderFillRect(ren, &box_vkbps);
-        draw_brown_border_rect(ren, &box_vkbps, ed_vk, false);
-        if (ed_vk) {
-            daw_draw_text_edit_overlay(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, box_vkbps.y, box_vkbps.h, box_vkbps.x + box_vkbps.w - 4);
+        draw_text(ren, "Bitrate:", ex + 218, r2_y + 7, c_white);
+        int cur_vk_idx = get_current_mp4_v_kbps_preset_idx();
+        if (!g_export.mp4_v_kbps_manual_mode && cur_vk_idx >= 0 && cur_vk_idx < NUM_MP4_V_KBPS_PRESETS) {
+            SDL_Rect box_vk_dd = { ex + 286, r2_y, 206, 26 };
+            SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
+            SDL_RenderFillRect(ren, &box_vk_dd);
+            draw_brown_border_rect(ren, &box_vk_dd, g_export.mp4_v_kbps_dropdown_open, false);
+            char vk_lbl[32];
+            snprintf(vk_lbl, sizeof(vk_lbl), "%d kbps", g_mp4_v_kbps_presets[cur_vk_idx]);
+            draw_text(ren, vk_lbl, box_vk_dd.x + 10, r2_y + 7, c_white);
+            draw_text(ren, "v", box_vk_dd.x + box_vk_dd.w - 16, r2_y + 7, c_muted);
+        } else {
+            // Inline Manual Video Bitrate input + kbps + [v] dropdown toggle button
+            SDL_Rect box_vkbps = { ex + 286, r2_y, 114, 26 };
+            bool ed_vk = (g_export.active_field == EXP_FIELD_MP4_V_KBPS);
+            SDL_SetRenderDrawColor(ren, 16, 16, 16, 255);
+            SDL_RenderFillRect(ren, &box_vkbps);
+            draw_brown_border_rect(ren, &box_vkbps, ed_vk, false);
+            if (ed_vk) {
+                daw_draw_text_edit_overlay(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, box_vkbps.y, box_vkbps.h, box_vkbps.x + box_vkbps.w - 4);
+            }
+            draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r2_y + 7, ed_vk ? c_accent : c_white);
+            draw_text(ren, "kbps", ex + 408, r2_y + 7, c_muted);
+
+            SDL_Rect btn_vkdd = { ex + 458, r2_y, 34, 26 };
+            SDL_SetRenderDrawColor(ren, 44, 36, 30, 255);
+            SDL_RenderFillRect(ren, &btn_vkdd);
+            draw_brown_border_rect(ren, &btn_vkdd, g_export.mp4_v_kbps_dropdown_open, false);
+            draw_text(ren, "v", btn_vkdd.x + 13, r2_y + 7, c_white);
         }
-        draw_text(ren, g_export.mp4_video_kbps_str, box_vkbps.x + 8, r3_y + 7, c_white);
-        draw_text(ren, "kbps", ex + 402, r3_y + 7, c_muted);
 
-        // Row 4: Audio: [ AAC ]   Bitrate: [ 192 kbps v ]
-        int r4_y = sy_sub + 126;
-        draw_text(ren, "Audio:", ex + 34, r4_y + 7, c_white);
+        // Row 3: Audio: [ AAC ]   Bitrate: [ 192 kbps v ]
+        int r3_y = sy_sub + 102;
+        draw_text(ren, "Audio:", ex + 34, r3_y + 7, c_white);
 
-        SDL_Rect box_ac_aac = { ex + 96, r4_y, 110, 26 };
+        SDL_Rect box_ac_aac = { ex + 96, r3_y, 108, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_ac_aac);
         draw_brown_border_rect(ren, &box_ac_aac, true, false);
-        draw_text(ren, "AAC", box_ac_aac.x + 43, r4_y + 7, c_white);
+        draw_text(ren, "AAC", box_ac_aac.x + 42, r3_y + 7, c_white);
 
-        draw_text(ren, "Bitrate:", ex + 224, r4_y + 7, c_white);
-        SDL_Rect box_akbps = { ex + 292, r4_y, 136, 26 };
+        draw_text(ren, "Bitrate:", ex + 218, r3_y + 7, c_white);
+        SDL_Rect box_akbps = { ex + 286, r3_y, 206, 26 };
         SDL_SetRenderDrawColor(ren, 34, 30, 26, 255);
         SDL_RenderFillRect(ren, &box_akbps);
         draw_brown_border_rect(ren, &box_akbps, g_export.mp4_aac_dropdown_open, false);
         char aac_rate_lbl[32];
         snprintf(aac_rate_lbl, sizeof(aac_rate_lbl), "%s kbps", g_export.mp4_audio_kbps_str);
-        draw_text(ren, aac_rate_lbl, box_akbps.x + 12, r4_y + 7, c_white);
-        draw_text(ren, "v", box_akbps.x + box_akbps.w - 18, r4_y + 7, c_muted);
+        draw_text(ren, aac_rate_lbl, box_akbps.x + 10, r3_y + 7, c_white);
+        draw_text(ren, "v", box_akbps.x + box_akbps.w - 16, r3_y + 7, c_muted);
     }
 
     // ---- 5. OPTION: TWO-PASS RENDER CHECKBOX (Green Right Mark) ----
@@ -9773,10 +9976,10 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
 
     // ---- 8. DROPDOWN OVERLAYS (Drawn after main controls so they appear on top of everything) ----
     if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
-        int dd_x = ex + 292;
-        int dd_y = sy_sub + 126 + 26;
-        int dd_w = 136;
-        SDL_Rect dd_box = { dd_x, dd_y, dd_w, 78 };
+        int dd_x = ex + 286;
+        int dd_y = sy_sub + 102 + 26;
+        int dd_w = 206;
+        SDL_Rect dd_box = { dd_x, dd_y, dd_w, 80 };
         SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
         SDL_RenderFillRect(ren, &dd_box);
         draw_brown_border_rect(ren, &dd_box, true, false);
@@ -9785,32 +9988,65 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
         const char *rate_labels[3] = { "120 kbps", "192 kbps", "320 kbps" };
         for (int r_i = 0; r_i < 3; r_i++) {
             bool is_cur = (strcmp(g_export.mp4_audio_kbps_str, rates[r_i]) == 0);
-            SDL_Rect r_item = { dd_x + 2, dd_y + r_i * 26 + 2, dd_w - 4, 22 };
+            SDL_Rect r_item = { dd_x + 2, dd_y + r_i * 26 + 2, dd_w - 4, 24 };
             SDL_SetRenderDrawColor(ren, is_cur ? 68 : 30, is_cur ? 48 : 28, is_cur ? 32 : 26, 255);
             SDL_RenderFillRect(ren, &r_item);
             draw_brown_border_rect(ren, &r_item, is_cur, !is_cur);
-            draw_text(ren, rate_labels[r_i], dd_x + 12, dd_y + r_i * 26 + 7, c_white);
+            draw_text(ren, rate_labels[r_i], dd_x + 10, dd_y + r_i * 26 + 7, c_white);
+        }
+    }
+
+    if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_v_kbps_dropdown_open) {
+        int vdd_x = ex + 286;
+        int vdd_y = sy_sub + 58 + 26;
+        int vdd_w = 206;
+        int vdd_h = (NUM_MP4_V_KBPS_PRESETS + 1) * 26 + 4;
+        SDL_Rect vdd_box = { vdd_x, vdd_y, vdd_w, vdd_h };
+        SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
+        SDL_RenderFillRect(ren, &vdd_box);
+        draw_brown_border_rect(ren, &vdd_box, true, false);
+
+        int cur_vk = get_current_mp4_v_kbps_preset_idx();
+        for (int vi = 0; vi <= NUM_MP4_V_KBPS_PRESETS; vi++) {
+            bool is_cur = (vi < NUM_MP4_V_KBPS_PRESETS) ? (vi == cur_vk && !g_export.mp4_v_kbps_manual_mode)
+                                                        : (g_export.mp4_v_kbps_manual_mode || cur_vk < 0);
+            SDL_Rect r_item = { vdd_x + 2, vdd_y + 2 + vi * 26, vdd_w - 4, 24 };
+            SDL_SetRenderDrawColor(ren, is_cur ? 68 : 30, is_cur ? 48 : 28, is_cur ? 32 : 26, 255);
+            SDL_RenderFillRect(ren, &r_item);
+            draw_brown_border_rect(ren, &r_item, is_cur, !is_cur);
+            if (vi < NUM_MP4_V_KBPS_PRESETS) {
+                char vlbl[32];
+                snprintf(vlbl, sizeof(vlbl), "%d kbps", g_mp4_v_kbps_presets[vi]);
+                draw_text(ren, vlbl, vdd_x + 10, vdd_y + 8 + vi * 26, c_white);
+            } else {
+                draw_text(ren, "Manual", vdd_x + 10, vdd_y + 8 + vi * 26, is_cur ? c_accent : c_white);
+            }
         }
     }
 
     if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_size_dropdown_open) {
-        int sdd_x = ex + 272;
-        int sdd_y = sy_sub + 6 + 26;
-        int sdd_w = 216;
-        int sdd_h = NUM_MP4_RES_PRESETS * 26 + 4;
+        int sdd_x = ex + 266;
+        int sdd_y = sy_sub + 14 + 26;
+        int sdd_w = 226;
+        int sdd_h = (NUM_MP4_RES_PRESETS + 1) * 26 + 4;
         SDL_Rect sdd_box = { sdd_x, sdd_y, sdd_w, sdd_h };
         SDL_SetRenderDrawColor(ren, 24, 22, 20, 255);
         SDL_RenderFillRect(ren, &sdd_box);
         draw_brown_border_rect(ren, &sdd_box, true, false);
 
         int cur_res = get_current_mp4_res_preset_idx();
-        for (int ri = 0; ri < NUM_MP4_RES_PRESETS; ri++) {
-            bool is_cur = (ri == cur_res);
+        for (int ri = 0; ri <= NUM_MP4_RES_PRESETS; ri++) {
+            bool is_cur = (ri < NUM_MP4_RES_PRESETS) ? (ri == cur_res && !g_export.mp4_size_manual_mode)
+                                                     : (g_export.mp4_size_manual_mode || cur_res < 0);
             SDL_Rect r_item = { sdd_x + 2, sdd_y + 2 + ri * 26, sdd_w - 4, 24 };
             SDL_SetRenderDrawColor(ren, is_cur ? 68 : 30, is_cur ? 48 : 28, is_cur ? 32 : 26, 255);
             SDL_RenderFillRect(ren, &r_item);
             draw_brown_border_rect(ren, &r_item, is_cur, !is_cur);
-            draw_text(ren, g_mp4_res_presets[ri].label, sdd_x + 10, sdd_y + 8 + ri * 26, c_white);
+            if (ri < NUM_MP4_RES_PRESETS) {
+                draw_text(ren, g_mp4_res_presets[ri].label, sdd_x + 10, sdd_y + 8 + ri * 26, c_white);
+            } else {
+                draw_text(ren, "Manual", sdd_x + 10, sdd_y + 8 + ri * 26, is_cur ? c_accent : c_white);
+            }
         }
     }
 
@@ -9869,6 +10105,121 @@ static void render_export_popup_window(SDL_Renderer *ren, ProjectTab *p) {
     }
 }
 
+// Requirement 10: Commit manual Auto Save cycle interval (minutes) and render Auto Save Settings window
+static void commit_autosave_interval_edit(void) {
+    int val = atoi(g_autosave.interval_buf);
+    if (val < 1) val = 1;
+    if (val > 1440) val = 1440;
+    g_autosave.interval_minutes = val;
+    snprintf(g_autosave.interval_buf, sizeof(g_autosave.interval_buf), "%d", val);
+    g_autosave.interval_focused = false;
+    SDL_StopTextInput();
+    save_keyboard_shortcuts_json();
+    snprintf(g_autosave.status_msg, sizeof(g_autosave.status_msg),
+             "Auto save cycle set to every %d min (%s)",
+             g_autosave.interval_minutes, g_autosave.enabled ? "ON" : "OFF");
+}
+
+static void render_auto_save_settings_window(SDL_Renderer *ren) {
+    if (!g_autosave.is_open || !ren) return;
+    SDL_Rect *wr = &g_autosave.win_rect;
+    ensure_popup_fits_text_width(wr, 480, 244, g_autosave.status_msg, 44);
+    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+
+    SDL_Color c_white  = { 228, 228, 228, 255 };
+    SDL_Color c_muted  = { 155, 150, 145, 255 };
+    SDL_Color c_accent = get_theme_accent_sdl_color();
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect shadow = { wx + 6, wy + 6, ww, wh };
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 175);
+    SDL_RenderFillRect(ren, &shadow);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderDrawColor(ren, 26, 24, 22, 255);
+    SDL_RenderFillRect(ren, wr);
+    draw_brown_border_rect(ren, wr, true, false);
+
+    uint8_t hr, hg, hb;
+    get_theme_surface_rgb(32, 0.22f, &hr, &hg, &hb);
+    SDL_Rect hdr = { wx, wy, ww, 30 };
+    SDL_SetRenderDrawColor(ren, hr, hg, hb, 255);
+    SDL_RenderFillRect(ren, &hdr);
+    draw_brown_border_rect(ren, &hdr, false, false);
+    draw_text(ren, "Auto Save Settings", wx + 14, wy + 9, c_white);
+    draw_text(ren, "X", wx + ww - 20, wy + 9, c_white);
+
+    // Row 1: Auto Save ON/OFF Tick Box (with green right checkmark)
+    int r1_y = wy + 44;
+    SDL_Rect row1 = { wx + 18, r1_y, ww - 36, 36 };
+    SDL_SetRenderDrawColor(ren, g_autosave.enabled ? 36 : 28, g_autosave.enabled ? 44 : 26, g_autosave.enabled ? 30 : 24, 255);
+    SDL_RenderFillRect(ren, &row1);
+    draw_brown_border_rect(ren, &row1, g_autosave.enabled, !g_autosave.enabled);
+
+    SDL_Rect chk = { wx + 30, r1_y + 8, 20, 20 };
+    SDL_SetRenderDrawColor(ren, g_autosave.enabled ? 22 : 16, g_autosave.enabled ? 46 : 15, g_autosave.enabled ? 26 : 14, 255);
+    SDL_RenderFillRect(ren, &chk);
+    draw_brown_border_rect(ren, &chk, g_autosave.enabled, false);
+    if (g_autosave.enabled) {
+        draw_green_checkmark_icon(ren, chk.x, chk.y, chk.w, chk.h);
+    }
+    draw_text(ren, g_autosave.enabled ? "Project Auto Save: ON" : "Project Auto Save: OFF", wx + 60, r1_y + 11, c_white);
+
+    // Row 2: Save-to-Save Cycle Timing Manual Entry (minutes)
+    int r2_y = wy + 94;
+    draw_text(ren, "Save-to-Save Cycle:", wx + 20, r2_y + 8, c_white);
+
+    SDL_Rect box_min = { wx + 190, r2_y, 96, 28 };
+    SDL_SetRenderDrawColor(ren, 16, 15, 14, 255);
+    SDL_RenderFillRect(ren, &box_min);
+    draw_brown_border_rect(ren, &box_min, g_autosave.interval_focused, false);
+    if (g_autosave.interval_focused) {
+        daw_draw_text_edit_overlay(ren, g_autosave.interval_buf, box_min.x + 8, box_min.y, box_min.h, box_min.x + box_min.w - 4);
+    }
+    draw_text(ren, g_autosave.interval_buf, box_min.x + 8, r2_y + 8, g_autosave.interval_focused ? c_accent : c_white);
+    draw_text(ren, "minutes", wx + 296, r2_y + 8, c_muted);
+
+    SDL_Rect btn_apply = { wx + ww - 98, r2_y, 80, 28 };
+    SDL_SetRenderDrawColor(ren, 58, 44, 32, 255);
+    SDL_RenderFillRect(ren, &btn_apply);
+    draw_brown_border_rect(ren, &btn_apply, true, false);
+    draw_text(ren, "Apply", btn_apply.x + 20, r2_y + 8, c_white);
+
+    // Row 3: Next Auto Save Countdown & Status Info
+    Uint32 now_t = SDL_GetTicks();
+    Uint32 cyc_ms = (Uint32)(g_autosave.interval_minutes > 0 ? g_autosave.interval_minutes : 30) * 60000U;
+    Uint32 el_ms = (now_t >= g_autosave.last_save_ticks) ? (now_t - g_autosave.last_save_ticks) : 0;
+    Uint32 rem_ms = (el_ms < cyc_ms) ? (cyc_ms - el_ms) : 0;
+    int rem_min = (int)(rem_ms / 60000U);
+    int rem_sec = (int)((rem_ms % 60000U) / 1000U);
+
+    char info_line[128];
+    if (!g_autosave.enabled) {
+        snprintf(info_line, sizeof(info_line), "Auto save is currently disabled.");
+    } else if (g_autosave.pending_autosave) {
+        snprintf(info_line, sizeof(info_line), "Auto save ready (waiting for active process to finish)...");
+    } else {
+        snprintf(info_line, sizeof(info_line), "Next auto save in: %02dm %02ds (Cycle: %d min)",
+                 rem_min, rem_sec, g_autosave.interval_minutes);
+    }
+    draw_text(ren, info_line, wx + 20, wy + 138, c_accent);
+    draw_text(ren, "Waits until Export / Import / Dynamic Split finishes.", wx + 20, wy + 162, c_muted);
+
+    // Bottom Buttons: [Save Now] and [OK]
+    int by = wy + wh - 42;
+    SDL_Rect b_savenow = { wx + 20, by, 118, 28 };
+    SDL_SetRenderDrawColor(ren, 48, 64, 46, 255);
+    SDL_RenderFillRect(ren, &b_savenow);
+    draw_brown_border_rect(ren, &b_savenow, true, false);
+    draw_text(ren, "Save Now", b_savenow.x + 25, by + 8, c_white);
+
+    SDL_Rect b_ok = { wx + ww - 102, by, 84, 28 };
+    SDL_SetRenderDrawColor(ren, hr + 22, hg + 14, hb + 8, 255);
+    SDL_RenderFillRect(ren, &b_ok);
+    draw_brown_border_rect(ren, &b_ok, true, false);
+    draw_text(ren, "OK", b_ok.x + 34, by + 8, c_white);
+}
+
 static bool is_processing_blocking_input(void) {
     return (g_engine_processing || g_processing_popup_open || g_export.is_rendering ||
             g_daw.save_prompt_open || g_track_delete_prompt_open);
@@ -9913,6 +10264,15 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
         return true;
     }
     if (g_mouse_settings_open && point_in_rect(mx, my, &g_mouse_win_rect)) return true;
+    if (g_autosave.is_open && point_in_rect(mx, my, &g_autosave.win_rect)) {
+        if (out_cursor) {
+            int wx = g_autosave.win_rect.x, wy = g_autosave.win_rect.y;
+            if (mx >= wx + 190 && mx <= wx + 286 && my >= wy + 94 && my <= wy + 122) {
+                *out_cursor = g_cursor_ibeam;
+            }
+        }
+        return true;
+    }
     if (g_dyn_split.is_open && point_in_rect(mx, my, &g_dyn_split.win_rect)) return true;
     if (g_reposition.is_open && point_in_rect(mx, my, &g_reposition.win_rect)) return true;
     if (g_color_picker.is_open && point_in_rect(mx, my, &g_color_picker.win_rect)) return true;
@@ -10000,10 +10360,10 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
 
     int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
     if (g_daw.menu_file_open && mx >= 8 && mx <= 204 && my >= m_start && my <= m_start + 126) return true;
-    if (g_daw.menu_action_open && mx >= 60 && mx <= 238 && my >= m_start && my <= m_start + 81) return true;
+    if (g_daw.menu_action_open && mx >= 60 && mx <= 258 && my >= m_start && my <= m_start + 108) return true;
     if (g_menu_tools_open && mx >= 126 && mx <= 282 && my >= m_start && my <= m_start + 81) return true;
     if (g_menu_edit_open && mx >= 190 && mx <= 346 && my >= m_start && my <= m_start + 54) return true;
-    if (g_menu_settings_open && mx >= 250 && mx <= 426 && my >= m_start && my <= m_start + 81) return true;
+    if (g_menu_settings_open && mx >= 250 && mx <= 434 && my >= m_start && my <= m_start + 108) return true;
     if (g_marker_context_menu_open && mx >= g_marker_context_x && mx <= g_marker_context_x + 128 &&
         my >= g_marker_context_y && my <= g_marker_context_y + 28) return true;
 
@@ -10019,6 +10379,13 @@ int main(int argc, char *argv[]) {
         1280, 720, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
     );
     SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    g_main_win = win;
+    g_main_ren = ren;
+    g_autosave.last_save_ticks = SDL_GetTicks();
+    signal(SIGSEGV, daw_fault_signal_handler);
+    signal(SIGFPE,  daw_fault_signal_handler);
+    signal(SIGILL,  daw_fault_signal_handler);
+    signal(SIGABRT, daw_fault_signal_handler);
 
 #ifdef _WIN32
     SDL_SysWMinfo wmInfo;
@@ -10136,6 +10503,14 @@ int main(int argc, char *argv[]) {
 
     SDL_Event e;
     while (running) {
+        // Requirement 8: Crash-proof recovery guard — if any unexpected signal/fault occurs, stabilize & show Wait Processing popup
+        if (setjmp(g_crash_recovery_jmp) != 0) {
+            g_crash_jmp_armed = 0;
+            g_fault_recovered_flag = 0;
+            stabilize_app_state_and_recover(get_cur_tab(), "Stabilizing application state after unexpected fault, please wait...");
+        }
+        g_crash_jmp_armed = 1;
+
         ProjectTab *p = get_cur_tab();
         int win_w, win_h;
         SDL_GetWindowSize(win, &win_w, &win_h);
@@ -10213,7 +10588,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 if (g_action_win.is_open && point_in_rect(mx, my, &g_action_win.win_rect)) {
-                    int rows_h = (g_action_win.win_rect.h - 220) - 24;
+                    int rows_h = (g_action_win.win_rect.h - 266) - 24;
                     int content_h = g_action_win.num_filtered * 22 + 6;
                     int max_sc = (content_h > rows_h) ? (content_h - rows_h) : 0;
                     g_action_win.scroll_y -= e.wheel.y * 44;
@@ -10319,6 +10694,18 @@ int main(int argc, char *argv[]) {
                     ScriptPopupControl *ctrl = &g_script_popup.controls[g_script_popup.focused_ctrl_idx];
                     daw_text_edit_insert_text(ctrl->str_val, sizeof(ctrl->str_val) - 1, e.text.text);
                     ctrl->num_val = atof(ctrl->str_val);
+                    continue;
+                }
+                if (g_autosave.is_open && g_autosave.interval_focused) {
+                    char clean_d[16] = {0};
+                    size_t jd = 0;
+                    for (const char *c = e.text.text; *c && jd + 1 < sizeof(clean_d); c++) {
+                        if (isdigit((unsigned char)*c)) clean_d[jd++] = *c;
+                    }
+                    clean_d[jd] = '\0';
+                    if (clean_d[0]) {
+                        daw_text_edit_insert_text(g_autosave.interval_buf, sizeof(g_autosave.interval_buf) - 1, clean_d);
+                    }
                     continue;
                 }
                 if (g_reposition.is_open && g_reposition.interval_focused) {
@@ -10454,6 +10841,26 @@ int main(int argc, char *argv[]) {
                 if (g_mouse_settings_open && point_in_rect(kmx, kmy, &g_mouse_win_rect)) {
                     if (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
                         g_mouse_settings_open = false;
+                    }
+                    continue;
+                }
+                if (g_autosave.is_open && (g_autosave.interval_focused || point_in_rect(kmx, kmy, &g_autosave.win_rect))) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        if (g_autosave.interval_focused) {
+                            g_autosave.interval_focused = false;
+                            snprintf(g_autosave.interval_buf, sizeof(g_autosave.interval_buf), "%d", g_autosave.interval_minutes);
+                            SDL_StopTextInput();
+                        } else {
+                            g_autosave.is_open = false;
+                        }
+                    } else if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                        if (g_autosave.interval_focused) {
+                            commit_autosave_interval_edit();
+                        } else {
+                            g_autosave.is_open = false;
+                        }
+                    } else if (g_autosave.interval_focused) {
+                        daw_text_edit_handle_keydown(g_autosave.interval_buf, sizeof(g_autosave.interval_buf) - 1, e.key.keysym.sym, mod);
                     }
                     continue;
                 }
@@ -10595,8 +11002,9 @@ int main(int argc, char *argv[]) {
                             daw_text_edit_handle_keydown(buf, max_len, e.key.keysym.sym, mod);
                         }
                     } else if (e.key.keysym.sym == SDLK_ESCAPE) {
-                        if (g_export.mp4_size_dropdown_open || g_export.mp4_aac_dropdown_open) {
+                        if (g_export.mp4_size_dropdown_open || g_export.mp4_v_kbps_dropdown_open || g_export.mp4_aac_dropdown_open) {
                             g_export.mp4_size_dropdown_open = false;
+                            g_export.mp4_v_kbps_dropdown_open = false;
                             g_export.mp4_aac_dropdown_open = false;
                         } else {
                             g_export.is_open = false;
@@ -10735,7 +11143,7 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
 
-                    int mw = 480, mh = 210;
+                    int mw = 620, mh = 210;
                     int mx_box = (win_w - mw) / 2;
                     int my_box = (win_h - mh) / 2;
                     // Optional [X] close on extra tab (when num_tabs > 1)
@@ -10746,7 +11154,7 @@ int main(int argc, char *argv[]) {
                     }
                     int btn_y = my_box + 118;
                     // Option 1: [ Open Project File ]
-                    if (mx >= mx_box + 28 && mx <= mx_box + 230 && my >= btn_y && my <= btn_y + 42) {
+                    if (mx >= mx_box + 56 && mx <= mx_box + 296 && my >= btn_y && my <= btn_y + 42) {
                         daw_load_project_dialog(p, ren, win);
                         if (p->project_path[0] != '\0') {
                             g_tab_needs_project_setup[get_valid_tab_idx()] = false;
@@ -10754,7 +11162,7 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
                     // Option 2: [ Create Project File ]
-                    if (mx >= mx_box + 250 && mx <= mx_box + mw - 28 && my >= btn_y && my <= btn_y + 42) {
+                    if (mx >= mx_box + 324 && mx <= mx_box + 564 && my >= btn_y && my <= btn_y + 42) {
                         daw_create_new_project_file_dialog(p);
                         continue;
                     }
@@ -11108,8 +11516,58 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // Settings -> Auto save Popup Window (Requirement 10)
+                if (g_autosave.is_open && point_in_rect(mx, my, &g_autosave.win_rect)) {
+                    SDL_Rect *wr = &g_autosave.win_rect;
+                    int wx = wr->x, wy = wr->y, ww = wr->w, wh = wr->h;
+                    if (mx >= wx && mx <= wx + ww && my >= wy && my <= wy + 30) {
+                        if (mx >= wx + ww - 28) {
+                            if (g_autosave.interval_focused) commit_autosave_interval_edit();
+                            g_autosave.is_open = false;
+                        } else {
+                            g_autosave.is_dragging = true;
+                            g_autosave.drag_off_x = mx - wx;
+                            g_autosave.drag_off_y = my - wy;
+                        }
+                        continue;
+                    }
+                    if (mx >= wx && mx <= wx + ww && my >= wy + 30 && my <= wy + wh) {
+                        int r1_y = wy + 44;
+                        int r2_y = wy + 94;
+                        int by   = wy + wh - 42;
+                        if (my >= r1_y && my <= r1_y + 36 && mx >= wx + 18 && mx <= wx + ww - 18) {
+                            if (g_autosave.interval_focused) commit_autosave_interval_edit();
+                            g_autosave.enabled = !g_autosave.enabled;
+                            if (g_autosave.enabled) {
+                                g_autosave.last_save_ticks = SDL_GetTicks();
+                                g_autosave.pending_autosave = false;
+                            }
+                            save_keyboard_shortcuts_json();
+                            record_project_change(g_autosave.enabled ? "Auto Save: ON" : "Auto Save: OFF", false);
+                        } else if (my >= r2_y && my <= r2_y + 28 && mx >= wx + 190 && mx <= wx + 286) {
+                            g_autosave.interval_focused = true;
+                            daw_text_edit_click_cursor(g_autosave.interval_buf, mx, wx + 198);
+                            SDL_StartTextInput();
+                        } else if (my >= r2_y && my <= r2_y + 28 && mx >= wx + ww - 98 && mx <= wx + ww - 18) {
+                            commit_autosave_interval_edit();
+                        } else if (my >= by && my <= by + 28 && mx >= wx + 20 && mx <= wx + 138) {
+                            if (g_autosave.interval_focused) commit_autosave_interval_edit();
+                            daw_save_project_dialog(p, false);
+                        } else if (my >= by && my <= by + 28 && mx >= wx + ww - 102 && mx <= wx + ww - 18) {
+                            if (g_autosave.interval_focused) commit_autosave_interval_edit();
+                            g_autosave.is_open = false;
+                        } else if (g_autosave.interval_focused) {
+                            commit_autosave_interval_edit();
+                        }
+                        continue;
+                    }
+                    continue;
+                } else if (g_autosave.interval_focused) {
+                    commit_autosave_interval_edit();
+                }
+
                 if (g_track_delete_prompt_open) {
-                    int dia_w = 390, dia_h = 140;
+                    int dia_w = 430, dia_h = 140;
                     int dia_x = (win_w - dia_w) / 2;
                     int dia_y = (win_h - dia_h) / 2;
                     int btn_y = dia_y + dia_h - 44;
@@ -11498,6 +11956,7 @@ int main(int argc, char *argv[]) {
                         if (mx >= ex + ew - 34) {
                             g_export.mp4_aac_dropdown_open = false;
                             g_export.mp4_size_dropdown_open = false;
+                            g_export.mp4_v_kbps_dropdown_open = false;
                             g_export.overwrite_prompt_open = false;
                             g_export.is_open = false;
                             save_themes_settings_json();
@@ -11511,21 +11970,26 @@ int main(int argc, char *argv[]) {
 
                     if (mx >= ex && mx <= ex + ew && my >= ey + 30 && my <= ey + eh) {
                         int sy_sub = ey + 274;
-                        int r1_y = sy_sub + 6;
-                        int r2_y = sy_sub + 46;
-                        int r3_y = sy_sub + 86;
-                        int r4_y = sy_sub + 126;
+                        int r1_y = sy_sub + 14;
+                        int r2_y = sy_sub + 58;
+                        int r3_y = sy_sub + 102;
 
-                        // Check open MP4 Size Resolution Dropdown Menu first so it never gets swallowed by rows underneath!
+                        // 1. Check open MP4 Size Resolution Dropdown Menu first (6 presets + Manual at end)
                         if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_size_dropdown_open) {
-                            int sdd_x = ex + 272;
+                            int sdd_x = ex + 266;
                             int sdd_y = r1_y + 26;
-                            int sdd_w = 216;
-                            int sdd_h = NUM_MP4_RES_PRESETS * 26 + 4;
+                            int sdd_w = 226;
+                            int sdd_h = (NUM_MP4_RES_PRESETS + 1) * 26 + 4;
                             if (mx >= sdd_x && mx <= sdd_x + sdd_w && my >= sdd_y && my <= sdd_y + sdd_h) {
                                 int sel_idx = (my - (sdd_y + 2)) / 26;
                                 if (sel_idx >= 0 && sel_idx < NUM_MP4_RES_PRESETS) {
                                     apply_mp4_res_preset(sel_idx);
+                                } else if (sel_idx == NUM_MP4_RES_PRESETS) {
+                                    // Selected "Manual" at end of Size dropdown
+                                    g_export.mp4_size_manual_mode = true;
+                                    g_export.active_field = EXP_FIELD_MP4_WIDTH;
+                                    daw_text_edit_focus_buf(g_export.mp4_width_str, true);
+                                    SDL_StartTextInput();
                                 }
                                 g_export.mp4_size_dropdown_open = false;
                                 continue;
@@ -11533,12 +11997,37 @@ int main(int argc, char *argv[]) {
                             g_export.mp4_size_dropdown_open = false;
                         }
 
-                        // Check open MP4 AAC bitrate dropdown menu
+                        // 2. Check open MP4 Video Bitrate Dropdown Menu (6 presets + Manual at end)
+                        if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_v_kbps_dropdown_open) {
+                            int vdd_x = ex + 286;
+                            int vdd_y = r2_y + 26;
+                            int vdd_w = 206;
+                            int vdd_h = (NUM_MP4_V_KBPS_PRESETS + 1) * 26 + 4;
+                            if (mx >= vdd_x && mx <= vdd_x + vdd_w && my >= vdd_y && my <= vdd_y + vdd_h) {
+                                int sel_idx = (my - (vdd_y + 2)) / 26;
+                                if (sel_idx >= 0 && sel_idx < NUM_MP4_V_KBPS_PRESETS) {
+                                    g_export.mp4_v_kbps_manual_mode = false;
+                                    snprintf(g_export.mp4_video_kbps_str, sizeof(g_export.mp4_video_kbps_str),
+                                             "%d", g_mp4_v_kbps_presets[sel_idx]);
+                                } else if (sel_idx == NUM_MP4_V_KBPS_PRESETS) {
+                                    // Selected "Manual" at end of Video Bitrate dropdown
+                                    g_export.mp4_v_kbps_manual_mode = true;
+                                    g_export.active_field = EXP_FIELD_MP4_V_KBPS;
+                                    daw_text_edit_focus_buf(g_export.mp4_video_kbps_str, true);
+                                    SDL_StartTextInput();
+                                }
+                                g_export.mp4_v_kbps_dropdown_open = false;
+                                continue;
+                            }
+                            g_export.mp4_v_kbps_dropdown_open = false;
+                        }
+
+                        // 3. Check open MP4 AAC Audio Bitrate Dropdown Menu
                         if (g_export.format == EXPORT_FMT_MP4 && g_export.mp4_aac_dropdown_open) {
-                            int dd_x = ex + 292;
-                            int dd_y = r4_y + 26;
-                            int dd_w = 136;
-                            if (mx >= dd_x && mx <= dd_x + dd_w && my >= dd_y && my <= dd_y + 78) {
+                            int dd_x = ex + 286;
+                            int dd_y = r3_y + 26;
+                            int dd_w = 206;
+                            if (mx >= dd_x && mx <= dd_x + dd_w && my >= dd_y && my <= dd_y + 80) {
                                 int sel_row = (my - dd_y) / 26;
                                 if (sel_row == 0) strcpy(g_export.mp4_audio_kbps_str, "120");
                                 else if (sel_row == 1) strcpy(g_export.mp4_audio_kbps_str, "192");
@@ -11626,52 +12115,66 @@ int main(int argc, char *argv[]) {
                                 continue;
                             }
                         } else if (g_export.format == EXPORT_FMT_MP4) {
-                            // Row 1: File: [MPEG-4]  Size: [ Preset Dropdown v ]  FPS: [25.00]
+                            // Row 1 (Requirement 4): File: [MPEG-4]  Size: [ Dropdown with Manual at end ]  FPS: [25.00]
                             if (my >= r1_y - 2 && my <= r1_y + 28) {
-                                if (mx >= ex + 272 && mx <= ex + 488) {
-                                    g_export.mp4_size_dropdown_open = !g_export.mp4_size_dropdown_open;
-                                    g_export.mp4_aac_dropdown_open = false;
-                                } else if (mx >= ex + 544 && mx <= ex + 636) {
+                                int cur_res_idx = get_current_mp4_res_preset_idx();
+                                if (!g_export.mp4_size_manual_mode && cur_res_idx >= 0 && cur_res_idx < NUM_MP4_RES_PRESETS) {
+                                    if (mx >= ex + 266 && mx <= ex + 492) {
+                                        g_export.mp4_size_dropdown_open = !g_export.mp4_size_dropdown_open;
+                                        g_export.mp4_v_kbps_dropdown_open = false;
+                                        g_export.mp4_aac_dropdown_open = false;
+                                    }
+                                } else {
+                                    if (mx >= ex + 266 && mx <= ex + 350) {
+                                        g_export.active_field = EXP_FIELD_MP4_WIDTH;
+                                        daw_text_edit_click_cursor(g_export.mp4_width_str, mx, ex + 274);
+                                        SDL_StartTextInput();
+                                    } else if (mx >= ex + 370 && mx <= ex + 454) {
+                                        g_export.active_field = EXP_FIELD_MP4_HEIGHT;
+                                        daw_text_edit_click_cursor(g_export.mp4_height_str, mx, ex + 378);
+                                        SDL_StartTextInput();
+                                    } else if (mx >= ex + 458 && mx <= ex + 492) {
+                                        g_export.mp4_size_dropdown_open = !g_export.mp4_size_dropdown_open;
+                                        g_export.mp4_v_kbps_dropdown_open = false;
+                                        g_export.mp4_aac_dropdown_open = false;
+                                    }
+                                }
+                                if (mx >= ex + 544 && mx <= ex + 636) {
                                     g_export.active_field = EXP_FIELD_MP4_FPS;
                                     daw_text_edit_click_cursor(g_export.mp4_fps_str, mx, ex + 552);
                                     SDL_StartTextInput();
                                 }
                                 continue;
                             }
-                            // Row 2 (Requirement 1): Manual Resolution Width x Height input boxes
+                            // Row 2 (Requirement 5): Video: [H.264]  Bitrate: [ Dropdown with Manual at end ]
                             if (my >= r2_y - 2 && my <= r2_y + 28) {
-                                if (mx >= ex + 186 && mx <= ex + 278) {
-                                    g_export.active_field = EXP_FIELD_MP4_WIDTH;
-                                    daw_text_edit_click_cursor(g_export.mp4_width_str, mx, ex + 194);
-                                    SDL_StartTextInput();
-                                } else if (mx >= ex + 370 && mx <= ex + 462) {
-                                    g_export.active_field = EXP_FIELD_MP4_HEIGHT;
-                                    daw_text_edit_click_cursor(g_export.mp4_height_str, mx, ex + 378);
-                                    SDL_StartTextInput();
+                                int cur_vk_idx = get_current_mp4_v_kbps_preset_idx();
+                                if (!g_export.mp4_v_kbps_manual_mode && cur_vk_idx >= 0 && cur_vk_idx < NUM_MP4_V_KBPS_PRESETS) {
+                                    if (mx >= ex + 286 && mx <= ex + 492) {
+                                        g_export.mp4_v_kbps_dropdown_open = !g_export.mp4_v_kbps_dropdown_open;
+                                        g_export.mp4_size_dropdown_open = false;
+                                        g_export.mp4_aac_dropdown_open = false;
+                                    }
+                                } else {
+                                    if (mx >= ex + 286 && mx <= ex + 400) {
+                                        g_export.active_field = EXP_FIELD_MP4_V_KBPS;
+                                        daw_text_edit_click_cursor(g_export.mp4_video_kbps_str, mx, ex + 294);
+                                        SDL_StartTextInput();
+                                    } else if (mx >= ex + 458 && mx <= ex + 492) {
+                                        g_export.mp4_v_kbps_dropdown_open = !g_export.mp4_v_kbps_dropdown_open;
+                                        g_export.mp4_size_dropdown_open = false;
+                                        g_export.mp4_aac_dropdown_open = false;
+                                    }
                                 }
                                 continue;
                             }
-                            // Row 3: Video: [H.264]  Bitrate: [2048] kbps
+                            // Row 3: Audio: [ AAC ]  Bitrate: [ 120 / 192 / 320 kbps v ] dropdown menu
                             if (my >= r3_y - 2 && my <= r3_y + 28) {
-                                if (mx >= ex + 96 && mx <= ex + 206) {
-                                    int vk = atoi(g_export.mp4_video_kbps_str);
-                                    if (vk < 2048) strcpy(g_export.mp4_video_kbps_str, "2048");
-                                    else if (vk < 4096) strcpy(g_export.mp4_video_kbps_str, "4096");
-                                    else if (vk < 8192) strcpy(g_export.mp4_video_kbps_str, "8192");
-                                    else strcpy(g_export.mp4_video_kbps_str, "1024");
-                                } else if (mx >= ex + 292 && mx <= ex + 392) {
-                                    g_export.active_field = EXP_FIELD_MP4_V_KBPS;
-                                    daw_text_edit_click_cursor(g_export.mp4_video_kbps_str, mx, ex + 300);
-                                    SDL_StartTextInput();
-                                }
-                                continue;
-                            }
-                            // Row 4: Audio: [ AAC ]  Bitrate: [ 120 / 192 / 320 kbps v ] dropdown menu
-                            if (my >= r4_y - 2 && my <= r4_y + 28) {
                                 g_export.mp4_audio_codec = EXPORT_MP4_AUDIO_AAC;
-                                if (mx >= ex + 292 && mx <= ex + 428) {
+                                if (mx >= ex + 286 && mx <= ex + 492) {
                                     g_export.mp4_aac_dropdown_open = !g_export.mp4_aac_dropdown_open;
                                     g_export.mp4_size_dropdown_open = false;
+                                    g_export.mp4_v_kbps_dropdown_open = false;
                                     continue;
                                 }
                             }
@@ -12396,7 +12899,7 @@ int main(int argc, char *argv[]) {
 
                 if (g_daw.menu_action_open) {
                     int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-                    if (mx >= 60 && mx <= 238 && my >= m_start && my <= m_start + 81) {
+                    if (mx >= 60 && mx <= 258 && my >= m_start && my <= m_start + 108) {
                         if (my >= m_start && my < m_start + 27) {
                             // Action Submenu 1: Scripts -> Opens unified Lua & Python Script Manager popup window
                             scan_scripts_directory_to_actions(&g_daw);
@@ -12414,13 +12917,18 @@ int main(int argc, char *argv[]) {
                             g_dyn_split.dragging_slider_id = 0;
                             g_daw.menu_action_open = false;
                             continue;
-                        } else if (my >= m_start + 54 && my <= m_start + 81) {
+                        } else if (my >= m_start + 54 && my < m_start + 81) {
                             // Action Submenu 3: Reposition -> Opens Reposition Items popup window
                             g_reposition.is_open = true;
                             g_reposition.win_rect.x = (win_w - g_reposition.win_rect.w) / 2;
                             g_reposition.win_rect.y = (win_h - g_reposition.win_rect.h) / 2;
                             g_reposition.interval_focused = true;
                             SDL_StartTextInput();
+                            g_daw.menu_action_open = false;
+                            continue;
+                        } else if (my >= m_start + 81 && my <= m_start + 108) {
+                            // Action Submenu 4 (Requirement 6): Infinity -dB ON/OFF for selected track
+                            toggle_selected_track_infinity_db(p);
                             g_daw.menu_action_open = false;
                             continue;
                         }
@@ -12483,7 +12991,7 @@ int main(int argc, char *argv[]) {
 
                 if (g_menu_settings_open) {
                     int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-                    if (mx >= 250 && mx <= 426 && my >= m_start && my <= m_start + 81) {
+                    if (mx >= 250 && mx <= 434 && my >= m_start && my <= m_start + 108) {
                         if (my >= m_start && my < m_start + 27) {
                             // Settings Submenu 1: Keyboard Shortcut
                             scan_scripts_directory_to_actions(&g_daw);
@@ -12502,11 +13010,20 @@ int main(int argc, char *argv[]) {
                             g_theme.win_rect.y = (win_h - g_theme.win_rect.h) / 2;
                             g_menu_settings_open = false;
                             continue;
-                        } else if (my >= m_start + 54 && my <= m_start + 81) {
+                        } else if (my >= m_start + 54 && my < m_start + 81) {
                             // Settings Submenu 3: Mouse
                             g_mouse_settings_open = true;
                             g_mouse_win_rect.x = (win_w - g_mouse_win_rect.w) / 2;
                             g_mouse_win_rect.y = (win_h - g_mouse_win_rect.h) / 2;
+                            g_menu_settings_open = false;
+                            continue;
+                        } else if (my >= m_start + 81 && my <= m_start + 108) {
+                            // Settings Submenu 4 (Requirement 10): Auto save
+                            g_autosave.is_open = true;
+                            g_autosave.win_rect.x = (win_w - g_autosave.win_rect.w) / 2;
+                            g_autosave.win_rect.y = (win_h - g_autosave.win_rect.h) / 2;
+                            snprintf(g_autosave.interval_buf, sizeof(g_autosave.interval_buf), "%d", g_autosave.interval_minutes);
+                            g_autosave.interval_focused = false;
                             g_menu_settings_open = false;
                             continue;
                         }
@@ -12856,8 +13373,30 @@ int main(int argc, char *argv[]) {
                                     }
                                     handled_btn = true;
                                 } else if (!trk_full_locked && e.button.button == SDL_BUTTON_LEFT) {
-                                    if (mx >= 8 && mx <= 26) { push_undo_state(); p->track_db[t] -= 1.0f; record_project_change("Adjusted Track Volume", true); handled_btn = true; }
-                                    else if (mx >= 72 && mx <= 90) { push_undo_state(); p->track_db[t] += 1.0f; record_project_change("Adjusted Track Volume", true); handled_btn = true; }
+                                    if (mx >= 8 && mx <= 26) {
+                                        push_undo_state();
+                                        if (!g_track_inf_db[tab_tcp][t] && p->track_db[t] > -60.0f) {
+                                            p->track_db[t] -= 1.0f;
+                                            if (p->track_db[t] <= -60.0f) {
+                                                g_track_inf_db[tab_tcp][t] = true;
+                                                p->track_db[t] = -120.0f;
+                                            }
+                                        }
+                                        record_project_change("Adjusted Track Volume", true);
+                                        handled_btn = true;
+                                    } else if (mx >= 72 && mx <= 90) {
+                                        push_undo_state();
+                                        if (g_track_inf_db[tab_tcp][t] || p->track_db[t] <= -60.0f) {
+                                            g_track_inf_db[tab_tcp][t] = false;
+                                            float rdb = g_track_pre_inf_db[tab_tcp][t];
+                                            if (rdb <= -59.0f || rdb > 24.0f) rdb = 0.0f;
+                                            p->track_db[t] = rdb;
+                                        } else {
+                                            p->track_db[t] += 1.0f;
+                                        }
+                                        record_project_change("Adjusted Track Volume", true);
+                                        handled_btn = true;
+                                    }
                                     else if (mx >= 122 && mx <= 144) { push_undo_state(); p->tracks[t].mute = !p->tracks[t].mute; record_project_change("Toggled Track Mute", true); handled_btn = true; }
                                     else if (mx >= 148 && mx <= 170) { push_undo_state(); p->tracks[t].solo = !p->tracks[t].solo; record_project_change("Toggled Track Solo", true); handled_btn = true; }
                                 } else if (mx >= 8 && mx <= 172) {
@@ -13003,6 +13542,7 @@ int main(int argc, char *argv[]) {
                 g_clip_props.is_dragging = false;
                 g_clip_props.resize_edge = 0;
                 g_mouse_win_dragging = false;
+                g_autosave.is_dragging = false;
                 g_lock_win_dragging = false;
                 g_time_jump_dragging = false;
                 g_range_popup.is_dragging = false;
@@ -13130,6 +13670,12 @@ int main(int argc, char *argv[]) {
                     SDL_SetCursor(g_cursor_arrow);
                     continue;
                 }
+                if (g_autosave.is_open && g_autosave.is_dragging) {
+                    g_autosave.win_rect.x = mx - g_autosave.drag_off_x;
+                    g_autosave.win_rect.y = my - g_autosave.drag_off_y;
+                    SDL_SetCursor(g_cursor_arrow);
+                    continue;
+                }
                 if (g_clip_props.is_open && g_clip_props.resize_edge != 0) {
                     int dx = mx - g_clip_props.resize_start_mx;
                     int dy = my - g_clip_props.resize_start_my;
@@ -13231,7 +13777,7 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (g_action_win.is_open && g_action_win.sb_dragging) {
-                    int rows_h = (g_action_win.win_rect.h - 220) - 24;
+                    int rows_h = (g_action_win.win_rect.h - 266) - 24;
                     int content_h = g_action_win.num_filtered * 22 + 6;
                     int max_sc = (content_h > rows_h) ? (content_h - rows_h) : 0;
                     if (max_sc > 0 && rows_h > 0) {
@@ -13762,6 +14308,42 @@ int main(int argc, char *argv[]) {
             g_drop_batch_count = 0;
         }
 
+        // ================= REQUIREMENT 10: PROJECT AUTO SAVE (DEFAULT 30-MINUTE CYCLE) =================
+        // If project is not saved until cycle time (default 30 minutes), show "Project Auto Saving..." popup and auto-save.
+        // When major actions (Dynamic Split, Export, Import, Recording, Script Popup, or active mouse dragging) are in progress,
+        // auto-saving waits without disturbing the user and runs immediately after the major process completes!
+        if (g_autosave.enabled) {
+            Uint32 now_as = SDL_GetTicks();
+            Uint32 cyc_ms = (Uint32)(g_autosave.interval_minutes > 0 ? g_autosave.interval_minutes : 30) * 60000U;
+            if (now_as >= g_autosave.last_save_ticks && (now_as - g_autosave.last_save_ticks) >= cyc_ms) {
+                g_autosave.pending_autosave = true;
+            }
+            if (g_autosave.pending_autosave) {
+                bool major_action_busy = (
+                    g_engine_processing || g_processing_popup_open ||
+                    g_export.is_open || g_export.is_rendering ||
+                    g_multi_import.is_open || g_drop_batch_count > 0 ||
+                    g_dyn_split.is_open || g_reposition.is_open || g_script_popup.is_open ||
+                    g_rec.is_recording || g_daw.save_prompt_open || g_track_delete_prompt_open ||
+                    dragging_item_idx != -1 || marquee_selecting || scrubbing_ruler ||
+                    dragging_range_left || dragging_range_right || dragging_range_body ||
+                    resizing_track_idx != -1 || dragging_track_order_idx != -1 ||
+                    g_tab_needs_project_setup[get_valid_tab_idx()] || !p || p->project_path[0] == '\0'
+                );
+                if (!major_action_busy) {
+                    g_autosave_in_progress = true;
+                    for (int ti = 0; ti < g_daw.num_tabs; ti++) {
+                        if (g_daw.tabs[ti].project_path[0] != '\0' && !g_tab_needs_project_setup[ti]) {
+                            daw_save_project_to_path(&g_daw.tabs[ti], g_daw.tabs[ti].project_path);
+                        }
+                    }
+                    g_autosave_in_progress = false;
+                    g_autosave.pending_autosave = false;
+                    g_autosave.last_save_ticks = SDL_GetTicks();
+                }
+            }
+        }
+
         // ================= TOP-TRACK VIDEO SYNCHRONIZATION =================
         if (p->video.is_open) {
             AudioItem *v_clip = get_active_video_clip_at_playhead(p);
@@ -13900,7 +14482,7 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &btn_edit, g_menu_edit_open, false);
         draw_text(ren, "Edit", 201, TABBAR_HEIGHT + 13, c_white);
 
-        bool settings_active = g_menu_settings_open || g_action_win.is_open || g_theme.is_open || g_mouse_settings_open;
+        bool settings_active = g_menu_settings_open || g_action_win.is_open || g_theme.is_open || g_mouse_settings_open || g_autosave.is_open;
         SDL_Rect btn_settings = { 250, TABBAR_HEIGHT + 5, 76, 26 };
         SDL_SetRenderDrawColor(ren, settings_active ? 62 : 40, settings_active ? 46 : 40, settings_active ? 32 : 40, 255);
         SDL_RenderFillRect(ren, &btn_settings);
@@ -14871,8 +15453,13 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "-", 14, bot_y + 4, c_white);
 
             char db_txt[16];
-            snprintf(db_txt, sizeof(db_txt), "%+.1f", p->track_db[i]);
-            draw_text(ren, db_txt, 29, bot_y + 5, c_white);
+            bool trk_is_inf = (g_track_inf_db[get_valid_tab_idx()][i] || p->track_db[i] <= -60.0f);
+            if (trk_is_inf) {
+                snprintf(db_txt, sizeof(db_txt), "-inf");
+            } else {
+                snprintf(db_txt, sizeof(db_txt), "%+.1f", p->track_db[i]);
+            }
+            draw_text(ren, db_txt, trk_is_inf ? 32 : 29, bot_y + 5, trk_is_inf ? get_theme_accent_sdl_color() : c_white);
 
             SDL_Rect btn_plus = { 72, bot_y, 18, 20 };
             SDL_SetRenderDrawColor(ren, 32, 32, 34, 255);
@@ -14943,16 +15530,19 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Delete Marker", g_marker_context_x + 12, g_marker_context_y + 8, c_white);
         }
 
-        // 7. Action Menu (Submenus: Scripts, Dynamic split, Reposition)
+        // 7. Action Menu (Submenus: Scripts, Dynamic split, Reposition, Infinity -dB)
         if (g_daw.menu_action_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect a_box = { 60, m_start, 178, 81 };
+            SDL_Rect a_box = { 60, m_start, 198, 108 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &a_box);
             draw_brown_border_rect(ren, &a_box, true, false);
             draw_text(ren, "Scripts", 68, m_start + 7, c_white);
             draw_text(ren, "Dynamic split", 68, m_start + 34, c_white);
             draw_text(ren, "Reposition", 68, m_start + 61, c_white);
+            bool inf_on = is_selected_track_infinity_db_on(p);
+            draw_text(ren, inf_on ? "Infinity -dB [ON]" : "Infinity -dB [OFF]",
+                      68, m_start + 88, inf_on ? get_theme_accent_sdl_color() : c_white);
         }
 
         // Unified Script Manager (Lua & Python Scripts, Edge-Draggable Resize, Vertical Scrollbar, Refresh Script & Run Script)
@@ -15132,10 +15722,10 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Join (Glue)", 200, m_start + 34, c_white);
         }
 
-        // Settings Menu (Requirement 8 & 9: Submenus: Keyboard Shortcut, Themes, Mouse)
+        // Settings Menu (Submenus: Keyboard Shortcut, Themes, Mouse, Auto save)
         if (g_menu_settings_open) {
             int m_start = TABBAR_HEIGHT + TOPBAR_HEIGHT;
-            SDL_Rect s_box = { 250, m_start, 176, 81 };
+            SDL_Rect s_box = { 250, m_start, 184, 108 };
             SDL_SetRenderDrawColor(ren, 24, 24, 24, 255);
             SDL_RenderFillRect(ren, &s_box);
             draw_brown_border_rect(ren, &s_box, true, false);
@@ -15143,6 +15733,7 @@ int main(int argc, char *argv[]) {
             draw_text(ren, "Keyboard Shortcut", 260, m_start + 7, c_white);
             draw_text(ren, "Themes", 260, m_start + 34, c_white);
             draw_text(ren, "Mouse", 260, m_start + 61, c_white);
+            draw_text(ren, "Auto save", 260, m_start + 88, c_white);
         }
 
         // File Menu (Import Project, Export Project, Project Save As, Import Media, Export Media)
@@ -15549,6 +16140,11 @@ int main(int argc, char *argv[]) {
             render_mouse_settings_window(ren);
         }
 
+        // Settings -> Auto Save Popup Window (Requirement 10)
+        if (g_autosave.is_open) {
+            render_auto_save_settings_window(ren);
+        }
+
         // Main Lock Two-Section Popup Window (All Track | Selected track)
         if (g_lock_popup_open) {
             render_track_lock_popup_window(ren);
@@ -15577,7 +16173,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &dim_overlay);
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
-            int mw = 480, mh = 210;
+            int mw = 620, mh = 210;
             int mx_box = (win_w - mw) / 2;
             int my_box = (win_h - mh) / 2;
 
@@ -15595,25 +16191,25 @@ int main(int argc, char *argv[]) {
                 draw_text(ren, "X", mx_box + mw - 20, my_box + 10, c_white);
             }
 
-            draw_text(ren, "Choose an option to start working in this project tab:", mx_box + 28, my_box + 52, c_white);
-            draw_text(ren, "Creating a project creates <Project>/, <Project>.ehs & <Project>/media/", mx_box + 28, my_box + 78, c_muted);
+            draw_text(ren, "Choose an option to start working in this project tab:", mx_box + 24, my_box + 52, c_white);
+            draw_text(ren, "Creating a project creates <Project>/, <Project>.ehs & <Project>/media/", mx_box + 24, my_box + 78, c_muted);
 
             int btn_y = my_box + 118;
             // Option 1: [ Open Project File ]
-            SDL_Rect b_open = { mx_box + 28, btn_y, 202, 42 };
+            SDL_Rect b_open = { mx_box + 56, btn_y, 240, 42 };
             SDL_SetRenderDrawColor(ren, 46, 58, 72, 255);
             SDL_RenderFillRect(ren, &b_open);
             draw_brown_border_rect(ren, &b_open, true, false);
-            draw_text(ren, "Open Project File", b_open.x + 33, btn_y + 15, c_white);
+            draw_text(ren, "Open Project File", b_open.x + 52, btn_y + 15, c_white);
 
             // Option 2: [ Create Project File ]
-            SDL_Rect b_create = { mx_box + 250, btn_y, 202, 42 };
+            SDL_Rect b_create = { mx_box + 324, btn_y, 240, 42 };
             SDL_SetRenderDrawColor(ren, 82, 54, 32, 255);
             SDL_RenderFillRect(ren, &b_create);
             draw_brown_border_rect(ren, &b_create, true, false);
-            draw_text(ren, "Create Project File", b_create.x + 25, btn_y + 15, c_white);
+            draw_text(ren, "Create Project File", b_create.x + 44, btn_y + 15, c_white);
 
-            draw_text(ren, "All imported, recorded & glued media are stored in <Project>/media/", mx_box + 28, my_box + mh - 26, c_muted);
+            draw_text(ren, "All imported, recorded & glued media are stored in <Project>/media/", mx_box + 24, my_box + mh - 26, c_muted);
         }
 
         // Sync & render Global Pinned Video Monitor window if active (Requirement 7)
@@ -15676,7 +16272,7 @@ int main(int argc, char *argv[]) {
             SDL_RenderFillRect(ren, &dim_overlay);
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
 
-            int dia_w = 390, dia_h = 140;
+            int dia_w = 430, dia_h = 140;
             int dia_x = (win_w - dia_w) / 2;
             int dia_y = (win_h - dia_h) / 2;
 
