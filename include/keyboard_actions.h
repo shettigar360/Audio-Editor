@@ -366,6 +366,35 @@ static inline void draw_lock_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool
 #endif
 
 // Anchor indices for standard Shift+Click range selection on tracks and clips
+#ifndef DAW_APP_VOL_AND_PROJ_SETUP_DEFINED
+#define DAW_APP_VOL_AND_PROJ_SETUP_DEFINED
+// Per-tab App Hearing Volume (0..100%, 0 = infinity mute; hearing level only, saved in .ehs project file)
+static float g_app_master_vol[MAX_TABS] = { 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f };
+static float g_app_track_vol[MAX_TABS][MAX_TRACKS];
+static bool  g_app_vol_initialized = false;
+static inline void ensure_app_vol_defaults_initialized(void) {
+    if (g_app_vol_initialized) return;
+    g_app_vol_initialized = true;
+    for (int t = 0; t < MAX_TABS; t++) {
+        g_app_master_vol[t] = 100.0f;
+        for (int k = 0; k < MAX_TRACKS; k++) {
+            g_app_track_vol[t][k] = 100.0f;
+        }
+    }
+}
+static inline void init_tab_app_volume_defaults(int tab_idx) {
+    ensure_app_vol_defaults_initialized();
+    if (tab_idx < 0 || tab_idx >= MAX_TABS) return;
+    g_app_master_vol[tab_idx] = 100.0f;
+    for (int k = 0; k < MAX_TRACKS; k++) {
+        g_app_track_vol[tab_idx][k] = 100.0f;
+    }
+}
+
+// Per-tab New Project Tab 2-option modal ("Open Project File" / "Create Project File")
+static bool g_tab_needs_project_setup[MAX_TABS] = { true, true, true, true, true, true, true, true };
+#endif
+
 #ifndef DAW_SHARED_STABILITY_VARS_DEFINED
 #define DAW_SHARED_STABILITY_VARS_DEFINED
 static int g_last_clicked_track_idx = -1;
@@ -479,7 +508,7 @@ static RecordingEngineState g_rec = {
     0, -1, 0.0, 0, 0,
     NULL, NULL,
     "", "",
-    "Temporary Media",
+    "media",
     0.0f, 0.0f, 0, 0, 0,
     false
 };
@@ -487,30 +516,8 @@ static RecordingEngineState g_rec = {
 static inline void init_default_recording_folder(void) {
     if (g_rec.folder_initialized) return;
     g_rec.folder_initialized = true;
-    char *base = SDL_GetBasePath();
-    if (base && base[0]) {
-        size_t blen = strlen(base);
-        while (blen > 0 && (base[blen - 1] == '\\' || base[blen - 1] == '/')) {
-            base[--blen] = '\0';
-        }
-#ifdef _WIN32
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s\\Temporary Media", base);
-        CreateDirectoryA(g_rec.folder_path, NULL);
-        CreateDirectoryA("Temporary Media", NULL);
-#else
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "%s/Temporary Media", base);
-        mkdir(g_rec.folder_path, 0777);
-        mkdir("Temporary Media", 0777);
-#endif
-        SDL_free(base);
-    } else {
-        if (base) SDL_free(base);
-        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "Temporary Media");
-#ifdef _WIN32
-        CreateDirectoryA("Temporary Media", NULL);
-#else
-        mkdir("Temporary Media", 0777);
-#endif
+    if (!g_rec.folder_path[0]) {
+        snprintf(g_rec.folder_path, sizeof(g_rec.folder_path), "media");
     }
 }
 
@@ -5478,9 +5485,11 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
                 memset(g_tab_history[nt], 0, sizeof(g_tab_history[0]));
                 g_tab_history_count[nt] = 0;
                 g_tab_notification[nt][0] = '\0';
+                init_tab_app_volume_defaults(nt);
+                g_tab_needs_project_setup[nt] = true;
                 g_daw.active_tab = g_daw.num_tabs++;
                 g_selected_marker_idx = -1;
-                record_project_change("Project Created", false);
+                record_project_change("New Project Tab Opened", false);
             }
             break;
         }
