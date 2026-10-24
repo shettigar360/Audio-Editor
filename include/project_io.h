@@ -93,7 +93,8 @@ static inline void load_project_file(void) {
 static inline void export_rendered_audio(const char *ext) {
     ProjectTab *p = get_cur_tab();
     char filter[128], path[MAX_PATH];
-    snprintf(filter, sizeof(filter), "Audio Format (*.%s)\0*.%s\0", ext, ext);
+    int n1 = snprintf(filter, 60, "Audio Format (*.%s)", ext);
+    if (n1 > 0 && n1 < 60) snprintf(filter + n1 + 1, 60, "*.%s", ext);
     if (open_generic_dialog(path, sizeof(path), filter, true)) {
         FILE *out_f = fopen(path, "wb");
         if (out_f) {
