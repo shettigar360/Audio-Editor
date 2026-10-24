@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/stat.h>
 
 #define MAX_TRACKS 32
@@ -163,8 +164,7 @@ static inline PeakBin* daw_register_shared_peaks(const char *raw_path, PeakBin *
 
 #endif // DAW_PEAK_POOL_DEFINED
 
-// Simple string hash to generate distinct cache filenames
-// Rebuilds high-resolution 32-sample REAPER-style peaks directly from an existing .raw stereo float cache file
+// Rebuilds high-resolution REAPER-style peaks directly from an existing .raw stereo float cache file
 static inline PeakBin* daw_rebuild_peaks_from_raw_file(const char *raw_path, const char *pk_cache_path,
                                                        int *out_peak_count, double *out_total_dur, bool has_video) {
     if (!raw_path || !raw_path[0]) return NULL;
@@ -241,10 +241,42 @@ static inline PeakBin* daw_rebuild_peaks_from_raw_file(const char *raw_path, con
     return peaks;
 }
 
+// Hashes canonical <lowercase_filename>_<filesize_bytes> so copying/moving a media clip
+// into <Project>/media/ never creates duplicate .raw/.pk cache files in .cache/!
 static inline unsigned int hash_path(const char *str) {
-    unsigned int hash = 5381;
-    int c;
-    while ((c = *str++)) hash = ((hash << 5) + hash) + c;
+    if (!str || !str[0]) return 5381U;
+    const char *base = strrchr(str, '\\');
+    const char *base2 = strrchr(str, '/');
+    if (base2 && (!base || base2 > base)) base = base2;
+    const char *fname = base ? (base + 1) : str;
+
+    int64_t fsize = -1;
+    FILE *fp = fopen(str, "rb");
+    if (fp) {
+        if (daw_fseek64(fp, 0, SEEK_END) == 0) {
+            fsize = daw_ftell64(fp);
+        }
+        fclose(fp);
+    }
+
+    unsigned int hash = 5381U;
+    if (fsize > 0 && fname[0] != '\0') {
+        for (const char *p = fname; *p; p++) {
+            int c = tolower((unsigned char)*p);
+            hash = ((hash << 5) + hash) + (unsigned int)c;
+        }
+        char sz_buf[48];
+        snprintf(sz_buf, sizeof(sz_buf), "_%lld", (long long)fsize);
+        for (const char *p = sz_buf; *p; p++) {
+            hash = ((hash << 5) + hash) + (unsigned int)(unsigned char)(*p);
+        }
+        return hash;
+    }
+
+    for (const char *p = str; *p; p++) {
+        int c = (*p == '/') ? '\\' : tolower((unsigned char)*p);
+        hash = ((hash << 5) + hash) + (unsigned int)c;
+    }
     return hash;
 }
 
