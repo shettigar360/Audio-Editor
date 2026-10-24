@@ -6628,15 +6628,14 @@ static void get_export_time_bounds(ProjectTab *p, double *out_start, double *out
     if (out_end)   *out_end   = exp_end;
 }
 
+static void daw_ensure_all_project_raw_audio_ready(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win);
+
 // Executes the unified Export Media workflow based on all settings in g_export with live progress %, green 100% bar & full stability
 static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
     if (!p) return;
 
-#ifdef _WIN32
-    CreateDirectoryA(".cache", NULL);
-#else
-    mkdir(".cache", 0777);
-#endif
+    (void)daw_get_engine_cache_dir();
+    daw_ensure_all_project_raw_audio_ready(p, ren, g_main_win);
 
     // Pause live playback and pause SDL audio device during export so file handles and mixer never conflict
     p->is_playing = false;
@@ -6677,7 +6676,7 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
             g_export.two_pass_render, 0, 100
         );
     } else if (g_export.format == EXPORT_FMT_MP3) {
-        const char *tmp_wav = ".cache/export_tmp_audio.wav";
+        char tmp_wav[512]; snprintf(tmp_wav, sizeof(tmp_wav), "%s/export_tmp_audio.wav", daw_get_engine_cache_dir());
         if (render_range_to_wav_file(
                 p, ren, tmp_wav, exp_start, exp_end, -1, -1,
                 g_export.sample_rate, g_export.channels, 24,
@@ -6697,7 +6696,7 @@ static void execute_unified_export(ProjectTab *p, SDL_Renderer *ren) {
             remove(tmp_wav);
         }
     } else if (g_export.format == EXPORT_FMT_MP4) {
-        const char *tmp_wav = ".cache/export_tmp_video_audio.wav";
+        char tmp_wav[512]; snprintf(tmp_wav, sizeof(tmp_wav), "%s/export_tmp_video_audio.wav", daw_get_engine_cache_dir());
         int w = atoi(g_export.mp4_width_str);
         int h = atoi(g_export.mp4_height_str);
         if (w <= 0 || h <= 0) {
@@ -6963,17 +6962,508 @@ static void render_import_progress_popup(SDL_Renderer *ren, SDL_Window *win,
     SDL_RenderPresent(ren);
 }
 
+// ================= REAPER-STYLE INSTANT METADATA & PEAK LOADING + BACKGROUND STREAM WORKER =================
+#define MAX_BG_MEDIA_QUEUE 256
+typedef struct {
+    char file_path[512];
+    char raw_audio_path[512];
+    char proj_pk_path[512];
+    char cache_pk_path[512];
+} BgMediaPrepTask;
+
+static BgMediaPrepTask g_bg_media_queue[MAX_BG_MEDIA_QUEUE];
+static int             g_bg_media_q_head = 0;
+static int             g_bg_media_q_tail = 0;
+static SDL_mutex      *g_bg_media_mutex  = NULL;
+static SDL_Thread     *g_bg_media_thread = NULL;
+static volatile int    g_bg_media_running = 0;
+static volatile int    g_bg_media_completed_serial = 0;
+static int             g_bg_media_observed_serial  = 0;
+
+static void daw_init_bg_media_system(void) {
+    if (!g_bg_media_mutex) {
+        g_bg_media_mutex = SDL_CreateMutex();
+    }
+}
+
+// Decodes a single media file into <raw_audio_path>.part and writes .pk sidecar files on the background worker thread
+static void daw_bg_decode_single_media_task(const BgMediaPrepTask *task) {
+    if (!task || !task->file_path[0] || !task->raw_audio_path[0]) return;
+
+    FILE *chk_raw = daw_fopen_LockFreeRead(task->raw_audio_path);
+    if (chk_raw) {
+        fclose(chk_raw);
+        FILE *chk_pk = fopen(task->proj_pk_path[0] ? task->proj_pk_path : task->cache_pk_path, "rb");
+        if (chk_pk) {
+            fclose(chk_pk);
+            return;
+        }
+    }
+
+    AVFormatContext *fmt = NULL;
+    if (avformat_open_input(&fmt, task->file_path, NULL, NULL) < 0) return;
+    if (avformat_find_stream_info(fmt, NULL) < 0) {
+        avformat_close_input(&fmt);
+        return;
+    }
+
+    int a_idx = -1, v_idx = -1;
+    for (unsigned int i = 0; i < fmt->nb_streams; i++) {
+        enum AVMediaType ctype = fmt->streams[i]->codecpar->codec_type;
+        if (ctype == AVMEDIA_TYPE_AUDIO && a_idx == -1) a_idx = (int)i;
+        else if (ctype == AVMEDIA_TYPE_VIDEO && v_idx == -1) {
+            if (!(fmt->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC)) v_idx = (int)i;
+        }
+    }
+    if (v_idx == -1) {
+        for (unsigned int i = 0; i < fmt->nb_streams; i++) {
+            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { v_idx = (int)i; break; }
+        }
+    }
+    if (a_idx == -1) {
+        avformat_close_input(&fmt);
+        return;
+    }
+
+    bool has_video = (v_idx != -1);
+    double total_sec = 0.0;
+    if (fmt->duration != AV_NOPTS_VALUE && fmt->duration > 0) {
+        total_sec = (double)fmt->duration / AV_TIME_BASE;
+    } else if (v_idx != -1 && fmt->streams[v_idx]->duration != AV_NOPTS_VALUE && fmt->streams[v_idx]->duration > 0) {
+        total_sec = (double)fmt->streams[v_idx]->duration * av_q2d(fmt->streams[v_idx]->time_base);
+    } else if (fmt->streams[a_idx]->duration != AV_NOPTS_VALUE && fmt->streams[a_idx]->duration > 0) {
+        total_sec = (double)fmt->streams[a_idx]->duration * av_q2d(fmt->streams[a_idx]->time_base);
+    }
+    if (total_sec <= 0.0) total_sec = 10.0;
+
+    AVCodecParameters *cpar = fmt->streams[a_idx]->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(cpar->codec_id);
+    if (!codec) {
+        avformat_close_input(&fmt);
+        return;
+    }
+    for (unsigned int s_i = 0; s_i < fmt->nb_streams; s_i++) {
+#ifdef AVDISCARD_ALL
+        if ((int)s_i != a_idx) fmt->streams[s_i]->discard = AVDISCARD_ALL;
+#endif
+    }
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(ctx, cpar);
+    ctx->thread_count = 2;
+    if (avcodec_open2(ctx, codec, NULL) < 0) {
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return;
+    }
+    if (ctx->ch_layout.nb_channels <= 0) {
+        int ch = (cpar->ch_layout.nb_channels > 0) ? cpar->ch_layout.nb_channels : 2;
+        av_channel_layout_default(&ctx->ch_layout, ch);
+    }
+    SwrContext *swr = NULL;
+    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
+    if (swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, SAMPLE_RATE,
+                            &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, 0, NULL) < 0 ||
+        swr_init(swr) < 0) {
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return;
+    }
+
+    char tmp_raw_path[540];
+    snprintf(tmp_raw_path, sizeof(tmp_raw_path), "%s.part", task->raw_audio_path);
+    FILE *f_raw = fopen(tmp_raw_path, "wb");
+    if (!f_raw) {
+        swr_free(&swr);
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return;
+    }
+    setvbuf(f_raw, NULL, _IOFBF, 65536);
+
+    int allocated_bins = (int)((total_sec * SAMPLE_RATE) / PEAK_SAMPLES_PER_BIN) + 4096;
+    if (allocated_bins < 4096) allocated_bins = 4096;
+    PeakBin *peak_cache = (PeakBin *)calloc((size_t)allocated_bins, sizeof(PeakBin));
+    int current_bin = 0;
+
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    int pcm_cap_frames = 16384;
+    float *temp_pcm = (float *)malloc((size_t)pcm_cap_frames * 2 * sizeof(float));
+    if (!temp_pcm) {
+        fclose(f_raw);
+        remove(tmp_raw_path);
+        if (peak_cache) free(peak_cache);
+        av_frame_free(&frame);
+        av_packet_free(&pkt);
+        swr_free(&swr);
+        avcodec_free_context(&ctx);
+        avformat_close_input(&fmt);
+        return;
+    }
+
+    float cur_min = 0.0f, cur_max = 0.0f;
+    int samples_in_bin = 0;
+    int64_t total_written_frames = 0;
+
+    while (av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == a_idx && avcodec_send_packet(ctx, pkt) == 0) {
+            while (avcodec_receive_frame(ctx, frame) == 0) {
+                int needed_out = (int)((double)frame->nb_samples * (double)SAMPLE_RATE / (double)(ctx->sample_rate > 0 ? ctx->sample_rate : SAMPLE_RATE)) + 1024;
+                if (needed_out > pcm_cap_frames) {
+                    int new_cap = needed_out * 2;
+                    float *grown_pcm = (float *)realloc(temp_pcm, (size_t)new_cap * 2 * sizeof(float));
+                    if (grown_pcm) { temp_pcm = grown_pcm; pcm_cap_frames = new_cap; }
+                }
+                const uint8_t **in_data = (const uint8_t **)frame->extended_data;
+                int in_samples = frame->nb_samples;
+                for (;;) {
+                    uint8_t *out_d[2] = { (uint8_t *)temp_pcm, NULL };
+                    int converted = swr_convert(swr, out_d, pcm_cap_frames, in_data, in_samples);
+                    in_data = NULL; in_samples = 0;
+                    if (converted <= 0) break;
+                    fwrite(temp_pcm, sizeof(float) * 2, (size_t)converted, f_raw);
+                    total_written_frames += converted;
+                    for (int s = 0; s < converted; s++) {
+                        float mono = (temp_pcm[s * 2] + temp_pcm[s * 2 + 1]) * 0.5f;
+                        if (samples_in_bin == 0) { cur_min = mono; cur_max = mono; }
+                        else { if (mono < cur_min) cur_min = mono; if (mono > cur_max) cur_max = mono; }
+                        if (++samples_in_bin >= PEAK_SAMPLES_PER_BIN) {
+                            if (current_bin >= allocated_bins && peak_cache) {
+                                int new_cap = allocated_bins * 2;
+                                PeakBin *grown = (PeakBin *)realloc(peak_cache, (size_t)new_cap * sizeof(PeakBin));
+                                if (grown) {
+                                    memset(grown + allocated_bins, 0, (size_t)(new_cap - allocated_bins) * sizeof(PeakBin));
+                                    peak_cache = grown; allocated_bins = new_cap;
+                                }
+                            }
+                            if (peak_cache && current_bin < allocated_bins) {
+                                peak_cache[current_bin].min_val = cur_min;
+                                peak_cache[current_bin].max_val = cur_max;
+                                current_bin++;
+                            }
+                            cur_min = 0.0f; cur_max = 0.0f; samples_in_bin = 0;
+                        }
+                    }
+                }
+            }
+        }
+        av_packet_unref(pkt);
+    }
+
+    avcodec_send_packet(ctx, NULL);
+    while (avcodec_receive_frame(ctx, frame) == 0) {
+        const uint8_t **in_data = (const uint8_t **)frame->extended_data;
+        int in_samples = frame->nb_samples;
+        for (;;) {
+            uint8_t *out_d[2] = { (uint8_t *)temp_pcm, NULL };
+            int converted = swr_convert(swr, out_d, pcm_cap_frames, in_data, in_samples);
+            in_data = NULL; in_samples = 0;
+            if (converted <= 0) break;
+            fwrite(temp_pcm, sizeof(float) * 2, (size_t)converted, f_raw);
+            total_written_frames += converted;
+            for (int s = 0; s < converted; s++) {
+                float mono = (temp_pcm[s * 2] + temp_pcm[s * 2 + 1]) * 0.5f;
+                if (mono < cur_min) cur_min = mono;
+                if (mono > cur_max) cur_max = mono;
+                if (++samples_in_bin >= PEAK_SAMPLES_PER_BIN) {
+                    if (current_bin >= allocated_bins && peak_cache) {
+                        int new_cap = allocated_bins * 2;
+                        PeakBin *grown = (PeakBin *)realloc(peak_cache, (size_t)new_cap * sizeof(PeakBin));
+                        if (grown) {
+                            memset(grown + allocated_bins, 0, (size_t)(new_cap - allocated_bins) * sizeof(PeakBin));
+                            peak_cache = grown; allocated_bins = new_cap;
+                        }
+                    }
+                    if (peak_cache && current_bin < allocated_bins) {
+                        peak_cache[current_bin].min_val = cur_min;
+                        peak_cache[current_bin].max_val = cur_max;
+                        current_bin++;
+                    }
+                    cur_min = 0.0f; cur_max = 0.0f; samples_in_bin = 0;
+                }
+            }
+        }
+    }
+    for (;;) {
+        uint8_t *out_d[2] = { (uint8_t *)temp_pcm, NULL };
+        int converted = swr_convert(swr, out_d, pcm_cap_frames, NULL, 0);
+        if (converted <= 0) break;
+        fwrite(temp_pcm, sizeof(float) * 2, (size_t)converted, f_raw);
+        total_written_frames += converted;
+    }
+    if (samples_in_bin > 0 && peak_cache && current_bin < allocated_bins) {
+        peak_cache[current_bin].min_val = cur_min;
+        peak_cache[current_bin].max_val = cur_max;
+        current_bin++;
+    }
+
+    free(temp_pcm);
+    fflush(f_raw);
+    fclose(f_raw);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    swr_free(&swr);
+    avcodec_free_context(&ctx);
+    avformat_close_input(&fmt);
+
+    double actual_dur = (total_written_frames > 0) ? ((double)total_written_frames / SAMPLE_RATE) : total_sec;
+    if (peak_cache && current_bin > 0) {
+        if (task->cache_pk_path[0]) daw_save_pk_file(task->cache_pk_path, peak_cache, current_bin, actual_dur, has_video);
+        if (task->proj_pk_path[0])  daw_save_pk_file(task->proj_pk_path,  peak_cache, current_bin, actual_dur, has_video);
+    }
+    if (peak_cache) free(peak_cache);
+
+#ifdef _WIN32
+    if (!MoveFileExA(tmp_raw_path, task->raw_audio_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+        remove(task->raw_audio_path);
+        rename(tmp_raw_path, task->raw_audio_path);
+    }
+#else
+    rename(tmp_raw_path, task->raw_audio_path);
+#endif
+    g_bg_media_completed_serial++;
+}
+
+static int SDLCALL daw_bg_media_worker_thread_fn(void *data) {
+    (void)data;
+    for (;;) {
+        BgMediaPrepTask task;
+        bool has_task = false;
+        if (g_bg_media_mutex) SDL_LockMutex(g_bg_media_mutex);
+        if (g_bg_media_q_head != g_bg_media_q_tail) {
+            task = g_bg_media_queue[g_bg_media_q_head];
+            g_bg_media_q_head = (g_bg_media_q_head + 1) % MAX_BG_MEDIA_QUEUE;
+            has_task = true;
+        } else {
+            g_bg_media_running = 0;
+        }
+        if (g_bg_media_mutex) SDL_UnlockMutex(g_bg_media_mutex);
+
+        if (!has_task) break;
+        daw_bg_decode_single_media_task(&task);
+    }
+    return 0;
+}
+
+static void daw_enqueue_bg_media_prep(const char *file_path, const char *raw_audio_path,
+                                      const char *proj_pk_path, const char *cache_pk_path) {
+    if (!file_path || !file_path[0] || !raw_audio_path || !raw_audio_path[0]) return;
+    daw_init_bg_media_system();
+    if (g_bg_media_mutex) SDL_LockMutex(g_bg_media_mutex);
+
+    // Avoid duplicate queue entries for the same raw_audio_path
+    int idx = g_bg_media_q_head;
+    while (idx != g_bg_media_q_tail) {
+        if (strcmp(g_bg_media_queue[idx].raw_audio_path, raw_audio_path) == 0) {
+            if (g_bg_media_mutex) SDL_UnlockMutex(g_bg_media_mutex);
+            return;
+        }
+        idx = (idx + 1) % MAX_BG_MEDIA_QUEUE;
+    }
+
+    int next_tail = (g_bg_media_q_tail + 1) % MAX_BG_MEDIA_QUEUE;
+    if (next_tail != g_bg_media_q_head) {
+        BgMediaPrepTask *t = &g_bg_media_queue[g_bg_media_q_tail];
+        strncpy(t->file_path, file_path, sizeof(t->file_path) - 1);
+        t->file_path[sizeof(t->file_path) - 1] = '\0';
+        strncpy(t->raw_audio_path, raw_audio_path, sizeof(t->raw_audio_path) - 1);
+        t->raw_audio_path[sizeof(t->raw_audio_path) - 1] = '\0';
+        if (proj_pk_path) {
+            strncpy(t->proj_pk_path, proj_pk_path, sizeof(t->proj_pk_path) - 1);
+            t->proj_pk_path[sizeof(t->proj_pk_path) - 1] = '\0';
+        } else {
+            t->proj_pk_path[0] = '\0';
+        }
+        if (cache_pk_path) {
+            strncpy(t->cache_pk_path, cache_pk_path, sizeof(t->cache_pk_path) - 1);
+            t->cache_pk_path[sizeof(t->cache_pk_path) - 1] = '\0';
+        } else {
+            t->cache_pk_path[0] = '\0';
+        }
+        g_bg_media_q_tail = next_tail;
+    }
+
+    bool need_spawn = (g_bg_media_running == 0);
+    if (need_spawn) g_bg_media_running = 1;
+    if (g_bg_media_mutex) SDL_UnlockMutex(g_bg_media_mutex);
+
+    if (need_spawn) {
+        if (g_bg_media_thread) {
+            SDL_WaitThread(g_bg_media_thread, NULL);
+            g_bg_media_thread = NULL;
+        }
+        g_bg_media_thread = SDL_CreateThread(daw_bg_media_worker_thread_fn, "DawBgMediaWorker", NULL);
+    }
+}
+
+// Polls on the main UI thread to attach any background-prepared .raw handles and .pk waveform peaks
+static void daw_poll_bg_prepared_media_on_main_thread(void) {
+    int cur_ser = g_bg_media_completed_serial;
+    if (cur_ser == g_bg_media_observed_serial && g_bg_media_running == 0) return;
+    g_bg_media_observed_serial = cur_ser;
+
+    for (int t = 0; t < g_daw.num_tabs; t++) {
+        ProjectTab *tp = &g_daw.tabs[t];
+        for (int i = 0; i < tp->num_items; i++) {
+            AudioItem *it = &tp->items[i];
+            if (!it->raw_audio_path[0]) continue;
+            if (!it->peaks) {
+                int p_cnt = 0; double p_dur = 0.0; bool p_vid = false;
+                PeakBin *sh = daw_find_shared_peaks(it->raw_audio_path, &p_cnt, &p_dur, &p_vid);
+                if (sh && p_dur > 0.0) {
+                    it->peaks = sh;
+                    it->peak_count = p_cnt;
+                    if (it->file_total_duration <= 0.0) it->file_total_duration = p_dur;
+                } else {
+                    char proj_pk[512] = {0};
+                    daw_build_project_pk_path(it->file_path, proj_pk, sizeof(proj_pk));
+                    unsigned int h = hash_path(it->file_path);
+                    char cache_pk[512] = {0};
+                    daw_build_pk_cache_path(h, cache_pk, sizeof(cache_pk));
+                    PeakBin *loaded_pk = NULL;
+                    if (daw_load_pk_file(proj_pk, &loaded_pk, &p_cnt, &p_dur, &p_vid) ||
+                        daw_load_pk_file(cache_pk, &loaded_pk, &p_cnt, &p_dur, &p_vid)) {
+                        it->peaks = daw_register_shared_peaks(it->raw_audio_path, loaded_pk, p_cnt, p_dur, p_vid);
+                        it->peak_count = p_cnt;
+                        if (it->file_total_duration <= 0.0) it->file_total_duration = p_dur;
+                        if (p_vid) it->has_video = true;
+                    }
+                }
+            }
+            if (!it->raw_file_handle) {
+                FILE *fp = daw_fopen_LockFreeRead(it->raw_audio_path);
+                if (fp) {
+                    if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
+                    it->raw_file_handle = fp;
+                    if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
+                }
+            }
+        }
+    }
+}
+
+// Ensures all clips in ProjectTab `p` have their .raw audio handles ready before offline Export / Glue / Reverse / Normalize
+static void daw_ensure_all_project_raw_audio_ready(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win) {
+    if (!p) return;
+    if (g_bg_media_running && g_bg_media_thread) {
+        SDL_WaitThread(g_bg_media_thread, NULL);
+        g_bg_media_thread = NULL;
+    }
+    daw_poll_bg_prepared_media_on_main_thread();
+    for (int i = 0; i < p->num_items; i++) {
+        AudioItem *it = &p->items[i];
+        if (!it->raw_file_handle && it->raw_audio_path[0]) {
+            it->raw_file_handle = daw_fopen_LockFreeRead(it->raw_audio_path);
+            if (!it->raw_file_handle && it->file_path[0]) {
+                BgMediaPrepTask task;
+                memset(&task, 0, sizeof(task));
+                strncpy(task.file_path, it->file_path, sizeof(task.file_path) - 1);
+                strncpy(task.raw_audio_path, it->raw_audio_path, sizeof(task.raw_audio_path) - 1);
+                daw_build_project_pk_path(it->file_path, task.proj_pk_path, sizeof(task.proj_pk_path));
+                daw_build_pk_cache_path(hash_path(it->file_path), task.cache_pk_path, sizeof(task.cache_pk_path));
+                (void)ren; (void)win;
+                daw_bg_decode_single_media_task(&task);
+                it->raw_file_handle = daw_fopen_LockFreeRead(it->raw_audio_path);
+            }
+        }
+    }
+}
+
+// REAPER-Style Instant Metadata & Sidecar Peak Loader for Project Open (0 ms UI wait, NEVER shows "Importing Media...")
+static int daw_load_clip_metadata_fast_reaper(AudioItem *item, const char *filepath,
+                                              double saved_file_tot_dur, double saved_clip_dur,
+                                              bool saved_has_video) {
+    if (!item || !filepath || !filepath[0]) return -1;
+    (void)daw_get_engine_cache_dir();
+
+    const char *name = strrchr(filepath, '\\');
+    if (!name) name = strrchr(filepath, '/');
+    const char *short_name = name ? name + 1 : filepath;
+
+    strncpy(item->file_path, filepath, sizeof(item->file_path) - 1);
+    item->file_path[sizeof(item->file_path) - 1] = '\0';
+    snprintf(item->label, sizeof(item->label), "%s", short_name);
+
+    unsigned int h = hash_path(filepath);
+    daw_build_raw_cache_path(h, item->raw_audio_path, sizeof(item->raw_audio_path));
+
+    char pk_cache_path[512] = {0};
+    char proj_pk_path[512]  = {0};
+    daw_build_pk_cache_path(h, pk_cache_path, sizeof(pk_cache_path));
+    daw_build_project_pk_path(filepath, proj_pk_path, sizeof(proj_pk_path));
+
+    bool has_vid_flag = saved_has_video;
+    if (!has_vid_flag) {
+        const char *ext_chk = strrchr(filepath, '.');
+        if (ext_chk && strstr(".mp4.MP4.mov.MOV.mkv.MKV.avi.AVI.webm.WEBM", ext_chk) != NULL) {
+            has_vid_flag = true;
+        }
+    }
+    item->has_video = has_vid_flag;
+    double fallback_dur = (saved_file_tot_dur > 0.0) ? saved_file_tot_dur : ((saved_clip_dur > 0.0) ? saved_clip_dur : 10.0);
+    item->file_total_duration = fallback_dur;
+    item->duration = (saved_clip_dur > 0.0) ? saved_clip_dur : fallback_dur;
+    item->offset_in_file = 0.0;
+    item->is_selected = false;
+
+    // 1. Check in-RAM shared peak pool first (0 ms)
+    int pooled_cnt = 0;
+    double pooled_dur = 0.0;
+    bool pooled_vid = false;
+    PeakBin *pooled_pk = daw_find_shared_peaks(item->raw_audio_path, &pooled_cnt, &pooled_dur, &pooled_vid);
+    if (pooled_pk && pooled_dur > 0.0) {
+        item->peaks = pooled_pk;
+        item->peak_count = pooled_cnt;
+        item->file_total_duration = pooled_dur;
+        if (pooled_vid) item->has_video = true;
+    } else {
+        // 2. Load REAPER-style sidecar .pk peak file from <Project>/media/<clip>.pk or engine cache (< 1 ms)
+        PeakBin *loaded_pk = NULL;
+        int loaded_cnt = 0;
+        double loaded_dur = 0.0;
+        bool loaded_vid = false;
+        bool from_proj_pk = daw_load_pk_file(proj_pk_path, &loaded_pk, &loaded_cnt, &loaded_dur, &loaded_vid);
+        bool from_cache_pk = false;
+        if (!from_proj_pk) {
+            from_cache_pk = daw_load_pk_file(pk_cache_path, &loaded_pk, &loaded_cnt, &loaded_dur, &loaded_vid);
+        }
+        if ((from_proj_pk || from_cache_pk) && loaded_dur > 0.0) {
+            if (!from_proj_pk && proj_pk_path[0] && loaded_pk && loaded_cnt > 0) {
+                daw_save_pk_file(proj_pk_path, loaded_pk, loaded_cnt, loaded_dur, loaded_vid || has_vid_flag);
+            }
+            if (loaded_vid) item->has_video = true;
+            item->peaks = daw_register_shared_peaks(item->raw_audio_path, loaded_pk, loaded_cnt, loaded_dur, item->has_video);
+            item->peak_count = loaded_cnt;
+            item->file_total_duration = loaded_dur;
+        }
+    }
+
+    // 3. Open .raw audio stream handle if already in engine cache; otherwise queue silent background preparation
+    item->raw_file_handle = daw_fopen_LockFreeRead(item->raw_audio_path);
+    if (item->raw_file_handle && !item->peaks) {
+        int rb_cnt = 0;
+        double rb_dur = 0.0;
+        PeakBin *rb_pk = daw_rebuild_peaks_from_raw_file(item->raw_audio_path, pk_cache_path, &rb_cnt, &rb_dur, item->has_video);
+        if (rb_pk && rb_dur > 0.0) {
+            if (proj_pk_path[0]) daw_save_pk_file(proj_pk_path, rb_pk, rb_cnt, rb_dur, item->has_video);
+            item->peaks = rb_pk;
+            item->peak_count = rb_cnt;
+            item->file_total_duration = rb_dur;
+        }
+    } else if (!item->raw_file_handle || !item->peaks) {
+        daw_enqueue_bg_media_prep(filepath, item->raw_audio_path, proj_pk_path, pk_cache_path);
+    }
+    return 0;
+}
+
 // Stable, UI-responsive media importer with disk peak-cache reuse and live "Importing Media..." popup window
 static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
                                       const char *filepath, AudioItem *item,
                                       int item_num, int total_items) {
     if (!filepath || !filepath[0] || !item) return -1;
 
-#ifdef _WIN32
-    CreateDirectoryA(".cache", NULL);
-#else
-    mkdir(".cache", 0777);
-#endif
+    (void)daw_get_engine_cache_dir();
 
     Uint32 start_ticks = SDL_GetTicks();
     Uint32 last_ui_ticks = 0;
@@ -6982,18 +7472,18 @@ static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
     if (!name) name = strrchr(filepath, '/');
     const char *short_name = name ? name + 1 : filepath;
 
-    render_import_progress_popup(ren, win, short_name, item_num, total_items, 0, start_ticks);
-
     strncpy(item->file_path, filepath, sizeof(item->file_path) - 1);
     item->file_path[sizeof(item->file_path) - 1] = '\0';
     snprintf(item->label, sizeof(item->label), "%s", short_name);
 
     unsigned int h = hash_path(filepath);
-    snprintf(item->raw_audio_path, sizeof(item->raw_audio_path), ".cache/%u.raw", h);
-    char pk_cache_path[512];
-    snprintf(pk_cache_path, sizeof(pk_cache_path), ".cache/%u.pk", h);
+    daw_build_raw_cache_path(h, item->raw_audio_path, sizeof(item->raw_audio_path));
+    char pk_cache_path[512] = {0};
+    char proj_pk_path[512]  = {0};
+    daw_build_pk_cache_path(h, pk_cache_path, sizeof(pk_cache_path));
+    daw_build_project_pk_path(filepath, proj_pk_path, sizeof(proj_pk_path));
 
-    // Ultra-fast path 0: check in-RAM shared peak pool first (0 RAM allocation, 0 disk re-decode)
+    // Ultra-fast path 0: check in-RAM shared peak pool first (0 RAM allocation, 0 disk re-decode, 0 popup)
     {
         int pooled_cnt = 0;
         double pooled_dur = 0.0;
@@ -7010,7 +7500,11 @@ static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
                 item->is_selected = false;
                 item->has_video = pooled_vid;
                 item->raw_file_handle = f_existing;
-                render_import_progress_popup(ren, win, short_name, item_num, total_items, 100, start_ticks);
+                if (proj_pk_path[0] && pooled_cnt > 0) {
+                    FILE *chk_ppk = fopen(proj_pk_path, "rb");
+                    if (chk_ppk) fclose(chk_ppk);
+                    else daw_save_pk_file(proj_pk_path, pooled_pk, pooled_cnt, pooled_dur, pooled_vid);
+                }
                 return 0;
             }
         }
@@ -7018,37 +7512,31 @@ static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
 
     // Fast path 1: check if both .raw and .pk cache files already exist on disk from an earlier import
     FILE *chk_raw = daw_fopen_LockFreeRead(item->raw_audio_path);
-    FILE *chk_pk  = fopen(pk_cache_path, "rb");
-    if (chk_raw && chk_pk) {
-        uint32_t magic = 0;
-        double cached_dur = 0.0;
-        int has_vid_i = 0;
-        int pk_cnt = 0;
-        if (fread(&magic, sizeof(uint32_t), 1, chk_pk) == 1 && magic == DAW_PK_CACHE_MAGIC &&
-            fread(&cached_dur, sizeof(double), 1, chk_pk) == 1 &&
-            fread(&has_vid_i, sizeof(int), 1, chk_pk) == 1 &&
-            fread(&pk_cnt, sizeof(int), 1, chk_pk) == 1 &&
-            pk_cnt >= 0 && pk_cnt < 25000000 && cached_dur > 0.0) {
-            PeakBin *pk_buf = (pk_cnt > 0) ? (PeakBin *)calloc((size_t)pk_cnt, sizeof(PeakBin)) : NULL;
-            if (pk_cnt == 0 || (pk_buf && (int)fread(pk_buf, sizeof(PeakBin), (size_t)pk_cnt, chk_pk) == pk_cnt)) {
-                fclose(chk_pk);
-                item->has_video = (has_vid_i != 0);
-                item->peaks = daw_register_shared_peaks(item->raw_audio_path, pk_buf, pk_cnt, cached_dur, item->has_video);
-                item->peak_count = pk_cnt;
-                item->file_total_duration = cached_dur;
-                item->duration = cached_dur;
-                item->offset_in_file = 0.0;
-                item->is_selected = false;
-                item->raw_file_handle = chk_raw;
-                render_import_progress_popup(ren, win, short_name, item_num, total_items, 100, start_ticks);
-                return 0;
-            }
-            if (pk_buf) free(pk_buf);
-        }
-    }
-    if (chk_pk) fclose(chk_pk);
     if (chk_raw) {
-        // Existing .raw file is already on disk, but .pk uses an older bin resolution: rebuild 32-sample peaks directly!
+        PeakBin *pk_buf = NULL;
+        int pk_cnt = 0;
+        double cached_dur = 0.0;
+        bool cached_vid = false;
+        bool got_proj_pk = daw_load_pk_file(proj_pk_path, &pk_buf, &pk_cnt, &cached_dur, &cached_vid);
+        bool got_cache_pk = false;
+        if (!got_proj_pk) {
+            got_cache_pk = daw_load_pk_file(pk_cache_path, &pk_buf, &pk_cnt, &cached_dur, &cached_vid);
+        }
+        if ((got_proj_pk || got_cache_pk) && cached_dur > 0.0) {
+            if (!got_proj_pk && proj_pk_path[0] && pk_buf && pk_cnt > 0) {
+                daw_save_pk_file(proj_pk_path, pk_buf, pk_cnt, cached_dur, cached_vid);
+            }
+            item->has_video = cached_vid;
+            item->peaks = daw_register_shared_peaks(item->raw_audio_path, pk_buf, pk_cnt, cached_dur, item->has_video);
+            item->peak_count = pk_cnt;
+            item->file_total_duration = cached_dur;
+            item->duration = cached_dur;
+            item->offset_in_file = 0.0;
+            item->is_selected = false;
+            item->raw_file_handle = chk_raw;
+            return 0;
+        }
+        // Existing .raw file is already on disk, rebuild .pk directly
         fclose(chk_raw);
         bool has_vid_metadata_flag = false;
         const char *ext_chk = strrchr(filepath, '.');
@@ -7059,6 +7547,7 @@ static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
         double rb_dur = 0.0;
         PeakBin *rb_pk = daw_rebuild_peaks_from_raw_file(item->raw_audio_path, pk_cache_path, &rb_cnt, &rb_dur, has_vid_metadata_flag);
         if (rb_pk && rb_dur > 0.0) {
+            if (proj_pk_path[0]) daw_save_pk_file(proj_pk_path, rb_pk, rb_cnt, rb_dur, has_vid_metadata_flag);
             item->has_video = has_vid_metadata_flag;
             item->peaks = rb_pk;
             item->peak_count = rb_cnt;
@@ -7067,10 +7556,11 @@ static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
             item->offset_in_file = 0.0;
             item->is_selected = false;
             item->raw_file_handle = daw_fopen_LockFreeRead(item->raw_audio_path);
-            render_import_progress_popup(ren, win, short_name, item_num, total_items, 100, start_ticks);
             return 0;
         }
     }
+
+    render_import_progress_popup(ren, win, short_name, item_num, total_items, 0, start_ticks);
 
     AVFormatContext *fmt = NULL;
     if (avformat_open_input(&fmt, filepath, NULL, NULL) < 0) return -1;
@@ -7408,19 +7898,10 @@ static int import_media_with_progress(SDL_Renderer *ren, SDL_Window *win,
     item->offset_in_file = 0.0;
     item->is_selected = false;
 
-    // Save peak cache (.pk) to disk so future loads of this media file are instantaneous
-    FILE *f_pk = fopen(pk_cache_path, "wb");
-    if (f_pk) {
-        uint32_t magic = DAW_PK_CACHE_MAGIC;
-        int has_vid_i = item->has_video ? 1 : 0;
-        fwrite(&magic, sizeof(uint32_t), 1, f_pk);
-        fwrite(&actual_dur, sizeof(double), 1, f_pk);
-        fwrite(&has_vid_i, sizeof(int), 1, f_pk);
-        fwrite(&current_bin, sizeof(int), 1, f_pk);
-        if (current_bin > 0 && item->peaks) {
-            fwrite(item->peaks, sizeof(PeakBin), (size_t)current_bin, f_pk);
-        }
-        fclose(f_pk);
+    // Save peak cache (.pk) to both engine cache and <Project>/media/<clip>.pk (REAPER-style sidecar peaks)
+    daw_save_pk_file(pk_cache_path, item->peaks, current_bin, actual_dur, item->has_video);
+    if (proj_pk_path[0]) {
+        daw_save_pk_file(proj_pk_path, item->peaks, current_bin, actual_dur, item->has_video);
     }
 
     item->raw_file_handle = daw_fopen_LockFreeRead(item->raw_audio_path);
@@ -8162,26 +8643,10 @@ static void daw_garbage_collect_unused_cache_files(void) {
 #endif
 }
 
-// Completely purges all files in .cache/ and removes the .cache folder on App Startup and App Exit
-// so multi-GB decoded raw PCM caches never accumulate in the software folder!
+// Removes any legacy .cache or Temporary Media folders inside the software installation directory
+// while preserving the persistent engine cache in %TEMP%/AudioTrack_EngineCache for instant project opening!
 static void daw_purge_all_cache_folder(void) {
-    for (int t = 0; t < g_daw.num_tabs; t++) {
-        ProjectTab *tp = &g_daw.tabs[t];
-        for (int i = 0; i < tp->num_items; i++) {
-            if (tp->items[i].raw_file_handle) {
-                fclose(tp->items[i].raw_file_handle);
-                tp->items[i].raw_file_handle = NULL;
-            }
-        }
-    }
-    for (int sp = 0; sp < MAX_SHARED_PEAK_ENTRIES; sp++) {
-        if (g_shared_peak_pool[sp].in_use && g_shared_peak_pool[sp].peaks) {
-            free(g_shared_peak_pool[sp].peaks);
-            g_shared_peak_pool[sp].peaks = NULL;
-        }
-        g_shared_peak_pool[sp].in_use = false;
-        g_shared_peak_pool[sp].raw_audio_path[0] = '\0';
-    }
+    (void)daw_garbage_collect_unused_cache_files;
     delete_all_files_in_temp_dir(".cache");
     delete_all_files_in_temp_dir("Temporary Media");
 #ifdef _WIN32
@@ -8381,8 +8846,6 @@ void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
 
     if (delete_all_temp_files) {
         daw_purge_all_cache_folder();
-    } else {
-        daw_garbage_collect_unused_cache_files();
     }
 }
 
@@ -8390,7 +8853,11 @@ void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
 // Checks all open tabs for unsaved changes first; prompts Save / Don't Save / Cancel for each dirty tab.
 static void request_exit_application(bool *running) {
     for (int t = 0; t < g_daw.num_tabs; t++) {
+        if (g_daw.tabs[t].project_path[0] == '\0' && g_daw.tabs[t].num_items == 0) {
+            g_daw.tabs[t].is_dirty = false;
+        }
         if (g_daw.tabs[t].is_dirty) {
+            g_daw.active_tab = t;
             g_daw.save_prompt_open = true;
             g_daw.save_prompt_tab_idx = t;
             g_daw.save_prompt_quit_app = true;
@@ -8548,6 +9015,16 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
                 update_clip_filepath_references(old_p, new_p);
             }
         }
+        // Ensure REAPER-style sidecar .pk peak file exists in <Project>/media/<clip>.pk for instant project reload
+        if (it->file_path[0] != '\0' && it->peaks && it->peak_count > 0 && it->file_total_duration > 0.0) {
+            char proj_pk[512] = {0};
+            daw_build_project_pk_path(it->file_path, proj_pk, sizeof(proj_pk));
+            if (proj_pk[0]) {
+                FILE *chk_pk = fopen(proj_pk, "rb");
+                if (chk_pk) fclose(chk_pk);
+                else daw_save_pk_file(proj_pk, it->peaks, it->peak_count, it->file_total_duration, it->has_video);
+            }
+        }
     }
 
     FILE *f = fopen(final_ehs_path, "wb");
@@ -8679,9 +9156,9 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
         100
     );
     if (g_main_ren && g_main_win) {
-        SDL_Delay(140);
+        SDL_Delay(90);
     }
-    finish_processing_wait_modal(260);
+    finish_processing_wait_modal(0);
     record_project_change(g_autosave_in_progress ? "Project Auto Saved" : "Project Saved (Media Folder Synced)", false);
     return true;
 }
@@ -8733,8 +9210,9 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
     int tab_i = get_valid_tab_idx();
     p->is_playing = false;
 
-    // Free existing clip handles & peaks before loading project
+    // Free existing clip handles & peaks safely under audio lock before loading project
     close_video(&p->video);
+    if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
     for (int i = 0; i < p->num_items; i++) {
         if (p->items[i].raw_file_handle) {
             fclose(p->items[i].raw_file_handle);
@@ -8745,6 +9223,8 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
             p->items[i].peaks = NULL;
         }
     }
+    p->num_items = 0;
+    if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
 
     int loaded_tracks = 4;
     int loaded_items = 0;
@@ -9007,6 +9487,7 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
             }
         }
 
+        (void)win;
         if (shared_idx >= 0) {
             AudioItem *src = &p->items[shared_idx];
             strncpy(it->file_path, src->file_path, sizeof(it->file_path) - 1);
@@ -9018,7 +9499,12 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
             it->peaks = src->peaks;
             it->raw_file_handle = daw_fopen_LockFreeRead(it->raw_audio_path);
         } else {
-            import_media_with_progress(ren, win, saved_fpath[i], it, i + 1, loaded_items);
+            daw_load_clip_metadata_fast_reaper(
+                it, saved_fpath[i],
+                has_ext ? ext_file_tot_dur[i] : saved_dur[i],
+                saved_dur[i],
+                has_ext ? ext_has_video[i] : false
+            );
         }
 
         // Restore exact saved clip position, trim offset, split duration, and metadata
@@ -9123,11 +9609,8 @@ static void execute_join_glue_selected_items(ProjectTab *p, SDL_Renderer *ren, S
 
     char proj_media_dir[512] = {0};
     get_project_media_folder(p, proj_media_dir, sizeof(proj_media_dir));
-#ifdef _WIN32
-    CreateDirectoryA(".cache", NULL);
-#else
-    mkdir(".cache", 0777);
-#endif
+    (void)daw_get_engine_cache_dir();
+    daw_ensure_all_project_raw_audio_ready(p, ren, win);
 
     p->is_playing = false;
     g_engine_processing = true;
@@ -9162,7 +9645,7 @@ static void execute_join_glue_selected_items(ProjectTab *p, SDL_Renderer *ren, S
         unsigned int ticks = (unsigned int)SDL_GetTicks();
         char raw_path[512];
         char wav_path[512];
-        snprintf(raw_path, sizeof(raw_path), ".cache/glued_%u_t%d.raw", ticks, t + 1);
+        snprintf(raw_path, sizeof(raw_path), "%s/glued_%u_t%d.raw", daw_get_engine_cache_dir(), ticks, t + 1);
 #ifdef _WIN32
         snprintf(wav_path, sizeof(wav_path), "%s\\Glued_Track%d_%u.wav", proj_media_dir, t + 1, ticks);
 #else
@@ -9280,6 +9763,13 @@ static void execute_join_glue_selected_items(ProjectTab *p, SDL_Renderer *ren, S
             write_wav_pcm_header(f_wav, written, SAMPLE_RATE, 2, 24);
             fflush(f_wav);
             fclose(f_wav);
+        }
+        {
+            char glued_pk[512] = {0};
+            daw_build_project_pk_path(wav_path, glued_pk, sizeof(glued_pk));
+            if (glued_pk[0] && new_peaks && pk_cnt > 0) {
+                daw_save_pk_file(glued_pk, new_peaks, pk_cnt, total_dur, false);
+            }
         }
 
         int keep_color      = g_item_color_idx[tab][sel_indices[0]];
@@ -9456,6 +9946,9 @@ static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window
             }
             if (it->peaks && it->peak_count > 0) {
                 it->peaks = daw_register_shared_peaks(it->raw_audio_path, it->peaks, it->peak_count, it->file_total_duration, false);
+                char rec_pk[512] = {0};
+                daw_build_project_pk_path(it->file_path, rec_pk, sizeof(rec_pk));
+                if (rec_pk[0]) daw_save_pk_file(rec_pk, it->peaks, it->peak_count, it->file_total_duration, false);
             }
             it->raw_file_handle = daw_fopen_LockFreeRead(it->raw_audio_path);
         }
@@ -9481,11 +9974,7 @@ static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window
 
     char proj_media_dir[512] = {0};
     get_project_media_folder(p, proj_media_dir, sizeof(proj_media_dir));
-#ifdef _WIN32
-    CreateDirectoryA(".cache", NULL);
-#else
-    mkdir(".cache", 0777);
-#endif
+    (void)daw_get_engine_cache_dir();
 
     time_t now_t = time(NULL);
     struct tm *lt = localtime(&now_t);
@@ -9500,7 +9989,7 @@ static void start_or_stop_recording(ProjectTab *p, SDL_Renderer *ren, SDL_Window
              "%s/Rec_Track%d_%s.wav", proj_media_dir, target_trk + 1, ts);
 #endif
     snprintf(g_rec.current_raw_path, sizeof(g_rec.current_raw_path),
-             ".cache/rec_%u_%s.raw", (unsigned int)SDL_GetTicks(), ts);
+             "%s/rec_%u_%s.raw", daw_get_engine_cache_dir(), (unsigned int)SDL_GetTicks(), ts);
 
     g_rec.wav_file = fopen(g_rec.current_wav_path, "wb");
     if (g_rec.wav_file) {
@@ -10733,9 +11222,9 @@ int main(int argc, char *argv[]) {
     g_cursor_ibeam   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_IBEAM);
 
     for (int t_i = 0; t_i < MAX_TABS; t_i++) {
-        memset(&g_daw.tabs[t_i], 0, offsetof(ProjectTab, undo_mgr));
-        g_daw.tabs[t_i].undo_mgr.head = -1;
-        g_daw.tabs[t_i].undo_mgr.count = 0;
+        char def_title[32];
+        snprintf(def_title, sizeof(def_title), "Project %d", t_i + 1);
+        init_tab_defaults(t_i, def_title);
     }
     memset(g_marker_full_text, 0, sizeof(g_marker_full_text));
     memset(g_editing_marker_full_buf, 0, sizeof(g_editing_marker_full_buf));
@@ -10869,7 +11358,13 @@ int main(int argc, char *argv[]) {
             g_processing_close_at_ticks = 0;
         }
 
+        daw_poll_bg_prepared_media_on_main_thread();
+
         while (SDL_PollEvent(&e)) {
+            p = get_cur_tab();
+            if (!(p->pixels_per_second >= 0.002f && p->pixels_per_second <= 10000.0f) || !isfinite(p->pixels_per_second)) {
+                p->pixels_per_second = 80.0f;
+            }
             if (e.type == SDL_WINDOWEVENT && g_video_ext_win &&
                 e.window.windowID == SDL_GetWindowID(g_video_ext_win)) {
                 if (e.window.event == SDL_WINDOWEVENT_CLOSE) {
@@ -11509,7 +12004,7 @@ int main(int argc, char *argv[]) {
 
                 // Requirement 5: New Project Tab 2-Option Modal ("Open Project File" / "Create Project File")
                 if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') {
-                    // Allow clicking top tab bar to switch between open tabs, close a tab, or click top-right 'Exit' button
+                    // Allow clicking top tab bar to switch between open tabs, close a tab, add '+' tab, or click top-right 'Exit' button
                     if (my < TABBAR_HEIGHT) {
                         // Top-right 'Exit' button on tab row (directly above 'Save' button)
                         if (mx >= win_w - 60 && mx <= win_w - 8) {
@@ -11525,15 +12020,12 @@ int main(int argc, char *argv[]) {
                             if (cur_tab_w < 70) cur_tab_w = 70;
                         }
                         int cur_tab_x = 0;
+                        bool clicked_tab = false;
                         for (int t = 0; t < g_daw.num_tabs; t++) {
                             if (mx >= cur_tab_x && mx < cur_tab_x + cur_tab_w) {
+                                clicked_tab = true;
                                 if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4) {
-                                    if (g_daw.num_tabs > 1) {
-                                        g_tab_needs_project_setup[t] = false;
-                                        request_close_tab(t);
-                                    } else {
-                                        request_close_tab(0);
-                                    }
+                                    request_close_tab(t);
                                 } else {
                                     g_daw.active_tab = t;
                                     g_selected_marker_idx = -1;
@@ -11541,6 +12033,36 @@ int main(int argc, char *argv[]) {
                                 break;
                             }
                             cur_tab_x += cur_tab_w;
+                        }
+                        if (!clicked_tab && mx >= cur_tab_x && mx <= cur_tab_x + add_btn_w && g_daw.num_tabs < MAX_TABS) {
+                            int nt = g_daw.num_tabs;
+                            char name[64]; snprintf(name, sizeof(name), "Project %d", nt + 1);
+                            init_tab_defaults(nt, name);
+                            g_tab_crossfade[nt] = true;
+                            g_tab_range_active[nt] = false;
+                            g_tab_range_start[nt] = 0.0;
+                            g_tab_range_end[nt] = 0.0;
+                            memset(g_marker_full_text[nt], 0, sizeof(g_marker_full_text[0]));
+                            memset(g_item_fade_in[nt], 0, sizeof(g_item_fade_in[0]));
+                            memset(g_item_fade_out[nt], 0, sizeof(g_item_fade_out[0]));
+                            memset(g_track_hidden[nt], 0, sizeof(g_track_hidden[0]));
+                            memset(g_track_locked[nt], 0, sizeof(g_track_locked[0]));
+                            g_lock_opt_full[nt] = true;
+                            g_lock_opt_prevent_lr[nt] = false;
+                            g_lock_opt_prevent_ud[nt] = false;
+                            memset(g_track_color_idx[nt], 0, sizeof(g_track_color_idx[0]));
+                            memset(g_track_peak_color_idx[nt], 0, sizeof(g_track_peak_color_idx[0]));
+                            memset(g_item_peak_color_idx[nt], 0, sizeof(g_item_peak_color_idx[0]));
+                            g_tab_peak_color_idx[nt] = 0;
+                            reset_tab_undo_history(nt);
+                            memset(g_tab_history[nt], 0, sizeof(g_tab_history[0]));
+                            g_tab_history_count[nt] = 0;
+                            g_tab_notification[nt][0] = '\0';
+                            init_tab_app_volume_defaults(nt);
+                            g_tab_needs_project_setup[nt] = true;
+                            g_daw.active_tab = g_daw.num_tabs++;
+                            g_selected_marker_idx = -1;
+                            record_project_change("New Project Tab Opened", false);
                         }
                         continue;
                     }
@@ -14652,6 +15174,28 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        if (!running) break;
+
+        // Refresh active ProjectTab pointer and viewport metrics after event processing
+        // (prevents stale `p` pointer and division-by-zero when closing the 3rd/last tab!)
+        p = get_cur_tab();
+        if (!(p->pixels_per_second >= 0.002f && p->pixels_per_second <= 10000.0f) || !isfinite(p->pixels_per_second)) {
+            p->pixels_per_second = 80.0f;
+        }
+        if (p->num_tracks <= 0 || p->num_tracks > MAX_TRACKS) {
+            p->num_tracks = 4;
+        }
+        m_lane_h = get_marker_height(p);
+        view_w = win_w - g_daw.tcp_width - SCROLLBAR_SIZE;
+        if (view_w < 64) view_w = 64;
+        view_h = win_h - TABBAR_HEIGHT - TOPBAR_HEIGHT - RULER_HEIGHT - m_lane_h - SCROLLBAR_SIZE;
+        if (view_h < 64) view_h = 64;
+        max_h_tracks = get_total_tracks_height();
+        full_content_dur = get_complete_project_duration_sec(p);
+        p->project_duration_sec = fmax(300.0, full_content_dur * 1.02);
+        total_w_timeline_d = p->project_duration_sec * (double)p->pixels_per_second;
+        total_w_timeline = (total_w_timeline_d > 200000000.0) ? 200000000 : (int)total_w_timeline_d;
+
         // Process any drag-and-drop media files collected in this frame
         if (g_drop_batch_count > 0) {
             if (g_drop_batch_count == 1) {
@@ -15026,20 +15570,30 @@ int main(int argc, char *argv[]) {
         SDL_RenderFillRect(ren, &ruler);
         draw_brown_border_rect(ren, &ruler, false, true);
 
+        if (!(p->pixels_per_second >= 0.002f && p->pixels_per_second <= 10000.0f) || !isfinite(p->pixels_per_second)) {
+            p->pixels_per_second = 80.0f;
+        }
+        if (!isfinite(p->scroll_x_sec) || p->scroll_x_sec < 0.0) {
+            p->scroll_x_sec = 0.0;
+        }
         double min_px_gap = 90.0;
-        double sec_per_tick = min_px_gap / p->pixels_per_second;
+        double sec_per_tick = min_px_gap / (double)p->pixels_per_second;
         double nice_steps[] = { 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0 };
         int num_steps = sizeof(nice_steps) / sizeof(nice_steps[0]);
         double chosen_step = nice_steps[num_steps - 1];
         for (int s = 0; s < num_steps; s++) {
             if (nice_steps[s] >= sec_per_tick) { chosen_step = nice_steps[s]; break; }
         }
+        if (!(chosen_step > 0.01) || !isfinite(chosen_step)) chosen_step = 2.0;
 
         double start_tick = floor(p->scroll_x_sec / chosen_step) * chosen_step;
-        double end_tick = p->scroll_x_sec + (double)view_w / p->pixels_per_second + chosen_step;
+        double end_tick = p->scroll_x_sec + (double)view_w / (double)p->pixels_per_second + chosen_step;
+        if (!isfinite(start_tick) || start_tick < 0.0) start_tick = 0.0;
+        if (!isfinite(end_tick) || end_tick < start_tick) end_tick = start_tick + chosen_step * 20.0;
 
         SDL_RenderSetClipRect(ren, &ruler);
-        for (double t = start_tick; t <= end_tick; t += chosen_step) {
+        int ruler_tick_guard = 0;
+        for (double t = start_tick; t <= end_tick && ruler_tick_guard < 512; t += chosen_step, ruler_tick_guard++) {
             int rx = g_daw.tcp_width + (int)((t - p->scroll_x_sec) * p->pixels_per_second);
             if (rx < g_daw.tcp_width || rx > g_daw.tcp_width + view_w) continue;
 
@@ -15259,7 +15813,8 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
         uint8_t th_r, th_g, th_b;
         get_theme_effective_rgb(&th_r, &th_g, &th_b);
-        for (double t = start_tick; t <= end_tick; t += chosen_step) {
+        int grid_tick_guard = 0;
+        for (double t = start_tick; t <= end_tick && grid_tick_guard < 512; t += chosen_step, grid_tick_guard++) {
             int gx = g_daw.tcp_width + (int)((t - p->scroll_x_sec) * p->pixels_per_second);
             if (gx < g_daw.tcp_width || gx > g_daw.tcp_width + view_w) continue;
             SDL_SetRenderDrawColor(ren, (uint8_t)((th_r * 58) / 100), (uint8_t)((th_g * 57) / 100), (uint8_t)((th_b * 63) / 100), 65);
@@ -16679,6 +17234,14 @@ int main(int argc, char *argv[]) {
     }
 
     save_themes_settings_json();
+    if (g_bg_media_thread) {
+        SDL_WaitThread(g_bg_media_thread, NULL);
+        g_bg_media_thread = NULL;
+    }
+    if (g_bg_media_mutex) {
+        SDL_DestroyMutex(g_bg_media_mutex);
+        g_bg_media_mutex = NULL;
+    }
     if (g_daw.audio_device > 0) SDL_CloseAudioDevice(g_daw.audio_device);
     for (int t = 0; t < g_daw.num_tabs; t++) {
         close_video(&g_daw.tabs[t].video);
