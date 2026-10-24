@@ -3166,8 +3166,9 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
                     // Insert new track
                     if (p->num_tracks < MAX_TRACKS) {
                         if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
+                        int inherit_h = (p->num_tracks > 0 && p->track_heights[p->num_tracks - 1] >= 40) ? p->track_heights[p->num_tracks - 1] : 84;
                         int nt = p->num_tracks++;
-                        p->track_heights[nt] = 84;
+                        p->track_heights[nt] = inherit_h;
                         p->tracks[nt].id = nt + 1;
                         p->tracks[nt].volume = 1.0f;
                         snprintf(p->track_names[nt], 64, "Track %d", nt + 1);
@@ -3291,8 +3292,9 @@ static bool interpret_custom_script_file(ProjectTab *p, SDL_Renderer *ren, SDL_W
             str_contains_nocase(s, "add_track")) {
             if (p->num_tracks < MAX_TRACKS) {
                 if (!pushed_undo) { push_undo_state(); pushed_undo = true; }
+                int inherit_h = (p->num_tracks > 0 && p->track_heights[p->num_tracks - 1] >= 40) ? p->track_heights[p->num_tracks - 1] : 84;
                 int nt = p->num_tracks++;
-                p->track_heights[nt] = 84;
+                p->track_heights[nt] = inherit_h;
                 p->tracks[nt].id = nt + 1;
                 p->tracks[nt].volume = 1.0f;
                 snprintf(p->track_names[nt], 64, "Track %d", nt + 1);
@@ -3947,7 +3949,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         }
         case ACT_VIEW_TRACK_ZOOM_DEFAULT:
         case ACT_VIEW_TRACK_ZOOM_DEFAULT_NO_PIN: {
-            for (int t = 0; t < p->num_tracks; t++) p->track_heights[t] = 84;
+            for (int t = 0; t < MAX_TRACKS; t++) p->track_heights[t] = 84;
             break;
         }
         case ACT_VIEW_TRACK_ZOOM_MAX_OVER:
@@ -3955,7 +3957,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
             int max_h = (view_h > 120) ? view_h : 220;
             if (max_h > 260) max_h = 260;
             bool already_max = (p->num_tracks > 0 && p->track_heights[0] >= max_h - 4);
-            for (int t = 0; t < p->num_tracks; t++) {
+            for (int t = 0; t < MAX_TRACKS; t++) {
                 p->track_heights[t] = already_max ? 84 : max_h;
             }
             break;
@@ -3963,7 +3965,7 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_VIEW_TRACK_ZOOM_MIN:
         case ACT_VIEW_TRACK_ZOOM_MIN_NO_PIN: {
             bool already_min = (p->num_tracks > 0 && p->track_heights[0] <= 52);
-            for (int t = 0; t < p->num_tracks; t++) {
+            for (int t = 0; t < MAX_TRACKS; t++) {
                 p->track_heights[t] = already_min ? 84 : 50;
             }
             break;
@@ -4015,20 +4017,26 @@ static void execute_daw_action_by_index(ProjectTab *p, SDL_Renderer *ren, SDL_Wi
         case ACT_VIEW_ZOOM_IN_VERT:
         case ACT_VIEW_ZOOM_VERT_WHEEL:
         case ACT_VIEW_ZOOM_VERT_SNAP: {
-            for (int t = 0; t < p->num_tracks; t++) {
-                int nh = p->track_heights[t] + 14;
-                if (nh > 260) nh = 260;
-                p->track_heights[t] = nh;
+            int base_h = (p->num_tracks > 0 && p->track_heights[0] >= 40) ? p->track_heights[0] : 84;
+            int target_h = base_h + 14;
+            if (target_h > 260) target_h = 260;
+            for (int t = 0; t < MAX_TRACKS; t++) {
+                int cur_h = (t < p->num_tracks && p->track_heights[t] >= 40) ? (p->track_heights[t] + 14) : target_h;
+                if (cur_h > 260) cur_h = 260;
+                p->track_heights[t] = cur_h;
             }
             break;
         }
         case ACT_VIEW_ZOOM_OUT_VERT:
         case ACT_VIEW_ZOOM_VERT_REV_WHEEL:
         case ACT_VIEW_ZOOM_VERT_REV_SNAP: {
-            for (int t = 0; t < p->num_tracks; t++) {
-                int nh = p->track_heights[t] - 14;
-                if (nh < 50) nh = 50;
-                p->track_heights[t] = nh;
+            int base_h = (p->num_tracks > 0 && p->track_heights[0] >= 40) ? p->track_heights[0] : 84;
+            int target_h = base_h - 14;
+            if (target_h < 50) target_h = 50;
+            for (int t = 0; t < MAX_TRACKS; t++) {
+                int cur_h = (t < p->num_tracks && p->track_heights[t] >= 40) ? (p->track_heights[t] - 14) : target_h;
+                if (cur_h < 50) cur_h = 50;
+                p->track_heights[t] = cur_h;
             }
             break;
         }
