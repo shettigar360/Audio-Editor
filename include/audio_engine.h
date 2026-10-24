@@ -67,7 +67,7 @@ typedef struct {
     bool has_video;
 } SharedPeakPoolEntry;
 
-static SharedPeakPoolEntry g_shared_peak_pool[MAX_SHARED_PEAK_ENTRIES];
+extern SharedPeakPoolEntry g_shared_peak_pool[MAX_SHARED_PEAK_ENTRIES];
 
 // Cross-platform 64-bit file seek (fixes 32-bit long overflow past 2GB / ~44 mins of stereo float PCM on Windows)
 static inline int daw_fseek64(FILE *fp, int64_t offset, int origin) {
