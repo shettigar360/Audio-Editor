@@ -107,32 +107,30 @@ typedef struct {
     int save_prompt_tab_idx;
     bool save_prompt_quit_app;
 
-    DawScript scripts[MAX_SCRIPTS];
-    int num_scripts;
-    bool script_manager_open;
-    bool script_manager_is_python;
-    int script_selected_idx;
-    SDL_Rect script_win_rect;
-    bool script_win_dragging;
-    int script_drag_offset_x;
-    int script_drag_offset_y;
-
-    bool menu_file_open;
-    bool menu_action_open;
-    bool submenu_export_audio_open;
-    bool submenu_export_video_open;
-
     InputFocusType input_focus;
     int editing_track_name_idx;
     char editing_name_buf[64];
     int editing_marker_idx;
     char editing_marker_buf[64];
+
+    bool menu_file_open;
+    bool menu_action_open;
+
+    DawScript scripts[MAX_SCRIPTS];
+    int num_scripts;
+    bool script_manager_open;
+    SDL_Rect script_win_rect;
+    bool script_win_dragging;
+    int script_drag_offset_x;
+    int script_drag_offset_y;
+    int script_selected_idx;
 } DawEngine;
 
 extern DawEngine g_daw;
 
 static inline ProjectTab* get_cur_tab(void) {
-    if (g_daw.num_tabs <= 0) return NULL;
+    if (g_daw.num_tabs <= 0) g_daw.num_tabs = 1;
+    if (g_daw.num_tabs > MAX_TABS) g_daw.num_tabs = MAX_TABS;
     if (g_daw.active_tab < 0) g_daw.active_tab = 0;
     if (g_daw.active_tab >= g_daw.num_tabs) g_daw.active_tab = g_daw.num_tabs - 1;
     return &g_daw.tabs[g_daw.active_tab];
@@ -143,41 +141,54 @@ static inline float db_to_linear(float db) {
     return powf(10.0f, db / 20.0f);
 }
 
-static inline void format_timecode(double seconds, char *out, size_t max_len) {
-    if (seconds < 0.0) seconds = 0.0;
-    int h = (int)(seconds / 3600);
-    int m = (int)((seconds - h * 3600) / 60);
-    int s = (int)(seconds - h * 3600 - m * 60);
-    int ms = (int)((seconds - (int)seconds) * 1000);
-    snprintf(out, max_len, "%02d:%02d:%02d.%03d", h, m, s, ms);
+static inline int get_marker_height(ProjectTab *p) {
+    return (p && p->show_marker_lane) ? MARKER_BAR_HEIGHT : 0;
+}
+
+static inline int get_track_y_offset(int target_track_idx) {
+    ProjectTab *p = get_cur_tab();
+    int y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + get_marker_height(p) - p->scroll_y_px;
+    for (int i = 0; i < target_track_idx && i < p->num_tracks; i++) {
+        y += p->track_heights[i];
+    }
+    return y;
+}
+
+static inline int get_total_tracks_height(void) {
+    ProjectTab *p = get_cur_tab();
+    int total = 0;
+    for (int i = 0; i < p->num_tracks; i++) total += p->track_heights[i];
+    return total;
+}
+
+static inline int get_track_at_mouse_y(int my) {
+    ProjectTab *p = get_cur_tab();
+    int cur_y = TABBAR_HEIGHT + TOPBAR_HEIGHT + RULER_HEIGHT + get_marker_height(p) - p->scroll_y_px;
+    for (int i = 0; i < p->num_tracks; i++) {
+        if (my >= cur_y && my < cur_y + p->track_heights[i]) return i;
+        cur_y += p->track_heights[i];
+    }
+    return -1;
 }
 
 static inline void push_undo_state(void) {
     ProjectTab *p = get_cur_tab();
-    if (!p) return;
+    UndoRedoManager *um = &p->undo_mgr;
+    um->head = (um->head + 1) % MAX_UNDO_STACK;
+    if (um->count < MAX_UNDO_STACK) um->count++;
 
-    if (p->undo_mgr.head < MAX_UNDO_STACK - 1) {
-        p->undo_mgr.head++;
-    } else {
-        for (int i = 0; i < MAX_UNDO_STACK - 1; i++) {
-            p->undo_mgr.history[i] = p->undo_mgr.history[i + 1];
-        }
-    }
-    DawSnapshot *snap = &p->undo_mgr.history[p->undo_mgr.head];
+    DawSnapshot *snap = &um->history[um->head];
     snap->num_items = p->num_items;
     snap->num_tracks = p->num_tracks;
     memcpy(snap->items, p->items, sizeof(AudioItem) * p->num_items);
-    p->undo_mgr.count = p->undo_mgr.head + 1;
     p->is_dirty = true;
 }
 
 static inline void perform_undo(void) {
     ProjectTab *p = get_cur_tab();
-    if (!p) return;
-
-    if (p->undo_mgr.head > 0) {
-        p->undo_mgr.head--;
-        DawSnapshot *snap = &p->undo_mgr.history[p->undo_mgr.head];
+    UndoRedoManager *um = &p->undo_mgr;
+    if (um->count > 0 && um->head >= 0) {
+        DawSnapshot *snap = &um->history[um->head];
         p->num_items = snap->num_items;
         p->num_tracks = snap->num_tracks;
         memcpy(p->items, snap->items, sizeof(AudioItem) * snap->num_items);
@@ -186,17 +197,21 @@ static inline void perform_undo(void) {
                 p->items[i].raw_file_handle = fopen(p->items[i].raw_audio_path, "rb");
             }
         }
+        um->head--;
+        if (um->head < 0 && um->count == MAX_UNDO_STACK) um->head = MAX_UNDO_STACK - 1;
+        um->count--;
         p->is_dirty = true;
     }
 }
 
 static inline void perform_redo(void) {
     ProjectTab *p = get_cur_tab();
-    if (!p) return;
-
-    if (p->undo_mgr.head + 1 < p->undo_mgr.count) {
-        p->undo_mgr.head++;
-        DawSnapshot *snap = &p->undo_mgr.history[p->undo_mgr.head];
+    UndoRedoManager *um = &p->undo_mgr;
+    int next_head = (um->head + 1) % MAX_UNDO_STACK;
+    if (um->count < MAX_UNDO_STACK && um->history[next_head].num_tracks > 0) {
+        um->head = next_head;
+        um->count++;
+        DawSnapshot *snap = &um->history[um->head];
         p->num_items = snap->num_items;
         p->num_tracks = snap->num_tracks;
         memcpy(p->items, snap->items, sizeof(AudioItem) * snap->num_items);
@@ -226,7 +241,7 @@ void init_tab_defaults(int idx, const char *title) {
     memset(p, 0, offsetof(ProjectTab, undo_mgr));
     p->undo_mgr.head = -1;
     p->undo_mgr.count = 0;
-    snprintf(p->project_name, sizeof(p->project_name), "%s", title);
+    snprintf(p->project_name, sizeof(p->project_name), "%s", title ? title : "Project");
     p->num_tracks = 4;
     p->pixels_per_second = 80.0f;
     p->project_duration_sec = 300.0;
@@ -246,6 +261,9 @@ void init_tab_defaults(int idx, const char *title) {
 void force_close_tab(int idx) {
     if (idx < 0 || idx >= g_daw.num_tabs) return;
 
+    // Close video outside audio lock so FFmpeg cleanup never delays the real-time audio callback
+    close_video(&g_daw.tabs[idx].video);
+
     // Lock audio device before closing file handles or shifting tabs so the real-time
     // audio callback thread never reads a freed FILE* or mid-shift ProjectTab!
     if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
@@ -253,7 +271,6 @@ void force_close_tab(int idx) {
     if (g_daw.num_tabs <= 1) {
         ProjectTab *p = &g_daw.tabs[0];
         p->is_playing = false;
-        close_video(&p->video);
         for (int i = 0; i < p->num_items; i++) {
             if (p->items[i].raw_file_handle) {
                 fclose(p->items[i].raw_file_handle);
@@ -267,13 +284,11 @@ void force_close_tab(int idx) {
         if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
 
         daw_shift_per_tab_arrays_on_close(0, true);
-        daw_cleanup_temp_media_for_tab(0, false);
         return;
     }
 
     ProjectTab *target = &g_daw.tabs[idx];
     target->is_playing = false;
-    close_video(&target->video);
     for (int i = 0; i < target->num_items; i++) {
         if (target->items[i].raw_file_handle) {
             fclose(target->items[i].raw_file_handle);
@@ -287,9 +302,9 @@ void force_close_tab(int idx) {
         g_daw.tabs[t] = g_daw.tabs[t + 1];
     }
     int vacated_slot = g_daw.num_tabs - 1;
-    memset(&g_daw.tabs[vacated_slot], 0, offsetof(ProjectTab, undo_mgr));
-    g_daw.tabs[vacated_slot].undo_mgr.head = -1;
-    g_daw.tabs[vacated_slot].undo_mgr.count = 0;
+    // Initialize vacated_slot with safe defaults (pixels_per_second = 80.0f, num_tracks = 4)
+    // so no slot in g_daw.tabs[] ever has pixels_per_second == 0.0f!
+    init_tab_defaults(vacated_slot, "Project");
     g_daw.num_tabs--;
 
     if (g_daw.active_tab > idx) {
@@ -301,15 +316,20 @@ void force_close_tab(int idx) {
 
     if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
 
-    // Shift all per-tab arrays in main.c in lockstep with g_daw.tabs[] and garbage-collect unreferenced .cache files
+    // Shift all per-tab arrays in main.c in lockstep with g_daw.tabs[]
     daw_shift_per_tab_arrays_on_close(idx, false);
-    daw_cleanup_temp_media_for_tab(-1, false);
 }
 
 void request_close_tab(int idx) {
     if (idx < 0 || idx >= g_daw.num_tabs) return;
 
+    // An unconfigured tab with no project path and 0 items has no unsaved edits
+    if (g_daw.tabs[idx].project_path[0] == '\0' && g_daw.tabs[idx].num_items == 0) {
+        g_daw.tabs[idx].is_dirty = false;
+    }
+
     if (g_daw.tabs[idx].is_dirty) {
+        g_daw.active_tab = idx;
         g_daw.save_prompt_open = true;
         g_daw.save_prompt_tab_idx = idx;
         g_daw.save_prompt_quit_app = false;
@@ -341,7 +361,11 @@ void handle_save_modal_choice(int choice, bool *running) {
             }
             // Check if any other open tab still has unsaved changes before exiting the app
             for (int t = 0; t < g_daw.num_tabs; t++) {
+                if (g_daw.tabs[t].project_path[0] == '\0' && g_daw.tabs[t].num_items == 0) {
+                    g_daw.tabs[t].is_dirty = false;
+                }
                 if (g_daw.tabs[t].is_dirty) {
+                    g_daw.active_tab = t;
                     g_daw.save_prompt_open = true;
                     g_daw.save_prompt_tab_idx = t;
                     g_daw.save_prompt_quit_app = true;
