@@ -129,8 +129,17 @@ typedef struct {
 
 extern DawEngine g_daw;
 
+// Cross-module tab lifecycle & state synchronization hooks (shared between main.c and daw_tabs.c)
+void daw_shift_per_tab_arrays_on_close(int closed_idx, int old_num_tabs);
+void daw_evict_unused_shared_peaks_after_tab_close(void);
+void daw_prepare_tab_close_state(int idx);
+bool daw_is_tab_unmodified_setup(int idx);
+void daw_clear_open_project_after_save_flag(void);
+void daw_cleanup_temp_media_for_tab(int idx);
+
 static inline ProjectTab* get_cur_tab(void) {
-    if (g_daw.num_tabs <= 0) return NULL;
+    if (g_daw.num_tabs <= 0) g_daw.num_tabs = 1;
+    if (g_daw.num_tabs > MAX_TABS) g_daw.num_tabs = MAX_TABS;
     if (g_daw.active_tab < 0) g_daw.active_tab = 0;
     if (g_daw.active_tab >= g_daw.num_tabs) g_daw.active_tab = g_daw.num_tabs - 1;
     return &g_daw.tabs[g_daw.active_tab];
