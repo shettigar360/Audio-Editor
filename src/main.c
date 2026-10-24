@@ -327,6 +327,7 @@ static inline void daw_draw_text_edit_overlay(SDL_Renderer *ren, char *buf, int 
 #endif
 #else
 #include <dirent.h>
+#include <unistd.h>
 #endif
 
 #ifndef DAW_PEAK_POOL_DEFINED
@@ -8042,11 +8043,312 @@ static void delete_all_files_in_temp_dir(const char *dir_path) {
 #endif
 }
 
-// Requirement 4: When a project tab or the software exits without saving, auto-delete temporary recorded & glued files
-// inside 'Temporary Media' so the 'Temporary Media' folder becomes completely empty.
+// Checks whether a .cache/<hash>.raw file is still referenced by any open tab, undo snapshot, or clipboard
+static bool daw_is_raw_cache_referenced_anywhere(const char *raw_path) {
+    if (!raw_path || !raw_path[0]) return false;
+    for (int t = 0; t < g_daw.num_tabs; t++) {
+        ProjectTab *tp = &g_daw.tabs[t];
+        for (int i = 0; i < tp->num_items; i++) {
+            if (daw_paths_equal_norm(tp->items[i].raw_audio_path, raw_path)) return true;
+        }
+        for (int h = 0; h < tp->undo_mgr.count && h < MAX_UNDO_STACK; h++) {
+            DawSnapshot *snap = &tp->undo_mgr.history[h];
+            for (int i = 0; i < snap->num_items; i++) {
+                if (daw_paths_equal_norm(snap->items[i].raw_audio_path, raw_path)) return true;
+            }
+        }
+        if (g_deep_undo_stack[t]) {
+            for (int h = 0; h < MAX_DEEP_UNDO; h++) {
+                DeepUndoEntry *ent = &g_deep_undo_stack[t][h];
+                for (int i = 0; i < ent->num_items; i++) {
+                    if (ent->items && daw_paths_equal_norm(ent->items[i].raw_audio_path, raw_path)) return true;
+                }
+            }
+        }
+    }
+    for (int c = 0; c < g_clipboard_count; c++) {
+        if (daw_paths_equal_norm(g_clipboard[c].item.raw_audio_path, raw_path)) return true;
+    }
+    for (int tc = 0; tc < g_track_clipboard_count; tc++) {
+        for (int c = 0; c < g_track_clipboard[tc].num_clips; c++) {
+            if (daw_paths_equal_norm(g_track_clipboard[tc].clips[c].item.raw_audio_path, raw_path)) return true;
+        }
+    }
+    if (g_rec.is_recording && daw_paths_equal_norm(g_rec.current_raw_path, raw_path)) return true;
+    return false;
+}
+
+// Garbage-collects unreferenced .raw and .pk files inside .cache/ when a tab closes so .cache never bloats
+static void daw_garbage_collect_unused_cache_files(void) {
+    for (int sp = 0; sp < MAX_SHARED_PEAK_ENTRIES; sp++) {
+        if (g_shared_peak_pool[sp].in_use) {
+            if (!daw_is_raw_cache_referenced_anywhere(g_shared_peak_pool[sp].raw_audio_path)) {
+                if (g_shared_peak_pool[sp].peaks) {
+                    free(g_shared_peak_pool[sp].peaks);
+                    g_shared_peak_pool[sp].peaks = NULL;
+                }
+                g_shared_peak_pool[sp].in_use = false;
+                g_shared_peak_pool[sp].raw_audio_path[0] = '\0';
+            }
+        }
+    }
+
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(".cache\\*.*", &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            const char *fname = fd.cFileName;
+            if (fname[0] == '.') continue;
+            const char *ext = strrchr(fname, '.');
+            char rel_slash[512];
+            snprintf(rel_slash, sizeof(rel_slash), ".cache/%s", fname);
+            if (ext && daw_strcasecmp_custom(ext, ".raw") == 0) {
+                if (!daw_is_raw_cache_referenced_anywhere(rel_slash)) {
+                    remove(rel_slash);
+                    char pk_path[512];
+                    size_t base_len = (size_t)(ext - fname);
+                    if (base_len < 480) {
+                        snprintf(pk_path, sizeof(pk_path), ".cache/%.*s.pk", (int)base_len, fname);
+                        remove(pk_path);
+                    }
+                }
+            } else if (ext && daw_strcasecmp_custom(ext, ".pk") == 0) {
+                char raw_match[512];
+                size_t base_len = (size_t)(ext - fname);
+                if (base_len < 480) {
+                    snprintf(raw_match, sizeof(raw_match), ".cache/%.*s.raw", (int)base_len, fname);
+                    if (!daw_is_raw_cache_referenced_anywhere(raw_match)) {
+                        remove(rel_slash);
+                    }
+                }
+            }
+        }
+    } while (FindNextFileA(hFind, &fd) != 0);
+    FindClose(hFind);
+#else
+    DIR *d = opendir(".cache");
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *fname = ent->d_name;
+        if (fname[0] == '.') continue;
+        const char *ext = strrchr(fname, '.');
+        char rel_slash[512];
+        snprintf(rel_slash, sizeof(rel_slash), ".cache/%s", fname);
+        if (ext && daw_strcasecmp_custom(ext, ".raw") == 0) {
+            if (!daw_is_raw_cache_referenced_anywhere(rel_slash)) {
+                remove(rel_slash);
+                char pk_path[512];
+                size_t base_len = (size_t)(ext - fname);
+                if (base_len < 480) {
+                    snprintf(pk_path, sizeof(pk_path), ".cache/%.*s.pk", (int)base_len, fname);
+                    remove(pk_path);
+                }
+            }
+        } else if (ext && daw_strcasecmp_custom(ext, ".pk") == 0) {
+            char raw_match[512];
+            size_t base_len = (size_t)(ext - fname);
+            if (base_len < 480) {
+                snprintf(raw_match, sizeof(raw_match), ".cache/%.*s.raw", (int)base_len, fname);
+                if (!daw_is_raw_cache_referenced_anywhere(raw_match)) {
+                    remove(rel_slash);
+                }
+            }
+        }
+    }
+    closedir(d);
+#endif
+}
+
+// Completely purges all files in .cache/ and removes the .cache folder on App Startup and App Exit
+// so multi-GB decoded raw PCM caches never accumulate in the software folder!
+static void daw_purge_all_cache_folder(void) {
+    for (int t = 0; t < g_daw.num_tabs; t++) {
+        ProjectTab *tp = &g_daw.tabs[t];
+        for (int i = 0; i < tp->num_items; i++) {
+            if (tp->items[i].raw_file_handle) {
+                fclose(tp->items[i].raw_file_handle);
+                tp->items[i].raw_file_handle = NULL;
+            }
+        }
+    }
+    for (int sp = 0; sp < MAX_SHARED_PEAK_ENTRIES; sp++) {
+        if (g_shared_peak_pool[sp].in_use && g_shared_peak_pool[sp].peaks) {
+            free(g_shared_peak_pool[sp].peaks);
+            g_shared_peak_pool[sp].peaks = NULL;
+        }
+        g_shared_peak_pool[sp].in_use = false;
+        g_shared_peak_pool[sp].raw_audio_path[0] = '\0';
+    }
+    delete_all_files_in_temp_dir(".cache");
+    delete_all_files_in_temp_dir("Temporary Media");
+#ifdef _WIN32
+    RemoveDirectoryA(".cache");
+    RemoveDirectoryA("Temporary Media");
+#else
+    rmdir(".cache");
+    rmdir("Temporary Media");
+#endif
+}
+
+// Shifts all 25 per-tab arrays in main.c in lockstep when a tab is closed in daw_tabs.c
+void daw_shift_per_tab_arrays_on_close(int idx, bool was_last_single_tab) {
+    if (idx < 0 || idx >= MAX_TABS) return;
+
+    g_daw.input_focus = INPUT_FOCUS_NONE;
+    g_daw.editing_track_name_idx = -1;
+    g_daw.editing_marker_idx = -1;
+    g_selected_marker_idx = -1;
+    SDL_StopTextInput();
+
+    if (was_last_single_tab) {
+        reset_tab_undo_history(0);
+        g_tab_needs_project_setup[0] = true;
+        g_tab_crossfade[0] = true;
+        g_tab_range_active[0] = false;
+        g_tab_range_start[0] = 0.0;
+        g_tab_range_end[0] = 0.0;
+        memset(g_item_fade_in[0], 0, sizeof(g_item_fade_in[0]));
+        memset(g_item_fade_out[0], 0, sizeof(g_item_fade_out[0]));
+        memset(g_item_vol_db[0], 0, sizeof(g_item_vol_db[0]));
+        memset(g_item_muted[0], 0, sizeof(g_item_muted[0]));
+        memset(g_item_color_idx[0], 0, sizeof(g_item_color_idx[0]));
+        memset(g_item_peak_color_idx[0], 0, sizeof(g_item_peak_color_idx[0]));
+        memset(g_item_group_id[0], 0, sizeof(g_item_group_id[0]));
+        memset(g_track_color_idx[0], 0, sizeof(g_track_color_idx[0]));
+        memset(g_track_peak_color_idx[0], 0, sizeof(g_track_peak_color_idx[0]));
+        g_tab_peak_color_idx[0] = 0;
+        memset(g_track_hidden[0], 0, sizeof(g_track_hidden[0]));
+        memset(g_track_locked[0], 0, sizeof(g_track_locked[0]));
+        memset(g_track_lock_lr_only[0], 0, sizeof(g_track_lock_lr_only[0]));
+        memset(g_track_lock_ud_only[0], 0, sizeof(g_track_lock_ud_only[0]));
+        g_lock_opt_full[0] = false;
+        g_lock_opt_complete_unlock[0] = false;
+        g_lock_opt_prevent_lr[0] = false;
+        g_lock_opt_prevent_ud[0] = false;
+        memset(g_track_inf_db[0], 0, sizeof(g_track_inf_db[0]));
+        memset(g_track_pre_inf_db[0], 0, sizeof(g_track_pre_inf_db[0]));
+        init_tab_app_volume_defaults(0);
+        g_video_fullscreen[0] = false;
+        memset(&g_video_saved_rect[0], 0, sizeof(SDL_Rect));
+        g_playhead_seek_serial[0] = 0;
+        g_last_observed_playhead[0] = -1.0;
+        memset(g_marker_full_text[0], 0, sizeof(g_marker_full_text[0]));
+        memset(g_tab_history[0], 0, sizeof(g_tab_history[0]));
+        g_tab_history_count[0] = 0;
+        snprintf(g_tab_notification[0], sizeof(g_tab_notification[0]), "Select Open or Create Project");
+        return;
+    }
+
+    // Free the closed tab's deep undo stack before shifting pointers down
+    reset_tab_undo_history(idx);
+    if (g_deep_undo_stack[idx]) {
+        free(g_deep_undo_stack[idx]);
+        g_deep_undo_stack[idx] = NULL;
+    }
+
+    // Note: g_daw.num_tabs was already decremented in force_close_tab(idx),
+    // so tabs originally at (idx + 1 .. g_daw.num_tabs) shift into (idx .. g_daw.num_tabs - 1).
+    int new_count = g_daw.num_tabs;
+    if (new_count < 1) new_count = 1;
+    if (new_count >= MAX_TABS) new_count = MAX_TABS - 1;
+
+    for (int t = idx; t < new_count; t++) {
+        g_deep_undo_stack[t]        = g_deep_undo_stack[t + 1];
+        g_deep_undo_head[t]         = g_deep_undo_head[t + 1];
+        g_deep_undo_count[t]        = g_deep_undo_count[t + 1];
+        g_deep_undo_has_redo_tip[t] = g_deep_undo_has_redo_tip[t + 1];
+
+        g_tab_needs_project_setup[t] = g_tab_needs_project_setup[t + 1];
+        g_tab_crossfade[t]           = g_tab_crossfade[t + 1];
+        g_tab_range_active[t]        = g_tab_range_active[t + 1];
+        g_tab_range_start[t]         = g_tab_range_start[t + 1];
+        g_tab_range_end[t]           = g_tab_range_end[t + 1];
+
+        memcpy(g_item_fade_in[t],        g_item_fade_in[t + 1],        sizeof(g_item_fade_in[0]));
+        memcpy(g_item_fade_out[t],       g_item_fade_out[t + 1],       sizeof(g_item_fade_out[0]));
+        memcpy(g_item_vol_db[t],         g_item_vol_db[t + 1],         sizeof(g_item_vol_db[0]));
+        memcpy(g_item_muted[t],          g_item_muted[t + 1],          sizeof(g_item_muted[0]));
+        memcpy(g_item_color_idx[t],      g_item_color_idx[t + 1],      sizeof(g_item_color_idx[0]));
+        memcpy(g_item_peak_color_idx[t], g_item_peak_color_idx[t + 1], sizeof(g_item_peak_color_idx[0]));
+        memcpy(g_item_group_id[t],       g_item_group_id[t + 1],       sizeof(g_item_group_id[0]));
+
+        memcpy(g_track_color_idx[t],      g_track_color_idx[t + 1],      sizeof(g_track_color_idx[0]));
+        memcpy(g_track_peak_color_idx[t], g_track_peak_color_idx[t + 1], sizeof(g_track_peak_color_idx[0]));
+        g_tab_peak_color_idx[t] = g_tab_peak_color_idx[t + 1];
+
+        memcpy(g_track_hidden[t],       g_track_hidden[t + 1],       sizeof(g_track_hidden[0]));
+        memcpy(g_track_locked[t],       g_track_locked[t + 1],       sizeof(g_track_locked[0]));
+        memcpy(g_track_lock_lr_only[t], g_track_lock_lr_only[t + 1], sizeof(g_track_lock_lr_only[0]));
+        memcpy(g_track_lock_ud_only[t], g_track_lock_ud_only[t + 1], sizeof(g_track_lock_ud_only[0]));
+        g_lock_opt_full[t]            = g_lock_opt_full[t + 1];
+        g_lock_opt_complete_unlock[t] = g_lock_opt_complete_unlock[t + 1];
+        g_lock_opt_prevent_lr[t]      = g_lock_opt_prevent_lr[t + 1];
+        g_lock_opt_prevent_ud[t]      = g_lock_opt_prevent_ud[t + 1];
+
+        memcpy(g_track_inf_db[t],     g_track_inf_db[t + 1],     sizeof(g_track_inf_db[0]));
+        memcpy(g_track_pre_inf_db[t], g_track_pre_inf_db[t + 1], sizeof(g_track_pre_inf_db[0]));
+
+        g_app_master_vol[t] = g_app_master_vol[t + 1];
+        memcpy(g_app_track_vol[t], g_app_track_vol[t + 1], sizeof(g_app_track_vol[0]));
+
+        g_video_fullscreen[t]  = g_video_fullscreen[t + 1];
+        g_video_saved_rect[t]  = g_video_saved_rect[t + 1];
+        g_playhead_seek_serial[t]   = g_playhead_seek_serial[t + 1];
+        g_last_observed_playhead[t] = g_last_observed_playhead[t + 1];
+
+        memcpy(g_marker_full_text[t], g_marker_full_text[t + 1], sizeof(g_marker_full_text[0]));
+        memcpy(g_tab_history[t],      g_tab_history[t + 1],      sizeof(g_tab_history[0]));
+        g_tab_history_count[t] = g_tab_history_count[t + 1];
+        memcpy(g_tab_notification[t], g_tab_notification[t + 1], sizeof(g_tab_notification[0]));
+    }
+
+    // Reset the vacated slot at new_count
+    g_deep_undo_stack[new_count]        = NULL;
+    g_deep_undo_head[new_count]         = -1;
+    g_deep_undo_count[new_count]        = 0;
+    g_deep_undo_has_redo_tip[new_count] = false;
+    g_tab_needs_project_setup[new_count] = true;
+    g_tab_crossfade[new_count]          = true;
+    g_tab_range_active[new_count]       = false;
+    g_tab_range_start[new_count]        = 0.0;
+    g_tab_range_end[new_count]          = 0.0;
+    memset(g_item_fade_in[new_count], 0, sizeof(g_item_fade_in[0]));
+    memset(g_item_fade_out[new_count], 0, sizeof(g_item_fade_out[0]));
+    memset(g_item_vol_db[new_count], 0, sizeof(g_item_vol_db[0]));
+    memset(g_item_muted[new_count], 0, sizeof(g_item_muted[0]));
+    memset(g_item_color_idx[new_count], 0, sizeof(g_item_color_idx[0]));
+    memset(g_item_peak_color_idx[new_count], 0, sizeof(g_item_peak_color_idx[0]));
+    memset(g_item_group_id[new_count], 0, sizeof(g_item_group_id[0]));
+    memset(g_track_color_idx[new_count], 0, sizeof(g_track_color_idx[0]));
+    memset(g_track_peak_color_idx[new_count], 0, sizeof(g_track_peak_color_idx[0]));
+    g_tab_peak_color_idx[new_count] = 0;
+    memset(g_track_hidden[new_count], 0, sizeof(g_track_hidden[0]));
+    memset(g_track_locked[new_count], 0, sizeof(g_track_locked[0]));
+    memset(g_track_lock_lr_only[new_count], 0, sizeof(g_track_lock_lr_only[0]));
+    memset(g_track_lock_ud_only[new_count], 0, sizeof(g_track_lock_ud_only[0]));
+    g_lock_opt_full[new_count] = false;
+    g_lock_opt_complete_unlock[new_count] = false;
+    g_lock_opt_prevent_lr[new_count] = false;
+    g_lock_opt_prevent_ud[new_count] = false;
+    memset(g_track_inf_db[new_count], 0, sizeof(g_track_inf_db[0]));
+    memset(g_track_pre_inf_db[new_count], 0, sizeof(g_track_pre_inf_db[0]));
+    init_tab_app_volume_defaults(new_count);
+    g_video_fullscreen[new_count] = false;
+    memset(&g_video_saved_rect[new_count], 0, sizeof(SDL_Rect));
+    g_playhead_seek_serial[new_count] = 0;
+    g_last_observed_playhead[new_count] = -1.0;
+    memset(g_marker_full_text[new_count], 0, sizeof(g_marker_full_text[0]));
+    memset(g_tab_history[new_count], 0, sizeof(g_tab_history[0]));
+    g_tab_history_count[new_count] = 0;
+    g_tab_notification[new_count][0] = '\0';
+}
+
+// Requirement 1 & 2: Cleans up temporary and .cache files when a tab or the complete application closes
 void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
     (void)is_temp_recordings_clip_path;
-    (void)delete_all_files_in_temp_dir;
     (void)sweep_and_empty_temp_recordings_dir;
     if (g_rec.is_recording && (delete_all_temp_files || tab_idx < 0 || tab_idx == g_daw.active_tab)) {
         g_rec.is_recording = false;
@@ -8076,6 +8378,28 @@ void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
         }
         reset_tab_undo_history(tab_idx);
     }
+
+    if (delete_all_temp_files) {
+        daw_purge_all_cache_folder();
+    } else {
+        daw_garbage_collect_unused_cache_files();
+    }
+}
+
+// Requests complete application exit (triggered by top-right 'Exit' button above 'Save'):
+// Checks all open tabs for unsaved changes first; prompts Save / Don't Save / Cancel for each dirty tab.
+static void request_exit_application(bool *running) {
+    for (int t = 0; t < g_daw.num_tabs; t++) {
+        if (g_daw.tabs[t].is_dirty) {
+            g_daw.save_prompt_open = true;
+            g_daw.save_prompt_tab_idx = t;
+            g_daw.save_prompt_quit_app = true;
+            g_save_prompt_open_project_after = false;
+            return;
+        }
+    }
+    daw_cleanup_temp_media_for_tab(-1, true);
+    if (running) *running = false;
 }
 
 // Moves all temporary Recorded and Glued clips from software Temporary Media folder into proj_folder permanently
@@ -8237,6 +8561,12 @@ static bool daw_save_project_to_path(ProjectTab *p, const char *path) {
     }
 
     int tab_i = get_valid_tab_idx();
+    for (int ti = 0; ti < g_daw.num_tabs; ti++) {
+        if (&g_daw.tabs[ti] == p) {
+            tab_i = ti;
+            break;
+        }
+    }
 
     // 1. Write standard base .ehs fields
     fwrite(&p->num_tracks, sizeof(int), 1, f);
@@ -10445,6 +10775,9 @@ int main(int argc, char *argv[]) {
     g_daw.script_selected_idx = -1;
     g_daw.script_win_rect = (SDL_Rect){ 360, 120, 560, 380 };
 
+    // Clean up any leftover .cache or Temporary Media files from previous sessions on startup
+    daw_purge_all_cache_folder();
+
     set_daw_window_thumbnail_icon(win);
     init_default_recording_folder();
     ensure_app_vol_defaults_initialized();
@@ -10547,20 +10880,18 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             if (e.type == SDL_QUIT) {
-                bool has_any_dirty = false;
-                for (int t = 0; t < g_daw.num_tabs; t++) {
-                    if (g_daw.tabs[t].is_dirty) {
-                        has_any_dirty = true;
-                        g_daw.save_prompt_tab_idx = t;
-                        break;
-                    }
-                }
-                if (has_any_dirty) {
-                    g_daw.save_prompt_open = true;
-                    g_daw.save_prompt_quit_app = true;
+                // Requirement 1: If there are 2 or more tabs open, clicking the top-right 'Exit' button is compulsory to close the app
+                if (g_daw.num_tabs >= 2) {
+                    record_project_change("2+ tabs open: Click top-right 'Exit' button to close app, or 'x' to close tab", false);
+                    show_processing_wait_modal(
+                        ren, win,
+                        "Multiple Project Tabs Open",
+                        "Click the top-right 'Exit' button (above 'Save') to close the application, or 'x' on a tab to close that tab.",
+                        100
+                    );
+                    g_processing_close_at_ticks = SDL_GetTicks() + 1400;
                 } else {
-                    daw_cleanup_temp_media_for_tab(-1, true);
-                    running = false;
+                    request_exit_application(&running);
                 }
             } else if (e.type == SDL_MOUSEWHEEL) {
                 int mx, my; SDL_GetMouseState(&mx, &my);
@@ -10796,6 +11127,13 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 SDL_Keymod mod = SDL_GetModState();
+                if (g_daw.save_prompt_open) {
+                    if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        g_save_prompt_open_project_after = false;
+                        handle_save_modal_choice(3, &running);
+                    }
+                    continue;
+                }
                 if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') {
                     if (e.key.keysym.sym == SDLK_ESCAPE && g_daw.num_tabs > 1) {
                         g_tab_needs_project_setup[g_daw.active_tab] = false;
@@ -11114,24 +11452,88 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                // Handle Save Confirmation Dialog Modal first (highest modal priority for tab close / app Exit)
+                if (g_daw.save_prompt_open) {
+                    int dia_w = 380, dia_h = 140;
+                    int dia_x = (win_w - dia_w) / 2;
+                    int dia_y = (win_h - dia_h) / 2;
+                    int btn_y = dia_y + dia_h - 44;
+                    bool open_proj_after = g_save_prompt_open_project_after;
+                    bool quit_after = g_daw.save_prompt_quit_app;
+
+                    // [Save]
+                    if (mx >= dia_x + 18 && mx <= dia_x + 118 && my >= btn_y && my <= btn_y + 30) {
+                        int t_idx = g_daw.save_prompt_tab_idx;
+                        g_daw.save_prompt_open = false;
+                        g_daw.save_prompt_tab_idx = -1;
+                        g_daw.save_prompt_quit_app = false;
+                        g_save_prompt_open_project_after = false;
+                        if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
+                            daw_save_project_dialog(&g_daw.tabs[t_idx], false);
+                            // Proceed with closing tab, exiting app, or opening project only if user completed the save
+                            if (!g_daw.tabs[t_idx].is_dirty) {
+                                if (open_proj_after) {
+                                    daw_load_project_dialog(p, ren, win);
+                                } else if (quit_after) {
+                                    request_exit_application(&running);
+                                } else {
+                                    force_close_tab(t_idx);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // [Don't Save]
+                    if (mx >= dia_x + 130 && mx <= dia_x + 250 && my >= btn_y && my <= btn_y + 30) {
+                        g_save_prompt_open_project_after = false;
+                        if (open_proj_after) {
+                            daw_cleanup_temp_media_for_tab(g_daw.active_tab, false);
+                            g_daw.save_prompt_open = false;
+                            g_daw.save_prompt_tab_idx = -1;
+                            g_daw.save_prompt_quit_app = false;
+                            p->is_dirty = false;
+                            daw_load_project_dialog(p, ren, win);
+                        } else {
+                            handle_save_modal_choice(2, &running);
+                        }
+                        continue;
+                    }
+                    // [Cancel]
+                    if (mx >= dia_x + 262 && mx <= dia_x + 362 && my >= btn_y && my <= btn_y + 30) {
+                        g_save_prompt_open_project_after = false;
+                        handle_save_modal_choice(3, &running);
+                        continue;
+                    }
+                    continue;
+                }
+
                 // Requirement 5: New Project Tab 2-Option Modal ("Open Project File" / "Create Project File")
                 if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') {
-                    // Allow clicking top tab bar to switch between open tabs or close extra tab
+                    // Allow clicking top tab bar to switch between open tabs, close a tab, or click top-right 'Exit' button
                     if (my < TABBAR_HEIGHT) {
+                        // Top-right 'Exit' button on tab row (directly above 'Save' button)
+                        if (mx >= win_w - 60 && mx <= win_w - 8) {
+                            request_exit_application(&running);
+                            continue;
+                        }
                         int max_tab_w = 160;
                         int add_btn_w = 34;
                         int cur_tab_w = max_tab_w;
                         if (g_daw.num_tabs > 0) {
-                            int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
+                            int calc_w = (win_w - add_btn_w - 76) / g_daw.num_tabs;
                             if (calc_w < cur_tab_w) cur_tab_w = calc_w;
                             if (cur_tab_w < 70) cur_tab_w = 70;
                         }
                         int cur_tab_x = 0;
                         for (int t = 0; t < g_daw.num_tabs; t++) {
                             if (mx >= cur_tab_x && mx < cur_tab_x + cur_tab_w) {
-                                if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4 && g_daw.num_tabs > 1) {
-                                    g_tab_needs_project_setup[t] = false;
-                                    request_close_tab(t);
+                                if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4) {
+                                    if (g_daw.num_tabs > 1) {
+                                        g_tab_needs_project_setup[t] = false;
+                                        request_close_tab(t);
+                                    } else {
+                                        request_close_tab(0);
+                                    }
                                 } else {
                                     g_daw.active_tab = t;
                                     g_selected_marker_idx = -1;
@@ -11579,51 +11981,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                if (g_daw.save_prompt_open) {
-                    int dia_w = 380, dia_h = 140;
-                    int dia_x = (win_w - dia_w) / 2;
-                    int dia_y = (win_h - dia_h) / 2;
-                    int btn_y = dia_y + dia_h - 44;
-                    bool open_proj_after = g_save_prompt_open_project_after;
 
-                    // [Save]
-                    if (mx >= dia_x + 18 && mx <= dia_x + 118 && my >= btn_y && my <= btn_y + 30) {
-                        int t_idx = g_daw.save_prompt_tab_idx;
-                        g_daw.save_prompt_open = false;
-                        g_daw.save_prompt_tab_idx = -1;
-                        g_daw.save_prompt_quit_app = false;
-                        g_save_prompt_open_project_after = false;
-                        if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
-                            daw_save_project_dialog(&g_daw.tabs[t_idx], false);
-                        }
-                        if (open_proj_after) {
-                            daw_load_project_dialog(p, ren, win);
-                        }
-                        continue;
-                    }
-                    // [Don't Save]
-                    if (mx >= dia_x + 130 && mx <= dia_x + 250 && my >= btn_y && my <= btn_y + 30) {
-                        g_save_prompt_open_project_after = false;
-                        if (open_proj_after) {
-                            daw_cleanup_temp_media_for_tab(g_daw.active_tab, false);
-                            g_daw.save_prompt_open = false;
-                            g_daw.save_prompt_tab_idx = -1;
-                            g_daw.save_prompt_quit_app = false;
-                            p->is_dirty = false;
-                            daw_load_project_dialog(p, ren, win);
-                        } else {
-                            handle_save_modal_choice(2, &running);
-                        }
-                        continue;
-                    }
-                    // [Cancel]
-                    if (mx >= dia_x + 262 && mx <= dia_x + 362 && my >= btn_y && my <= btn_y + 30) {
-                        g_save_prompt_open_project_after = false;
-                        handle_save_modal_choice(3, &running);
-                        continue;
-                    }
-                    continue;
-                }
 
                 // ================= LUA & PYTHON SCRIPT POPUP WINDOW INTERACTIONS =================
                 if (g_script_popup.is_open && point_in_rect(mx, my, &g_script_popup.win_rect)) {
@@ -12650,13 +13008,19 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Chrome-Style Tab Interactions
+                // Chrome-Style Tab Interactions + Top-Right 'Exit' Button (above 'Save')
                 if (my < TABBAR_HEIGHT) {
+                    // Requirement 1: Top-right 'Exit' button on tab row directly above 'Save' button
+                    if (mx >= win_w - 60 && mx <= win_w - 8) {
+                        request_exit_application(&running);
+                        continue;
+                    }
+
                     int max_tab_w = 160;
                     int add_btn_w = 34;
                     int cur_tab_w = max_tab_w;
                     if (g_daw.num_tabs > 0) {
-                        int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
+                        int calc_w = (win_w - add_btn_w - 76) / g_daw.num_tabs;
                         if (calc_w < cur_tab_w) cur_tab_w = calc_w;
                         if (cur_tab_w < 70) cur_tab_w = 70;
                     }
@@ -14387,7 +14751,7 @@ int main(int argc, char *argv[]) {
         int add_btn_w = 34;
         int cur_tab_w = max_tab_w;
         if (g_daw.num_tabs > 0) {
-            int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
+            int calc_w = (win_w - add_btn_w - 76) / g_daw.num_tabs;
             if (calc_w < cur_tab_w) cur_tab_w = calc_w;
             if (cur_tab_w < 70) cur_tab_w = 70;
         }
@@ -14420,10 +14784,10 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &btn_add_tab, false, false);
         draw_text(ren, "+", cur_tab_x + 12, 9, c_white);
 
-        // Request #6: Project Change Notification Badge in the Top Tab Bar Section
+        // Request #6: Project Change Notification Badge in the Top Tab Bar Section (leaves room for top-right 'Exit' button)
         int notif_x = cur_tab_x + add_btn_w + 10;
-        int notif_w = win_w - notif_x - 8;
-        if (notif_w > 120) {
+        int notif_w = (win_w - 68) - notif_x;
+        if (notif_w > 100) {
             int cur_t_idx = get_valid_tab_idx();
             SDL_Rect notif_box = { notif_x, 3, notif_w, TABBAR_HEIGHT - 6 };
             SDL_SetRenderDrawColor(ren, p->is_dirty ? 36 : 24, p->is_dirty ? 28 : 24, p->is_dirty ? 22 : 24, 255);
@@ -14448,6 +14812,13 @@ int main(int argc, char *argv[]) {
             SDL_Rect notif_clip = { notif_x + 22, 4, notif_w - 28, TABBAR_HEIGHT - 8 };
             draw_text_clipped(ren, notif_disp, notif_x + 22, 9, c_white, &notif_clip, NULL);
         }
+
+        // Requirement 1: Top-right 'Exit' button on the Tab Row, directly above the 'Save' button (win_w - 60, w = 52)
+        SDL_Rect exit_btn = { win_w - 60, 2, 52, TABBAR_HEIGHT - 4 };
+        SDL_SetRenderDrawColor(ren, 118, 34, 30, 255);
+        SDL_RenderFillRect(ren, &exit_btn);
+        draw_brown_border_rect(ren, &exit_btn, true, false);
+        draw_text(ren, "Exit", win_w - 50, 9, c_white);
 
         // 2. Top Bar (Left: File Action Tools Video | Right: Undo Redo Zoom- Zoom+ Range Crossfade Hide Save)
         SDL_Rect topbar = { 0, TABBAR_HEIGHT, win_w, TOPBAR_HEIGHT };
