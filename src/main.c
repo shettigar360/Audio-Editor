@@ -281,6 +281,15 @@ static inline void daw_draw_text_edit_overlay(SDL_Renderer *ren, char *buf, int 
 #include "daw_types.h"
 #include "daw_tabs.h"
 #include "project_io.h"
+
+void daw_init_tab_defaults_main(int idx, const char *title);
+void daw_force_close_tab_main(int idx);
+void daw_request_close_tab_main(int idx);
+void daw_handle_save_modal_choice_main(int choice, bool *running);
+#define init_tab_defaults        daw_init_tab_defaults_main
+#define force_close_tab          daw_force_close_tab_main
+#define request_close_tab        daw_request_close_tab_main
+#define handle_save_modal_choice daw_handle_save_modal_choice_main
 #ifndef SDL_TEXTUREACCESS_TARGET
 #define SDL_TEXTUREACCESS_TARGET 2
 #endif
@@ -487,7 +496,8 @@ typedef struct {
 } DawEngine;
 extern DawEngine g_daw;
 static inline ProjectTab* get_cur_tab(void) {
-    if (g_daw.num_tabs <= 0) return NULL;
+    if (g_daw.num_tabs <= 0) g_daw.num_tabs = 1;
+    if (g_daw.num_tabs > MAX_TABS) g_daw.num_tabs = MAX_TABS;
     if (g_daw.active_tab < 0) g_daw.active_tab = 0;
     if (g_daw.active_tab >= g_daw.num_tabs) g_daw.active_tab = g_daw.num_tabs - 1;
     return &g_daw.tabs[g_daw.active_tab];
@@ -2057,6 +2067,92 @@ static void paste_tracks_at_bottom_of_selected(ProjectTab *p) {
     }
 
     record_project_change("Pasted Track(s) Below Selected Track", true);
+}
+
+// Requirement 2: "+ Track" inserts the new track immediately below the selected track
+// (or at the bottom of all tracks if no track is selected).
+static void insert_new_track_below_selected(ProjectTab *p) {
+    if (!p || p->num_tracks >= MAX_TRACKS) return;
+    int tab = get_valid_tab_idx();
+    ensure_app_vol_defaults_initialized();
+
+    bool any_selected = false;
+    int insert_after = p->num_tracks - 1;
+    for (int t = 0; t < p->num_tracks; t++) {
+        if (p->track_selected[t]) {
+            insert_after = t;
+            any_selected = true;
+        }
+    }
+    int ins_idx = insert_after + 1;
+    if (ins_idx < 0) ins_idx = 0;
+    if (ins_idx > p->num_tracks) ins_idx = p->num_tracks;
+
+    push_undo_state();
+
+    // Shift tracks at >= ins_idx down by 1
+    for (int t = p->num_tracks; t > ins_idx; t--) {
+        p->tracks[t] = p->tracks[t - 1];
+        p->tracks[t].id = t + 1;
+
+        char old_auto_name[64];
+        snprintf(old_auto_name, sizeof(old_auto_name), "Track %d", t);
+        if (strcmp(p->track_names[t - 1], old_auto_name) == 0) {
+            snprintf(p->track_names[t], 64, "Track %d", t + 1);
+        } else {
+            memcpy(p->track_names[t], p->track_names[t - 1], 64);
+        }
+
+        p->track_db[t]                  = p->track_db[t - 1];
+        p->track_heights[t]             = p->track_heights[t - 1];
+        p->track_selected[t]            = false;
+        g_track_hidden[tab][t]          = g_track_hidden[tab][t - 1];
+        g_track_color_idx[tab][t]       = g_track_color_idx[tab][t - 1];
+        g_track_peak_color_idx[tab][t]  = g_track_peak_color_idx[tab][t - 1];
+        g_track_locked[tab][t]          = g_track_locked[tab][t - 1];
+        g_track_lock_lr_only[tab][t]    = g_track_lock_lr_only[tab][t - 1];
+        g_track_lock_ud_only[tab][t]    = g_track_lock_ud_only[tab][t - 1];
+        g_track_inf_db[tab][t]          = g_track_inf_db[tab][t - 1];
+        g_track_pre_inf_db[tab][t]      = g_track_pre_inf_db[tab][t - 1];
+        g_app_track_vol[tab][t]         = g_app_track_vol[tab][t - 1];
+    }
+
+    // Shift track_idx for all clips on tracks >= ins_idx
+    for (int i = 0; i < p->num_items; i++) {
+        if (p->items[i].track_idx >= ins_idx) {
+            p->items[i].track_idx++;
+        }
+    }
+
+    p->num_tracks++;
+
+    memset(&p->tracks[ins_idx], 0, sizeof(Track));
+    p->tracks[ins_idx].id     = ins_idx + 1;
+    p->tracks[ins_idx].volume = 1.0f;
+    p->track_db[ins_idx]      = 0.0f;
+    p->track_heights[ins_idx] = 84;
+    snprintf(p->track_names[ins_idx], 64, "Track %d", ins_idx + 1);
+
+    if (any_selected) {
+        for (int t = 0; t < p->num_tracks; t++) {
+            p->track_selected[t] = (t == ins_idx);
+        }
+        g_last_clicked_track_idx = ins_idx;
+    } else {
+        p->track_selected[ins_idx] = false;
+    }
+
+    g_track_hidden[tab][ins_idx]         = false;
+    g_track_color_idx[tab][ins_idx]      = 0;
+    g_track_peak_color_idx[tab][ins_idx] = 0;
+    g_track_locked[tab][ins_idx]         = false;
+    g_track_lock_lr_only[tab][ins_idx]   = false;
+    g_track_lock_ud_only[tab][ins_idx]   = false;
+    g_track_inf_db[tab][ins_idx]         = false;
+    g_track_pre_inf_db[tab][ins_idx]     = 0.0f;
+    g_app_track_vol[tab][ins_idx]        = 100.0f;
+
+    record_project_change("Added New Track", true);
 }
 
 // Copies all selected items into the internal clipboard
@@ -7300,7 +7396,7 @@ static void daw_enqueue_bg_media_prep(const char *file_path, const char *raw_aud
 // Polls on the main UI thread to attach any background-prepared .raw handles and .pk waveform peaks
 static void daw_poll_bg_prepared_media_on_main_thread(void) {
     int cur_ser = g_bg_media_completed_serial;
-    if (cur_ser == g_bg_media_observed_serial && g_bg_media_running == 0) return;
+    if (cur_ser == g_bg_media_observed_serial) return;
     g_bg_media_observed_serial = cur_ser;
 
     for (int t = 0; t < g_daw.num_tabs; t++) {
@@ -8666,6 +8762,12 @@ void daw_shift_per_tab_arrays_on_close(int idx, bool was_last_single_tab) {
     g_daw.editing_track_name_idx = -1;
     g_daw.editing_marker_idx = -1;
     g_selected_marker_idx = -1;
+    g_last_clicked_item_idx = -1;
+    g_last_clicked_track_idx = 0;
+    g_clip_props.is_open = false;
+    g_text_edit.active_buf = NULL;
+    g_text_edit.cursor_pos = 0;
+    g_text_edit.select_all = false;
     SDL_StopTextInput();
 
     if (was_last_single_tab) {
@@ -8811,6 +8913,183 @@ void daw_shift_per_tab_arrays_on_close(int idx, bool was_last_single_tab) {
     g_tab_notification[new_count][0] = '\0';
 }
 
+static bool daw_is_peak_ptr_referenced_in_active_tabs(const PeakBin *pk) {
+    if (!pk) return false;
+    for (int t = 0; t < g_daw.num_tabs && t < MAX_TABS; t++) {
+        ProjectTab *tp = &g_daw.tabs[t];
+        for (int i = 0; i < tp->num_items && i < MAX_ITEMS; i++) {
+            if (tp->items[i].peaks == pk) return true;
+        }
+        if (g_deep_undo_stack[t]) {
+            for (int k = 0; k < MAX_DEEP_UNDO; k++) {
+                DeepUndoEntry *ent = &g_deep_undo_stack[t][k];
+                if (ent->items) {
+                    for (int i = 0; i < ent->num_items; i++) {
+                        if (ent->items[i].peaks == pk) return true;
+                    }
+                }
+            }
+        }
+    }
+    for (int c = 0; c < g_clipboard_count; c++) {
+        if (g_clipboard[c].item.peaks == pk) return true;
+    }
+    for (int tc = 0; tc < g_track_clipboard_count; tc++) {
+        for (int c = 0; c < g_track_clipboard[tc].num_clips; c++) {
+            if (g_track_clipboard[tc].clips[c].item.peaks == pk) return true;
+        }
+    }
+    return false;
+}
+
+static void daw_evict_unused_shared_peaks_after_tab_close(void) {
+    for (int sp = 0; sp < MAX_SHARED_PEAK_ENTRIES; sp++) {
+        if (g_shared_peak_pool[sp].in_use) {
+            PeakBin *pk = g_shared_peak_pool[sp].peaks;
+            if (!pk || !daw_is_peak_ptr_referenced_in_active_tabs(pk)) {
+                if (pk) free(pk);
+                g_shared_peak_pool[sp].peaks = NULL;
+                g_shared_peak_pool[sp].in_use = false;
+                g_shared_peak_pool[sp].raw_audio_path[0] = '\0';
+                g_shared_peak_pool[sp].peak_count = 0;
+                g_shared_peak_pool[sp].total_duration = 0.0;
+                g_shared_peak_pool[sp].has_video = false;
+            }
+        }
+    }
+}
+
+void daw_init_tab_defaults_main(int idx, const char *title) {
+    if (idx < 0 || idx >= MAX_TABS) return;
+    ProjectTab *p = &g_daw.tabs[idx];
+    memset(p, 0, offsetof(ProjectTab, undo_mgr));
+    p->undo_mgr.head = -1;
+    p->undo_mgr.count = 0;
+    snprintf(p->project_name, sizeof(p->project_name), "%s", title ? title : "Project");
+    p->num_tracks = 4;
+    p->pixels_per_second = 80.0f;
+    p->project_duration_sec = 300.0;
+    p->show_marker_lane = false;
+    p->is_dirty = false;
+    p->video = (SimpleVideoPlayer){ .rect = { 650, 160, 480, 310 }, .is_open = false, .video_stream_idx = -1 };
+
+    for (int t = 0; t < MAX_TRACKS; t++) {
+        p->tracks[t].id = t + 1;
+        p->tracks[t].volume = 1.0f;
+        p->track_db[t] = 0.0f;
+        p->track_heights[t] = 84;
+        snprintf(p->track_names[t], sizeof(p->track_names[t]), "Track %d", t + 1);
+    }
+}
+
+// REAPER-style clean single-tab close: executes 100% in main.c so g_shared_peak_pool and g_daw are never split across TUs
+void daw_force_close_tab_main(int idx) {
+    if (idx < 0 || idx >= g_daw.num_tabs || idx >= MAX_TABS) return;
+
+    if (g_rec.is_recording && (idx == g_daw.active_tab || g_daw.num_tabs <= 1)) {
+        g_rec.is_recording = false;
+        if (g_rec.capture_dev > 0) {
+            SDL_CloseAudioDevice(g_rec.capture_dev);
+            g_rec.capture_dev = 0;
+        }
+        if (g_rec.wav_file) {
+            fclose(g_rec.wav_file);
+            g_rec.wav_file = NULL;
+        }
+        if (g_rec.raw_cache_file) {
+            fclose(g_rec.raw_cache_file);
+            g_rec.raw_cache_file = NULL;
+        }
+    }
+
+    g_engine_processing = true;
+    g_daw.tabs[idx].is_playing = false;
+    if (g_video_pinned_global && (idx == g_daw.active_tab || g_daw.num_tabs <= 1)) {
+        g_video_pinned_global = false;
+        destroy_external_pinned_video_window();
+    }
+    close_video(&g_daw.tabs[idx].video);
+
+    if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
+
+    ProjectTab *target = &g_daw.tabs[idx];
+    target->is_playing = false;
+    for (int i = 0; i < target->num_items && i < MAX_ITEMS; i++) {
+        if (target->items[i].raw_file_handle) {
+            fclose(target->items[i].raw_file_handle);
+            target->items[i].raw_file_handle = NULL;
+        }
+        if (target->items[i].peaks) {
+            if (!daw_is_pooled_peaks(target->items[i].peaks)) {
+                char anon_key[64];
+                snprintf(anon_key, sizeof(anon_key), "__unpooled_pk_%p", (void *)target->items[i].peaks);
+                daw_register_shared_peaks(
+                    target->items[i].raw_audio_path[0] ? target->items[i].raw_audio_path : anon_key,
+                    target->items[i].peaks,
+                    target->items[i].peak_count,
+                    target->items[i].file_total_duration,
+                    target->items[i].has_video
+                );
+            }
+            target->items[i].peaks = NULL;
+        }
+    }
+    target->num_items = 0;
+
+    if (g_daw.num_tabs <= 1) {
+        daw_init_tab_defaults_main(0, "Project 1");
+        g_daw.num_tabs = 1;
+        g_daw.active_tab = 0;
+        if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
+
+        daw_shift_per_tab_arrays_on_close(0, true);
+        daw_evict_unused_shared_peaks_after_tab_close();
+        g_engine_processing = false;
+        return;
+    }
+
+    for (int t = idx; t < g_daw.num_tabs - 1; t++) {
+        memmove(&g_daw.tabs[t], &g_daw.tabs[t + 1], offsetof(ProjectTab, undo_mgr));
+        g_daw.tabs[t].undo_mgr.head = -1;
+        g_daw.tabs[t].undo_mgr.count = 0;
+    }
+    int vacated_slot = g_daw.num_tabs - 1;
+    daw_init_tab_defaults_main(vacated_slot, "Project");
+    g_daw.num_tabs--;
+
+    if (g_daw.active_tab > idx) {
+        g_daw.active_tab--;
+    } else if (g_daw.active_tab >= g_daw.num_tabs) {
+        g_daw.active_tab = g_daw.num_tabs - 1;
+    }
+    if (g_daw.active_tab < 0) g_daw.active_tab = 0;
+
+    if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
+
+    daw_shift_per_tab_arrays_on_close(idx, false);
+    daw_evict_unused_shared_peaks_after_tab_close();
+    g_engine_processing = false;
+}
+
+void daw_request_close_tab_main(int idx) {
+    if (idx < 0 || idx >= g_daw.num_tabs) return;
+
+    if ((g_tab_needs_project_setup[idx] || g_daw.tabs[idx].project_path[0] == '\0') &&
+        g_daw.tabs[idx].num_items == 0) {
+        g_daw.tabs[idx].is_dirty = false;
+    }
+
+    if (g_daw.tabs[idx].is_dirty) {
+        g_daw.active_tab = idx;
+        g_daw.save_prompt_open = true;
+        g_daw.save_prompt_tab_idx = idx;
+        g_daw.save_prompt_quit_app = false;
+        g_save_prompt_open_project_after = false;
+    } else {
+        daw_force_close_tab_main(idx);
+    }
+}
+
 // Requirement 1 & 2: Cleans up temporary and .cache files when a tab or the complete application closes
 void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
     (void)is_temp_recordings_clip_path;
@@ -8833,7 +9112,9 @@ void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
 
     if (tab_idx >= 0 && tab_idx < g_daw.num_tabs) {
         ProjectTab *tp = &g_daw.tabs[tab_idx];
+        tp->is_playing = false;
         close_video(&tp->video);
+        if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
         for (int i = 0; i < tp->num_items; i++) {
             AudioItem *it = &tp->items[i];
             if (it->raw_file_handle) {
@@ -8841,11 +9122,51 @@ void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
                 it->raw_file_handle = NULL;
             }
         }
+        if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
         reset_tab_undo_history(tab_idx);
     }
 
     if (delete_all_temp_files) {
         daw_purge_all_cache_folder();
+    }
+}
+
+void daw_handle_save_modal_choice_main(int choice, bool *running) {
+    int t_idx = g_daw.save_prompt_tab_idx;
+    bool quit_after = g_daw.save_prompt_quit_app;
+
+    g_daw.save_prompt_open = false;
+    g_daw.save_prompt_tab_idx = -1;
+    g_daw.save_prompt_quit_app = false;
+
+    if (choice == 1) {
+        if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
+            save_project_file();
+            g_daw.tabs[t_idx].is_dirty = false;
+        }
+    } else if (choice == 2) {
+        if (quit_after) {
+            if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
+                g_daw.tabs[t_idx].is_dirty = false;
+            }
+            for (int t = 0; t < g_daw.num_tabs; t++) {
+                if ((g_tab_needs_project_setup[t] || g_daw.tabs[t].project_path[0] == '\0') &&
+                    g_daw.tabs[t].num_items == 0) {
+                    g_daw.tabs[t].is_dirty = false;
+                }
+                if (g_daw.tabs[t].is_dirty) {
+                    g_daw.active_tab = t;
+                    g_daw.save_prompt_open = true;
+                    g_daw.save_prompt_tab_idx = t;
+                    g_daw.save_prompt_quit_app = true;
+                    return;
+                }
+            }
+            daw_cleanup_temp_media_for_tab(-1, true);
+            if (running) *running = false;
+        } else {
+            daw_force_close_tab_main(t_idx);
+        }
     }
 }
 
@@ -9175,6 +9496,15 @@ static bool daw_create_new_project_file_dialog(ProjectTab *p) {
     if (!strstr(path, ".ehs") && !strstr(path, ".EHS")) {
         strncat(path, ".ehs", sizeof(path) - strlen(path) - 1);
     }
+    // Requirement 1: By default when opening/creating a fresh project, Lock is OFF
+    int cur_t = get_valid_tab_idx();
+    memset(g_track_locked[cur_t], 0, sizeof(g_track_locked[0]));
+    memset(g_track_lock_lr_only[cur_t], 0, sizeof(g_track_lock_lr_only[0]));
+    memset(g_track_lock_ud_only[cur_t], 0, sizeof(g_track_lock_ud_only[0]));
+    g_lock_opt_full[cur_t] = false;
+    g_lock_opt_complete_unlock[cur_t] = false;
+    g_lock_opt_prevent_lr[cur_t] = false;
+    g_lock_opt_prevent_ud[cur_t] = false;
     if (daw_save_project_to_path(p, path)) {
         g_tab_needs_project_setup[get_valid_tab_idx()] = false;
         record_project_change("Created Project Folder & Media Subfolder", false);
@@ -9280,7 +9610,7 @@ static void daw_load_project_dialog(ProjectTab *p, SDL_Renderer *ren, SDL_Window
     }
     memset(g_track_hidden[tab_i], 0, sizeof(g_track_hidden[0]));
     memset(g_track_locked[tab_i], 0, sizeof(g_track_locked[0]));
-    g_lock_opt_full[tab_i] = true;
+    g_lock_opt_full[tab_i] = false;
     g_lock_opt_prevent_lr[tab_i] = false;
     g_lock_opt_prevent_ud[tab_i] = false;
     memset(g_track_color_idx[tab_i], 0, sizeof(g_track_color_idx[0]));
@@ -11375,19 +11705,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             if (e.type == SDL_QUIT) {
-                // Requirement 1: If there are 2 or more tabs open, clicking the top-right 'Exit' button is compulsory to close the app
-                if (g_daw.num_tabs >= 2) {
-                    record_project_change("2+ tabs open: Click top-right 'Exit' button to close app, or 'x' to close tab", false);
-                    show_processing_wait_modal(
-                        ren, win,
-                        "Multiple Project Tabs Open",
-                        "Click the top-right 'Exit' button (above 'Save') to close the application, or 'x' on a tab to close that tab.",
-                        100
-                    );
-                    g_processing_close_at_ticks = SDL_GetTicks() + 1400;
-                } else {
-                    request_exit_application(&running);
-                }
+                request_exit_application(&running);
             } else if (e.type == SDL_MOUSEWHEEL) {
                 int mx, my; SDL_GetMouseState(&mx, &my);
                 if (is_processing_blocking_input()) continue;
@@ -12004,18 +12322,13 @@ int main(int argc, char *argv[]) {
 
                 // Requirement 5: New Project Tab 2-Option Modal ("Open Project File" / "Create Project File")
                 if (g_tab_needs_project_setup[get_valid_tab_idx()] || p->project_path[0] == '\0') {
-                    // Allow clicking top tab bar to switch between open tabs, close a tab, add '+' tab, or click top-right 'Exit' button
+                    // Allow clicking top tab bar to switch between open tabs, close a tab, or add '+' tab
                     if (my < TABBAR_HEIGHT) {
-                        // Top-right 'Exit' button on tab row (directly above 'Save' button)
-                        if (mx >= win_w - 60 && mx <= win_w - 8) {
-                            request_exit_application(&running);
-                            continue;
-                        }
                         int max_tab_w = 160;
                         int add_btn_w = 34;
                         int cur_tab_w = max_tab_w;
                         if (g_daw.num_tabs > 0) {
-                            int calc_w = (win_w - add_btn_w - 76) / g_daw.num_tabs;
+                            int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
                             if (calc_w < cur_tab_w) cur_tab_w = calc_w;
                             if (cur_tab_w < 70) cur_tab_w = 70;
                         }
@@ -12026,9 +12339,11 @@ int main(int argc, char *argv[]) {
                                 clicked_tab = true;
                                 if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4) {
                                     request_close_tab(t);
+                                    p = get_cur_tab();
                                 } else {
                                     g_daw.active_tab = t;
                                     g_selected_marker_idx = -1;
+                                    p = get_cur_tab();
                                 }
                                 break;
                             }
@@ -12047,7 +12362,10 @@ int main(int argc, char *argv[]) {
                             memset(g_item_fade_out[nt], 0, sizeof(g_item_fade_out[0]));
                             memset(g_track_hidden[nt], 0, sizeof(g_track_hidden[0]));
                             memset(g_track_locked[nt], 0, sizeof(g_track_locked[0]));
-                            g_lock_opt_full[nt] = true;
+                            memset(g_track_lock_lr_only[nt], 0, sizeof(g_track_lock_lr_only[0]));
+                            memset(g_track_lock_ud_only[nt], 0, sizeof(g_track_lock_ud_only[0]));
+                            g_lock_opt_full[nt] = false;
+                            g_lock_opt_complete_unlock[nt] = false;
                             g_lock_opt_prevent_lr[nt] = false;
                             g_lock_opt_prevent_ud[nt] = false;
                             memset(g_track_color_idx[nt], 0, sizeof(g_track_color_idx[0]));
@@ -13530,19 +13848,13 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Chrome-Style Tab Interactions + Top-Right 'Exit' Button (above 'Save')
+                // Chrome-Style Tab Interactions
                 if (my < TABBAR_HEIGHT) {
-                    // Requirement 1: Top-right 'Exit' button on tab row directly above 'Save' button
-                    if (mx >= win_w - 60 && mx <= win_w - 8) {
-                        request_exit_application(&running);
-                        continue;
-                    }
-
                     int max_tab_w = 160;
                     int add_btn_w = 34;
                     int cur_tab_w = max_tab_w;
                     if (g_daw.num_tabs > 0) {
-                        int calc_w = (win_w - add_btn_w - 76) / g_daw.num_tabs;
+                        int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
                         if (calc_w < cur_tab_w) cur_tab_w = calc_w;
                         if (cur_tab_w < 70) cur_tab_w = 70;
                     }
@@ -13554,9 +13866,11 @@ int main(int argc, char *argv[]) {
                             clicked_tab = true;
                             if (mx >= cur_tab_x + cur_tab_w - 24 && mx <= cur_tab_x + cur_tab_w - 4) {
                                 request_close_tab(t);
+                                p = get_cur_tab();
                             } else {
                                 g_daw.active_tab = t;
                                 g_selected_marker_idx = -1;
+                                p = get_cur_tab();
                             }
                             break;
                         }
@@ -13575,7 +13889,10 @@ int main(int argc, char *argv[]) {
                         memset(g_item_fade_out[g_daw.num_tabs], 0, sizeof(g_item_fade_out[0]));
                         memset(g_track_hidden[g_daw.num_tabs], 0, sizeof(g_track_hidden[0]));
                         memset(g_track_locked[g_daw.num_tabs], 0, sizeof(g_track_locked[0]));
-                        g_lock_opt_full[g_daw.num_tabs] = true;
+                        memset(g_track_lock_lr_only[g_daw.num_tabs], 0, sizeof(g_track_lock_lr_only[0]));
+                        memset(g_track_lock_ud_only[g_daw.num_tabs], 0, sizeof(g_track_lock_ud_only[0]));
+                        g_lock_opt_full[g_daw.num_tabs] = false;
+                        g_lock_opt_complete_unlock[g_daw.num_tabs] = false;
                         g_lock_opt_prevent_lr[g_daw.num_tabs] = false;
                         g_lock_opt_prevent_ud[g_daw.num_tabs] = false;
                         memset(g_track_color_idx[g_daw.num_tabs], 0, sizeof(g_track_color_idx[0]));
@@ -14049,11 +14366,7 @@ int main(int argc, char *argv[]) {
                 int corner_y = TABBAR_HEIGHT + TOPBAR_HEIGHT;
                 if (mx < g_daw.tcp_width && my > corner_y && my <= corner_y + RULER_HEIGHT + m_lane_h) {
                     if (mx >= 8 && mx <= 76 && p->num_tracks < MAX_TRACKS && e.button.button == SDL_BUTTON_LEFT) {
-                        push_undo_state();
-                        p->track_heights[p->num_tracks] = 84;
-                        snprintf(p->track_names[p->num_tracks], 64, "Track %d", p->num_tracks + 1);
-                        p->num_tracks++;
-                        record_project_change("Added New Track", true);
+                        insert_new_track_below_selected(p);
                     } else if (mx >= 80 && mx <= 106 && e.button.button == SDL_BUTTON_LEFT) {
                         g_lock_popup_open = !g_lock_popup_open;
                         if (g_lock_popup_open) {
@@ -15295,7 +15608,7 @@ int main(int argc, char *argv[]) {
         int add_btn_w = 34;
         int cur_tab_w = max_tab_w;
         if (g_daw.num_tabs > 0) {
-            int calc_w = (win_w - add_btn_w - 76) / g_daw.num_tabs;
+            int calc_w = (win_w - add_btn_w - 20) / g_daw.num_tabs;
             if (calc_w < cur_tab_w) cur_tab_w = calc_w;
             if (cur_tab_w < 70) cur_tab_w = 70;
         }
@@ -15328,9 +15641,9 @@ int main(int argc, char *argv[]) {
         draw_brown_border_rect(ren, &btn_add_tab, false, false);
         draw_text(ren, "+", cur_tab_x + 12, 9, c_white);
 
-        // Request #6: Project Change Notification Badge in the Top Tab Bar Section (leaves room for top-right 'Exit' button)
+        // Request #6: Project Change Notification Badge in the Top Tab Bar Section
         int notif_x = cur_tab_x + add_btn_w + 10;
-        int notif_w = (win_w - 68) - notif_x;
+        int notif_w = (win_w - 14) - notif_x;
         if (notif_w > 100) {
             int cur_t_idx = get_valid_tab_idx();
             SDL_Rect notif_box = { notif_x, 3, notif_w, TABBAR_HEIGHT - 6 };
@@ -15356,13 +15669,6 @@ int main(int argc, char *argv[]) {
             SDL_Rect notif_clip = { notif_x + 22, 4, notif_w - 28, TABBAR_HEIGHT - 8 };
             draw_text_clipped(ren, notif_disp, notif_x + 22, 9, c_white, &notif_clip, NULL);
         }
-
-        // Requirement 1: Top-right 'Exit' button on the Tab Row, directly above the 'Save' button (win_w - 60, w = 52)
-        SDL_Rect exit_btn = { win_w - 60, 2, 52, TABBAR_HEIGHT - 4 };
-        SDL_SetRenderDrawColor(ren, 118, 34, 30, 255);
-        SDL_RenderFillRect(ren, &exit_btn);
-        draw_brown_border_rect(ren, &exit_btn, true, false);
-        draw_text(ren, "Exit", win_w - 50, 9, c_white);
 
         // 2. Top Bar (Left: File Action Tools Video | Right: Undo Redo Zoom- Zoom+ Range Crossfade Hide Save)
         SDL_Rect topbar = { 0, TABBAR_HEIGHT, win_w, TOPBAR_HEIGHT };
