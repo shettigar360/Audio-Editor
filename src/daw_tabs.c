@@ -218,8 +218,10 @@ static inline void perform_redo(void) {
 #include "project_io.h"
 
 extern void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files);
+extern void daw_shift_per_tab_arrays_on_close(int closed_tab_idx, bool was_last_single_tab);
 
 void init_tab_defaults(int idx, const char *title) {
+    if (idx < 0 || idx >= MAX_TABS) return;
     ProjectTab *p = &g_daw.tabs[idx];
     memset(p, 0, offsetof(ProjectTab, undo_mgr));
     p->undo_mgr.head = -1;
@@ -243,10 +245,14 @@ void init_tab_defaults(int idx, const char *title) {
 
 void force_close_tab(int idx) {
     if (idx < 0 || idx >= g_daw.num_tabs) return;
-    daw_cleanup_temp_media_for_tab(idx, g_daw.num_tabs <= 1);
+
+    // Lock audio device before closing file handles or shifting tabs so the real-time
+    // audio callback thread never reads a freed FILE* or mid-shift ProjectTab!
+    if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
 
     if (g_daw.num_tabs <= 1) {
         ProjectTab *p = &g_daw.tabs[0];
+        p->is_playing = false;
         close_video(&p->video);
         for (int i = 0; i < p->num_items; i++) {
             if (p->items[i].raw_file_handle) {
@@ -258,10 +264,15 @@ void force_close_tab(int idx) {
         }
         init_tab_defaults(0, "Project 1");
         g_daw.active_tab = 0;
+        if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
+
+        daw_shift_per_tab_arrays_on_close(0, true);
+        daw_cleanup_temp_media_for_tab(0, false);
         return;
     }
 
     ProjectTab *target = &g_daw.tabs[idx];
+    target->is_playing = false;
     close_video(&target->video);
     for (int i = 0; i < target->num_items; i++) {
         if (target->items[i].raw_file_handle) {
@@ -275,6 +286,10 @@ void force_close_tab(int idx) {
     for (int t = idx; t < g_daw.num_tabs - 1; t++) {
         g_daw.tabs[t] = g_daw.tabs[t + 1];
     }
+    int vacated_slot = g_daw.num_tabs - 1;
+    memset(&g_daw.tabs[vacated_slot], 0, offsetof(ProjectTab, undo_mgr));
+    g_daw.tabs[vacated_slot].undo_mgr.head = -1;
+    g_daw.tabs[vacated_slot].undo_mgr.count = 0;
     g_daw.num_tabs--;
 
     if (g_daw.active_tab > idx) {
@@ -282,6 +297,13 @@ void force_close_tab(int idx) {
     } else if (g_daw.active_tab >= g_daw.num_tabs) {
         g_daw.active_tab = g_daw.num_tabs - 1;
     }
+    if (g_daw.active_tab < 0) g_daw.active_tab = 0;
+
+    if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
+
+    // Shift all per-tab arrays in main.c in lockstep with g_daw.tabs[] and garbage-collect unreferenced .cache files
+    daw_shift_per_tab_arrays_on_close(idx, false);
+    daw_cleanup_temp_media_for_tab(-1, false);
 }
 
 void request_close_tab(int idx) {
@@ -306,14 +328,26 @@ void handle_save_modal_choice(int choice, bool *running) {
     g_daw.save_prompt_quit_app = false;
 
     if (choice == 1) {
-        // [Save]: Save project and return back to project (do not exit/close)
+        // [Save]: Handled directly by main.c save dialog + post-save continuation
         if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
             save_project_file();
             g_daw.tabs[t_idx].is_dirty = false;
         }
     } else if (choice == 2) {
-        // [Don't Save]: Discard and auto-delete unsaved temporary media files
+        // [Don't Save]: Discard unsaved changes for t_idx
         if (quit_after) {
+            if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
+                g_daw.tabs[t_idx].is_dirty = false;
+            }
+            // Check if any other open tab still has unsaved changes before exiting the app
+            for (int t = 0; t < g_daw.num_tabs; t++) {
+                if (g_daw.tabs[t].is_dirty) {
+                    g_daw.save_prompt_open = true;
+                    g_daw.save_prompt_tab_idx = t;
+                    g_daw.save_prompt_quit_app = true;
+                    return;
+                }
+            }
             daw_cleanup_temp_media_for_tab(-1, true);
             if (running) *running = false;
         } else {
