@@ -282,14 +282,6 @@ static inline void daw_draw_text_edit_overlay(SDL_Renderer *ren, char *buf, int 
 #include "daw_tabs.h"
 #include "project_io.h"
 
-void daw_init_tab_defaults_main(int idx, const char *title);
-void daw_force_close_tab_main(int idx);
-void daw_request_close_tab_main(int idx);
-void daw_handle_save_modal_choice_main(int choice, bool *running);
-#define init_tab_defaults        daw_init_tab_defaults_main
-#define force_close_tab          daw_force_close_tab_main
-#define request_close_tab        daw_request_close_tab_main
-#define handle_save_modal_choice daw_handle_save_modal_choice_main
 #ifndef SDL_TEXTUREACCESS_TARGET
 #define SDL_TEXTUREACCESS_TARGET 2
 #endif
@@ -339,185 +331,8 @@ void daw_handle_save_modal_choice_main(int choice, bool *running);
 #include <unistd.h>
 #endif
 
-#ifndef DAW_PEAK_POOL_DEFINED
-#define DAW_PEAK_POOL_DEFINED
-#define MAX_SHARED_PEAK_ENTRIES 256
-typedef struct {
-    bool in_use;
-    char raw_audio_path[512];
-    PeakBin *peaks;
-    int peak_count;
-    double total_duration;
-    bool has_video;
-} SharedPeakPoolEntry;
-static SharedPeakPoolEntry g_shared_peak_pool[MAX_SHARED_PEAK_ENTRIES];
-static inline int daw_fseek64(FILE *fp, int64_t offset, int origin) {
-    if (!fp) return -1;
-    clearerr(fp);
-#ifdef _WIN32
-    return _fseeki64(fp, (int64_t)offset, origin);
-#else
-    return fseeko(fp, (off_t)offset, origin);
-#endif
-}
-static inline int64_t daw_ftell64(FILE *fp) {
-    if (!fp) return -1;
-#ifdef _WIN32
-    return _ftelli64(fp);
-#else
-    return (int64_t)ftello(fp);
-#endif
-}
-static inline FILE* daw_fopen_LockFreeRead(const char *path) {
-    if (!path || !path[0]) return NULL;
-    FILE *fp = fopen(path, "rb");
-    if (fp) setvbuf(fp, NULL, _IOFBF, 65536);
-    return fp;
-}
-static inline bool daw_is_pooled_peaks(const PeakBin *peaks) {
-    if (!peaks) return false;
-    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
-        if (g_shared_peak_pool[i].in_use && g_shared_peak_pool[i].peaks == peaks) return true;
-    }
-    return false;
-}
-static inline void daw_free_peaks_if_unpooled(PeakBin *peaks) {
-    if (!peaks) return;
-    if (!daw_is_pooled_peaks(peaks)) free(peaks);
-}
-static inline PeakBin* daw_find_shared_peaks(const char *raw_path, int *out_peak_count, double *out_total_dur, bool *out_has_video) {
-    if (!raw_path || !raw_path[0]) return NULL;
-    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
-        if (g_shared_peak_pool[i].in_use && strcmp(g_shared_peak_pool[i].raw_audio_path, raw_path) == 0 && g_shared_peak_pool[i].peaks != NULL) {
-            if (out_peak_count) *out_peak_count = g_shared_peak_pool[i].peak_count;
-            if (out_total_dur)  *out_total_dur  = g_shared_peak_pool[i].total_duration;
-            if (out_has_video)  *out_has_video  = g_shared_peak_pool[i].has_video;
-            return g_shared_peak_pool[i].peaks;
-        }
-    }
-    return NULL;
-}
-static inline PeakBin* daw_register_shared_peaks(const char *raw_path, PeakBin *peaks, int peak_count, double total_dur, bool has_video) {
-    if (!raw_path || !raw_path[0] || !peaks) return peaks;
-    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
-        if (g_shared_peak_pool[i].in_use && strcmp(g_shared_peak_pool[i].raw_audio_path, raw_path) == 0) {
-            if (g_shared_peak_pool[i].peaks && g_shared_peak_pool[i].peaks != peaks) { free(peaks); return g_shared_peak_pool[i].peaks; }
-            g_shared_peak_pool[i].peaks = peaks;
-            g_shared_peak_pool[i].peak_count = peak_count;
-            g_shared_peak_pool[i].total_duration = total_dur;
-            g_shared_peak_pool[i].has_video = has_video;
-            return peaks;
-        }
-    }
-    for (int i = 0; i < MAX_SHARED_PEAK_ENTRIES; i++) {
-        if (!g_shared_peak_pool[i].in_use) {
-            g_shared_peak_pool[i].in_use = true;
-            strncpy(g_shared_peak_pool[i].raw_audio_path, raw_path, sizeof(g_shared_peak_pool[i].raw_audio_path) - 1);
-            g_shared_peak_pool[i].raw_audio_path[sizeof(g_shared_peak_pool[i].raw_audio_path) - 1] = '\0';
-            g_shared_peak_pool[i].peaks = peaks;
-            g_shared_peak_pool[i].peak_count = peak_count;
-            g_shared_peak_pool[i].total_duration = total_dur;
-            g_shared_peak_pool[i].has_video = has_video;
-            return peaks;
-        }
-    }
-    return peaks;
-}
-#endif // DAW_PEAK_POOL_DEFINED
-
-#ifndef DAW_CORE_STRUCTS_DEFINED
-#define DAW_CORE_STRUCTS_DEFINED
-#ifndef TABBAR_HEIGHT
-#define TABBAR_HEIGHT 30
-#define TOPBAR_HEIGHT 36
-#define RULER_HEIGHT 28
-#define MARKER_BAR_HEIGHT 24
-#define SCROLLBAR_SIZE 16
-#define MAX_UNDO_STACK 32
-#define MAX_SCRIPTS 64
-#define MAX_TABS 8
-#define MAX_MARKERS 64
-typedef enum { INPUT_FOCUS_NONE = 0, INPUT_FOCUS_TRACK_NAME, INPUT_FOCUS_MARKER } InputFocusType;
-typedef struct { double time_sec; char text[64]; } DawMarker;
-typedef struct { char name[64]; char filepath[260]; char shortcut[16]; bool is_python; } DawScript;
-typedef struct { AudioItem items[MAX_ITEMS]; int num_items; int num_tracks; } DawSnapshot;
-typedef struct { DawSnapshot history[MAX_UNDO_STACK]; int head; int count; } UndoRedoManager;
-typedef struct {
-    char project_name[64];
-    char project_path[512];
-    bool is_dirty;
-    Track tracks[MAX_TRACKS];
-    char track_names[MAX_TRACKS][64];
-    float track_db[MAX_TRACKS];
-    int track_heights[MAX_TRACKS];
-    bool track_selected[MAX_TRACKS];
-    int num_tracks;
-    AudioItem items[MAX_ITEMS];
-    int num_items;
-    double playhead_seconds;
-    bool is_playing;
-    double scroll_x_sec;
-    int scroll_y_px;
-    float pixels_per_second;
-    double project_duration_sec;
-    DawMarker markers[MAX_MARKERS];
-    int num_markers;
-    bool show_marker_lane;
-    SimpleVideoPlayer video;
-    UndoRedoManager undo_mgr;
-} ProjectTab;
-typedef struct {
-    ProjectTab tabs[MAX_TABS];
-    int num_tabs;
-    int active_tab;
-    int tcp_width;
-    SDL_AudioDeviceID audio_device;
-    bool save_prompt_open;
-    int save_prompt_tab_idx;
-    bool save_prompt_quit_app;
-    DawScript scripts[MAX_SCRIPTS];
-    int num_scripts;
-    bool script_manager_open;
-    bool script_manager_is_python;
-    int script_selected_idx;
-    SDL_Rect script_win_rect;
-    bool script_win_dragging;
-    int script_drag_offset_x;
-    int script_drag_offset_y;
-    bool menu_file_open;
-    bool menu_action_open;
-    bool submenu_export_audio_open;
-    bool submenu_export_video_open;
-    InputFocusType input_focus;
-    int editing_track_name_idx;
-    char editing_name_buf[64];
-    int editing_marker_idx;
-    char editing_marker_buf[64];
-} DawEngine;
-extern DawEngine g_daw;
-static inline ProjectTab* get_cur_tab(void) {
-    if (g_daw.num_tabs <= 0) g_daw.num_tabs = 1;
-    if (g_daw.num_tabs > MAX_TABS) g_daw.num_tabs = MAX_TABS;
-    if (g_daw.active_tab < 0) g_daw.active_tab = 0;
-    if (g_daw.active_tab >= g_daw.num_tabs) g_daw.active_tab = g_daw.num_tabs - 1;
-    return &g_daw.tabs[g_daw.active_tab];
-}
-static inline float db_to_linear(float db) {
-    if (db <= -60.0f) return 0.0f;
-    return powf(10.0f, db / 20.0f);
-}
-static inline void format_timecode(double seconds, char *out, size_t max_len) {
-    if (seconds < 0.0) seconds = 0.0;
-    int h = (int)(seconds / 3600);
-    int m = (int)((seconds - h * 3600) / 60);
-    int s = (int)(seconds - h * 3600 - m * 60);
-    int ms = (int)((seconds - (int)seconds) * 1000);
-    snprintf(out, max_len, "%02d:%02d:%02d.%03d", h, m, s, ms);
-}
-#endif
-#endif // DAW_CORE_STRUCTS_DEFINED
-
 DawEngine g_daw;
+SharedPeakPoolEntry g_shared_peak_pool[MAX_SHARED_PEAK_ENTRIES];
 
 static SDL_Cursor *g_cursor_arrow = NULL;
 static SDL_Cursor *g_cursor_size_we = NULL;
@@ -554,7 +369,7 @@ static volatile uint32_t g_playhead_seek_serial[MAX_TABS] = { 0 };
 static double g_last_observed_playhead[MAX_TABS] = { -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0 };
 
 #define NUM_STUDIO_COLORS 24
-static const char* g_studio_color_names[NUM_STUDIO_COLORS] = {
+static const char* __attribute__((unused)) g_studio_color_names[NUM_STUDIO_COLORS] = {
     "Default Theme", "Copper Orange", "Emerald Teal", "Crimson Red",
     "Royal Blue",    "Amber Gold",    "Violet Purple","Cyber Cyan",
     "Forest Green",  "Coral Rose",    "Indigo Slate", "Chartreuse",
@@ -704,81 +519,8 @@ static inline void draw_lock_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool
     }
 }
 #endif
-
-#ifndef DAW_APP_VOL_AND_PROJ_SETUP_DEFINED
-#define DAW_APP_VOL_AND_PROJ_SETUP_DEFINED
-// Per-tab App Hearing Volume (0..100%, 0 = infinity mute; hearing level only, saved in .ehs project file)
-static float g_app_master_vol[MAX_TABS] = { 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f };
-static float g_app_track_vol[MAX_TABS][MAX_TRACKS];
-static bool  g_app_vol_initialized = false;
-static inline void ensure_app_vol_defaults_initialized(void) {
-    if (g_app_vol_initialized) return;
-    g_app_vol_initialized = true;
-    for (int t = 0; t < MAX_TABS; t++) {
-        g_app_master_vol[t] = 100.0f;
-        for (int k = 0; k < MAX_TRACKS; k++) {
-            g_app_track_vol[t][k] = 100.0f;
-        }
-    }
-}
-static inline void init_tab_app_volume_defaults(int tab_idx) {
-    ensure_app_vol_defaults_initialized();
-    if (tab_idx < 0 || tab_idx >= MAX_TABS) return;
-    g_app_master_vol[tab_idx] = 100.0f;
-    for (int k = 0; k < MAX_TRACKS; k++) {
-        g_app_track_vol[tab_idx][k] = 100.0f;
-    }
-}
-
-// Per-tab New Project Tab 2-option modal ("Open Project File" / "Create Project File")
-static bool g_tab_needs_project_setup[MAX_TABS] = { true, true, true, true, true, true, true, true };
-#endif
-
-// ================= TINY RANGE POPUP WINDOW STATE (NEAR RANGE BUTTON) =================
-typedef struct {
-    bool is_open;
-    SDL_Rect win_rect;
-    bool is_dragging;
-    int drag_off_x;
-    int drag_off_y;
-    int active_field; // 0 = none, 1 = Start Time, 2 = End Time
-    char start_buf[32];
-    char end_buf[32];
-} RangePopupState;
-
-static RangePopupState g_range_popup = {
-    false,
-    { 940, 70, 300, 128 },
-    false, 0, 0,
-    0,
-    "00:00:00.000",
-    "00:00:05.000"
-};
-
-// ================= APP HEARING VOLUME POPUP WINDOW STATE =================
-typedef struct {
-    bool is_open;
-    SDL_Rect win_rect;
-    bool is_dragging;
-    int drag_off_x;
-    int drag_off_y;
-    int scroll_y;
-    bool sb_dragging;
-    int sb_start_my;
-    int sb_orig_scroll;
-    int dragging_slider_idx; // -1 = none, 0 = Master Volume, 1..MAX_TRACKS = Track (idx - 1)
-} AppVolumePopupState;
-
-static AppVolumePopupState g_vol_popup = {
-    false,
-    { 360, 70, 500, 344 },
-    false, 0, 0,
-    0, false, 0, 0,
-    -1
-};
-
 static bool     g_hide_popup_open = false;
-static SDL_Rect g_hide_win_rect = { 450, 110, 440, 340 };
+static SDL_Rect g_hide_win_rect = { 450, 110, 380, 340 };
 static bool     g_hide_win_dragging = false;
 static int      g_hide_drag_off_x = 0;
 static int      g_hide_drag_off_y = 0;
@@ -891,7 +633,7 @@ static const Mp4ResolutionPreset g_mp4_res_presets[NUM_MP4_RES_PRESETS] = {
 
 #define NUM_MP4_V_KBPS_PRESETS 6
 static const int g_mp4_v_kbps_presets[NUM_MP4_V_KBPS_PRESETS] = {
-    1024, 2048, 4096, 8192, 12000, 16000
+    1024, 2048, 4096, 8000, 12000, 20000
 };
 
 typedef enum {
@@ -933,9 +675,9 @@ typedef struct {
     bool mp4_aac_dropdown_open;     // Dropdown for 120 / 192 / 320 kbps
     int  mp4_res_preset_idx;        // Default 3 -> 1920 x 1080 (Full HD)
     bool mp4_size_dropdown_open;    // Resolution Size dropdown menu open
-    bool mp4_size_manual_mode;      // True when Manual is selected at end of Size dropdown
+    bool mp4_size_manual_mode;      // True when "Manual" selected in Size dropdown
     bool mp4_v_kbps_dropdown_open;  // Video Bitrate dropdown menu open
-    bool mp4_v_kbps_manual_mode;    // True when Manual is selected at end of Video Bitrate dropdown
+    bool mp4_v_kbps_manual_mode;    // True when "Manual" selected in Video Bitrate dropdown
 
     bool two_pass_render;           // Option: two pass render
 
@@ -957,7 +699,7 @@ typedef struct {
 
 static ExportDialogState g_export = {
     false,
-    { 280, 50, 720, 620 },
+    { 300, 72, 680, 580 },
     false, 0, 0,
     EXPORT_SRC_MASTER,
     ".",
@@ -1012,16 +754,14 @@ static int get_current_mp4_res_preset_idx(void) {
             return i;
         }
     }
-    return -1; // Custom manual Width x Height resolution
+    return -1;
 }
 
 static int get_current_mp4_v_kbps_preset_idx(void) {
     if (g_export.mp4_v_kbps_manual_mode) return -1;
     int vk = atoi(g_export.mp4_video_kbps_str);
     for (int i = 0; i < NUM_MP4_V_KBPS_PRESETS; i++) {
-        if (g_mp4_v_kbps_presets[i] == vk) {
-            return i;
-        }
+        if (g_mp4_v_kbps_presets[i] == vk) return i;
     }
     return -1;
 }
@@ -1174,12 +914,125 @@ static inline void set_item_fade_out(ProjectTab *p, int item_idx, double fout) {
 // Activated when clicking the top-bar "Range" button:
 // If any clip(s) are selected, sets the Logic Pro style yellow cycle range to the selected clip(s) bounds.
 // Clicking "Range" again when already matching (or when no clip is selected) toggles the cycle range on/off.
-static void sync_range_popup_buffers_from_tab(void) {
+// Tiny Range Timings Popup Window state (near top-bar Range button)
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    int active_field; // 0 = none, 1 = start_buf, 2 = end_buf
+    char start_buf[32];
+    char end_buf[32];
+} RangePopupState;
+
+static RangePopupState g_range_popup = {
+    false,
+    { 940, 76, 260, 128 },
+    false, 0, 0,
+    0,
+    "00:00:00.000",
+    "00:00:05.000"
+};
+
+static inline void sync_range_popup_buffers_from_tab(void) {
     if (g_range_popup.active_field != 1) {
         format_timecode(get_range_start(), g_range_popup.start_buf, sizeof(g_range_popup.start_buf));
     }
     if (g_range_popup.active_field != 2) {
         format_timecode(get_range_end(), g_range_popup.end_buf, sizeof(g_range_popup.end_buf));
+    }
+}
+
+// App Hearing Volume (Monitor-Only Level, 0..100%) per-tab & popup state
+static float g_app_master_vol[MAX_TABS];
+static float g_app_track_vol[MAX_TABS][MAX_TRACKS];
+static bool  g_app_vol_initialized = false;
+
+static inline void init_tab_app_volume_defaults(int tab) {
+    if (tab < 0 || tab >= MAX_TABS) return;
+    g_app_master_vol[tab] = 100.0f;
+    for (int t = 0; t < MAX_TRACKS; t++) {
+        g_app_track_vol[tab][t] = 100.0f;
+    }
+}
+
+static inline void ensure_app_vol_defaults_initialized(void) {
+    if (g_app_vol_initialized) return;
+    g_app_vol_initialized = true;
+    for (int tb = 0; tb < MAX_TABS; tb++) {
+        init_tab_app_volume_defaults(tb);
+    }
+}
+
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    int dragging_slider_idx; // -1 = none, 0 = master, 1..MAX_TRACKS = track + 1
+    int scroll_y;
+    bool sb_dragging;
+    int sb_start_my;
+    int sb_orig_scroll;
+} AppVolumePopupState;
+
+static AppVolumePopupState g_vol_popup = {
+    false,
+    { 360, 76, 480, 320 },
+    false, 0, 0,
+    -1,
+    0, false, 0, 0
+};
+
+// Per-tab New Project Setup modal state & Per-track Infinity -dB state
+static bool  g_tab_needs_project_setup[MAX_TABS] = { false };
+static bool  g_track_inf_db[MAX_TABS][MAX_TRACKS] = { { false } };
+static float g_track_pre_inf_db[MAX_TABS][MAX_TRACKS] = { { 0.0f } };
+
+// Project Auto Save state & Crash-Recovery Guard state
+typedef struct {
+    bool is_open;
+    SDL_Rect win_rect;
+    bool is_dragging;
+    int drag_off_x;
+    int drag_off_y;
+    bool enabled;
+    int interval_minutes;
+    char interval_buf[16];
+    bool interval_focused;
+    Uint32 last_save_ticks;
+    bool pending_autosave;
+    char status_msg[128];
+} AutoSaveState;
+
+static AutoSaveState g_autosave = {
+    false,
+    { 400, 170, 480, 244 },
+    false, 0, 0,
+    true,
+    30,
+    "30",
+    false,
+    0,
+    false,
+    ""
+};
+
+static bool          g_autosave_in_progress = false;
+static SDL_Window   *g_main_win = NULL;
+static SDL_Renderer *g_main_ren = NULL;
+static jmp_buf       g_crash_recovery_jmp;
+static volatile sig_atomic_t g_crash_jmp_armed = 0;
+static volatile sig_atomic_t g_fault_recovered_flag = 0;
+
+static void daw_fault_signal_handler(int sig) {
+    signal(sig, daw_fault_signal_handler);
+    if (g_crash_jmp_armed) {
+        g_crash_jmp_armed = 0;
+        g_fault_recovered_flag = sig;
+        longjmp(g_crash_recovery_jmp, 1);
     }
 }
 
@@ -1367,11 +1220,6 @@ static void swap_tracks(ProjectTab *p, int t1, int t2) {
     g_track_lock_ud_only[tab_idx][t1] = g_track_lock_ud_only[tab_idx][t2];
     g_track_lock_ud_only[tab_idx][t2] = tmp_lck_ud;
 
-    ensure_app_vol_defaults_initialized();
-    float tmp_avol = g_app_track_vol[tab_idx][t1];
-    g_app_track_vol[tab_idx][t1] = g_app_track_vol[tab_idx][t2];
-    g_app_track_vol[tab_idx][t2] = tmp_avol;
-
     for (int i = 0; i < p->num_items; i++) {
         if (p->items[i].track_idx == t1) p->items[i].track_idx = t2;
         else if (p->items[i].track_idx == t2) p->items[i].track_idx = t1;
@@ -1406,56 +1254,6 @@ static bool g_submenu_tools_record_open = false;
 
 // Track vs Clip Copy/Paste Mode Flag
 static bool g_last_copied_is_track = false;
-
-static SDL_Window   *g_main_win = NULL;
-static SDL_Renderer *g_main_ren = NULL;
-static bool          g_autosave_in_progress = false;
-
-// Requirement 6: Per-Tab & Per-Track "Infinity -dB" ON/OFF State (REAPER-style -inf dB silence)
-static bool  g_track_inf_db[MAX_TABS][MAX_TRACKS];
-static float g_track_pre_inf_db[MAX_TABS][MAX_TRACKS];
-
-// Requirement 8: Crash Prevention & Stabilization Recovery State
-static jmp_buf               g_crash_recovery_jmp;
-static volatile sig_atomic_t g_crash_jmp_armed = 0;
-static volatile sig_atomic_t g_fault_recovered_flag = 0;
-
-static void daw_fault_signal_handler(int sig) {
-    signal(sig, daw_fault_signal_handler);
-    if (g_crash_jmp_armed) {
-        g_fault_recovered_flag = sig;
-        longjmp(g_crash_recovery_jmp, 1);
-    }
-}
-
-// Requirement 10: Project Auto Save Settings & 30-Minute Save-to-Save Cycle State
-typedef struct {
-    bool is_open;
-    SDL_Rect win_rect;
-    bool is_dragging;
-    int drag_off_x;
-    int drag_off_y;
-    bool enabled;                // Auto Save ON/OFF tick box (default true -> ON)
-    int interval_minutes;        // Save-to-save cycle in minutes (default 30 minutes)
-    char interval_buf[16];       // Manual timing entry buffer ("30")
-    bool interval_focused;       // Text input focus
-    Uint32 last_save_ticks;      // Timestamp of last project save
-    bool pending_autosave;       // True when cycle elapsed during a major action and is waiting to run
-    char status_msg[128];
-} AutoSaveSettingsState;
-
-static AutoSaveSettingsState g_autosave = {
-    false,
-    { 400, 170, 480, 244 },
-    false, 0, 0,
-    true,
-    30,
-    "30",
-    false,
-    0,
-    false,
-    ""
-};
 #endif
 
 // ================= BULLETPROOF DEEP UNDO / REDO ENGINE (100% AUDIO, PEAK & METADATA RECOVERY) =================
@@ -2069,90 +1867,63 @@ static void paste_tracks_at_bottom_of_selected(ProjectTab *p) {
     record_project_change("Pasted Track(s) Below Selected Track", true);
 }
 
-// Requirement 2: "+ Track" inserts the new track immediately below the selected track
-// (or at the bottom of all tracks if no track is selected).
+// Inserts a new track immediately below the currently selected track (or at the bottom if no track is selected)
 static void insert_new_track_below_selected(ProjectTab *p) {
     if (!p || p->num_tracks >= MAX_TRACKS) return;
     int tab = get_valid_tab_idx();
     ensure_app_vol_defaults_initialized();
 
-    bool any_selected = false;
     int insert_after = p->num_tracks - 1;
     for (int t = 0; t < p->num_tracks; t++) {
-        if (p->track_selected[t]) {
-            insert_after = t;
-            any_selected = true;
-        }
+        if (p->track_selected[t]) insert_after = t;
     }
     int ins_idx = insert_after + 1;
     if (ins_idx < 0) ins_idx = 0;
     if (ins_idx > p->num_tracks) ins_idx = p->num_tracks;
 
     push_undo_state();
+    for (int t = 0; t < p->num_tracks; t++) p->track_selected[t] = false;
 
-    // Shift tracks at >= ins_idx down by 1
     for (int t = p->num_tracks; t > ins_idx; t--) {
         p->tracks[t] = p->tracks[t - 1];
         p->tracks[t].id = t + 1;
-
-        char old_auto_name[64];
-        snprintf(old_auto_name, sizeof(old_auto_name), "Track %d", t);
-        if (strcmp(p->track_names[t - 1], old_auto_name) == 0) {
-            snprintf(p->track_names[t], 64, "Track %d", t + 1);
-        } else {
-            memcpy(p->track_names[t], p->track_names[t - 1], 64);
-        }
-
-        p->track_db[t]                  = p->track_db[t - 1];
-        p->track_heights[t]             = p->track_heights[t - 1];
-        p->track_selected[t]            = false;
-        g_track_hidden[tab][t]          = g_track_hidden[tab][t - 1];
-        g_track_color_idx[tab][t]       = g_track_color_idx[tab][t - 1];
-        g_track_peak_color_idx[tab][t]  = g_track_peak_color_idx[tab][t - 1];
-        g_track_locked[tab][t]          = g_track_locked[tab][t - 1];
-        g_track_lock_lr_only[tab][t]    = g_track_lock_lr_only[tab][t - 1];
-        g_track_lock_ud_only[tab][t]    = g_track_lock_ud_only[tab][t - 1];
-        g_track_inf_db[tab][t]          = g_track_inf_db[tab][t - 1];
-        g_track_pre_inf_db[tab][t]      = g_track_pre_inf_db[tab][t - 1];
-        g_app_track_vol[tab][t]         = g_app_track_vol[tab][t - 1];
+        memcpy(p->track_names[t], p->track_names[t - 1], 64);
+        p->track_db[t] = p->track_db[t - 1];
+        p->track_heights[t] = p->track_heights[t - 1];
+        p->track_selected[t] = false;
+        g_track_hidden[tab][t] = g_track_hidden[tab][t - 1];
+        g_track_color_idx[tab][t] = g_track_color_idx[tab][t - 1];
+        g_track_peak_color_idx[tab][t] = g_track_peak_color_idx[tab][t - 1];
+        g_track_locked[tab][t] = g_track_locked[tab][t - 1];
+        g_track_lock_lr_only[tab][t] = g_track_lock_lr_only[tab][t - 1];
+        g_track_lock_ud_only[tab][t] = g_track_lock_ud_only[tab][t - 1];
+        g_track_inf_db[tab][t] = g_track_inf_db[tab][t - 1];
+        g_track_pre_inf_db[tab][t] = g_track_pre_inf_db[tab][t - 1];
+        g_app_track_vol[tab][t] = g_app_track_vol[tab][t - 1];
     }
-
-    // Shift track_idx for all clips on tracks >= ins_idx
     for (int i = 0; i < p->num_items; i++) {
-        if (p->items[i].track_idx >= ins_idx) {
-            p->items[i].track_idx++;
-        }
+        if (p->items[i].track_idx >= ins_idx) p->items[i].track_idx++;
     }
-
     p->num_tracks++;
 
     memset(&p->tracks[ins_idx], 0, sizeof(Track));
-    p->tracks[ins_idx].id     = ins_idx + 1;
-    p->tracks[ins_idx].volume = 1.0f;
-    p->track_db[ins_idx]      = 0.0f;
+    p->tracks[ins_idx].id = ins_idx + 1;
+    snprintf(p->track_names[ins_idx], 64, "Track %d", p->num_tracks);
+    p->track_db[ins_idx] = 0.0f;
     p->track_heights[ins_idx] = 84;
-    snprintf(p->track_names[ins_idx], 64, "Track %d", ins_idx + 1);
-
-    if (any_selected) {
-        for (int t = 0; t < p->num_tracks; t++) {
-            p->track_selected[t] = (t == ins_idx);
-        }
-        g_last_clicked_track_idx = ins_idx;
-    } else {
-        p->track_selected[ins_idx] = false;
-    }
-
-    g_track_hidden[tab][ins_idx]         = false;
-    g_track_color_idx[tab][ins_idx]      = 0;
+    p->track_selected[ins_idx] = true;
+    g_track_hidden[tab][ins_idx] = false;
+    g_track_color_idx[tab][ins_idx] = 0;
     g_track_peak_color_idx[tab][ins_idx] = 0;
-    g_track_locked[tab][ins_idx]         = false;
-    g_track_lock_lr_only[tab][ins_idx]   = false;
-    g_track_lock_ud_only[tab][ins_idx]   = false;
-    g_track_inf_db[tab][ins_idx]         = false;
-    g_track_pre_inf_db[tab][ins_idx]     = 0.0f;
-    g_app_track_vol[tab][ins_idx]        = 100.0f;
+    g_track_locked[tab][ins_idx] = false;
+    g_track_lock_lr_only[tab][ins_idx] = false;
+    g_track_lock_ud_only[tab][ins_idx] = false;
+    g_track_inf_db[tab][ins_idx] = false;
+    g_track_pre_inf_db[tab][ins_idx] = 0.0f;
+    g_app_track_vol[tab][ins_idx] = 100.0f;
+    g_last_clicked_track_idx = ins_idx;
 
-    record_project_change("Added New Track", true);
+    record_project_change("Added Track Below Selected Track", true);
 }
 
 // Copies all selected items into the internal clipboard
@@ -2293,7 +2064,7 @@ typedef struct {
 
 static ThemeManagerState g_theme = {
     false,
-    { 340, 88, 648, 396 },
+    { 340, 88, 580, 420 },
     false, 0, 0,
     205, 138, 72, 255,
     29.77f, 0.6488f, 0.8039f,
@@ -2334,7 +2105,7 @@ static bool g_mouse_win_dragging = false;
 static int  g_mouse_drag_off_x = 0;
 static int  g_mouse_drag_off_y = 0;
 static bool g_time_jump_open = false;
-static SDL_Rect g_time_jump_rect = { 510, 82, 308, 124 };
+static SDL_Rect g_time_jump_rect = { 510, 82, 268, 124 };
 static bool g_time_jump_dragging = false;
 static int  g_time_jump_drag_off_x = 0;
 static int  g_time_jump_drag_off_y = 0;
@@ -2346,62 +2117,7 @@ static SDL_Texture  *g_video_ext_tex = NULL;
 static int           g_video_ext_tex_w = 0;
 static int           g_video_ext_tex_h = 0;
 
-#ifndef DAW_TRACK_LOCK_VARS_DEFINED
-#define DAW_TRACK_LOCK_VARS_DEFINED
-// Per-tab & Per-track Lock State + Main Lock Two-Section Popup Window (All Track | Selected Track)
-static bool g_track_locked[MAX_TABS][MAX_TRACKS];
-static bool g_track_lock_lr_only[MAX_TABS][MAX_TRACKS];
-static bool g_track_lock_ud_only[MAX_TABS][MAX_TRACKS];
-static bool g_lock_opt_full[MAX_TABS]            = { false };
-static bool g_lock_opt_complete_unlock[MAX_TABS] = { false };
-static bool g_lock_opt_prevent_lr[MAX_TABS]      = { false };
-static bool g_lock_opt_prevent_ud[MAX_TABS]      = { false };
-static bool g_lock_popup_open = false;
-static SDL_Rect g_lock_win_rect = { 260, 140, 740, 256 };
-static bool g_lock_win_dragging = false;
-static int  g_lock_drag_off_x = 0;
-static int  g_lock_drag_off_y = 0;
-
-static inline bool is_track_locked_tab(int tab, int trk) {
-    if (tab < 0 || tab >= MAX_TABS || trk < 0 || trk >= MAX_TRACKS) return false;
-    return g_track_locked[tab][trk];
-}
-static inline bool is_track_full_locked_tab(int tab, int trk) {
-    if (!is_track_locked_tab(tab, trk)) return false;
-    return (!g_track_lock_lr_only[tab][trk] && !g_track_lock_ud_only[tab][trk]);
-}
-static inline bool is_track_lr_locked_tab(int tab, int trk) {
-    if (!is_track_locked_tab(tab, trk)) return false;
-    return is_track_full_locked_tab(tab, trk) || g_track_lock_lr_only[tab][trk];
-}
-static inline bool is_track_ud_locked_tab(int tab, int trk) {
-    if (!is_track_locked_tab(tab, trk)) return false;
-    return is_track_full_locked_tab(tab, trk) || g_track_lock_ud_only[tab][trk];
-}
-
-// Draws a crisp Padlock symbol icon at (cx, cy)
-static inline void draw_lock_symbol_icon(SDL_Renderer *ren, int cx, int cy, bool is_locked, SDL_Color col) {
-    SDL_SetRenderDrawColor(ren, col.r, col.g, col.b, col.a);
-    // Shackle arch at top
-    SDL_RenderDrawLine(ren, cx + 4, cy + 1, cx + 8, cy + 1);
-    SDL_RenderDrawLine(ren, cx + 3, cy + 2, cx + 3, cy + 5);
-    if (is_locked) {
-        SDL_RenderDrawLine(ren, cx + 9, cy + 2, cx + 9, cy + 5);
-    } else {
-        SDL_RenderDrawLine(ren, cx + 9, cy + 2, cx + 9, cy + 3);
-    }
-    // Padlock body
-    SDL_Rect body = { cx + 2, cy + 5, 9, 7 };
-    if (is_locked) {
-        SDL_RenderFillRect(ren, &body);
-        SDL_SetRenderDrawColor(ren, 18, 16, 14, 255);
-        SDL_RenderDrawLine(ren, cx + 6, cy + 7, cx + 6, cy + 9);
-    } else {
-        SDL_RenderDrawRect(ren, &body);
-    }
-}
-#endif
-#endif
+#endif // DAW_14POINT_STATE_DEFINED
 
 // Anchor indices for standard Shift+Click range selection on tracks and clips
 
@@ -2525,30 +2241,6 @@ static inline void init_default_recording_folder(void) {
     }
 }
 
-#ifndef DAW_SHARED_STABILITY_VARS_DEFINED
-#define DAW_SHARED_STABILITY_VARS_DEFINED
-static int g_last_clicked_track_idx = -1;
-static int g_last_clicked_item_idx = -1;
-// ================= APP STABILITY & PROCESSING WAIT MODAL STATE =================
-static volatile bool g_engine_processing = false;
-static bool   g_processing_popup_open = false;
-static char   g_processing_title[128] = "Processing, please wait...";
-static char   g_processing_detail[160] = "Stabilizing audio timeline...";
-static int    g_processing_pct = 100;
-static Uint32 g_processing_close_at_ticks = 0;
-
-// Track Delete Confirmation Modal State (when deleting a track that contains clips)
-static bool g_track_delete_prompt_open = false;
-
-// Open Project on Dirty Tab Save Confirmation Flag
-static bool g_save_prompt_open_project_after = false;
-
-// Tools -> Record Submenu State (Rec | Browse [with folder symbol])
-static bool g_submenu_tools_record_open = false;
-
-// Track vs Clip Copy/Paste Mode Flag
-static bool g_last_copied_is_track = false;
-#endif
 
 // ================= LUA & PYTHON CUSTOM SCRIPT POPUP WINDOW STATE =================
 #define MAX_SCRIPT_POPUP_CONTROLS 8
@@ -8942,7 +8634,7 @@ static bool daw_is_peak_ptr_referenced_in_active_tabs(const PeakBin *pk) {
     return false;
 }
 
-static void daw_evict_unused_shared_peaks_after_tab_close(void) {
+void daw_evict_unused_shared_peaks_after_tab_close(void) {
     for (int sp = 0; sp < MAX_SHARED_PEAK_ENTRIES; sp++) {
         if (g_shared_peak_pool[sp].in_use) {
             PeakBin *pk = g_shared_peak_pool[sp].peaks;
@@ -8957,35 +8649,11 @@ static void daw_evict_unused_shared_peaks_after_tab_close(void) {
             }
         }
     }
+    g_engine_processing = false;
 }
 
-void daw_init_tab_defaults_main(int idx, const char *title) {
-    if (idx < 0 || idx >= MAX_TABS) return;
-    ProjectTab *p = &g_daw.tabs[idx];
-    memset(p, 0, offsetof(ProjectTab, undo_mgr));
-    p->undo_mgr.head = -1;
-    p->undo_mgr.count = 0;
-    snprintf(p->project_name, sizeof(p->project_name), "%s", title ? title : "Project");
-    p->num_tracks = 4;
-    p->pixels_per_second = 80.0f;
-    p->project_duration_sec = 300.0;
-    p->show_marker_lane = false;
-    p->is_dirty = false;
-    p->video = (SimpleVideoPlayer){ .rect = { 650, 160, 480, 310 }, .is_open = false, .video_stream_idx = -1 };
-
-    for (int t = 0; t < MAX_TRACKS; t++) {
-        p->tracks[t].id = t + 1;
-        p->tracks[t].volume = 1.0f;
-        p->track_db[t] = 0.0f;
-        p->track_heights[t] = 84;
-        snprintf(p->track_names[t], sizeof(p->track_names[t]), "Track %d", t + 1);
-    }
-}
-
-// REAPER-style clean single-tab close: executes 100% in main.c so g_shared_peak_pool and g_daw are never split across TUs
-void daw_force_close_tab_main(int idx) {
+void daw_prepare_tab_close_state(int idx) {
     if (idx < 0 || idx >= g_daw.num_tabs || idx >= MAX_TABS) return;
-
     if (g_rec.is_recording && (idx == g_daw.active_tab || g_daw.num_tabs <= 1)) {
         g_rec.is_recording = false;
         if (g_rec.capture_dev > 0) {
@@ -9001,93 +8669,22 @@ void daw_force_close_tab_main(int idx) {
             g_rec.raw_cache_file = NULL;
         }
     }
-
     g_engine_processing = true;
     g_daw.tabs[idx].is_playing = false;
     if (g_video_pinned_global && (idx == g_daw.active_tab || g_daw.num_tabs <= 1)) {
         g_video_pinned_global = false;
         destroy_external_pinned_video_window();
     }
-    close_video(&g_daw.tabs[idx].video);
-
-    if (g_daw.audio_device > 0) SDL_LockAudioDevice(g_daw.audio_device);
-
-    ProjectTab *target = &g_daw.tabs[idx];
-    target->is_playing = false;
-    for (int i = 0; i < target->num_items && i < MAX_ITEMS; i++) {
-        if (target->items[i].raw_file_handle) {
-            fclose(target->items[i].raw_file_handle);
-            target->items[i].raw_file_handle = NULL;
-        }
-        if (target->items[i].peaks) {
-            if (!daw_is_pooled_peaks(target->items[i].peaks)) {
-                char anon_key[64];
-                snprintf(anon_key, sizeof(anon_key), "__unpooled_pk_%p", (void *)target->items[i].peaks);
-                daw_register_shared_peaks(
-                    target->items[i].raw_audio_path[0] ? target->items[i].raw_audio_path : anon_key,
-                    target->items[i].peaks,
-                    target->items[i].peak_count,
-                    target->items[i].file_total_duration,
-                    target->items[i].has_video
-                );
-            }
-            target->items[i].peaks = NULL;
-        }
-    }
-    target->num_items = 0;
-
-    if (g_daw.num_tabs <= 1) {
-        daw_init_tab_defaults_main(0, "Project 1");
-        g_daw.num_tabs = 1;
-        g_daw.active_tab = 0;
-        if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
-
-        daw_shift_per_tab_arrays_on_close(0, true);
-        daw_evict_unused_shared_peaks_after_tab_close();
-        g_engine_processing = false;
-        return;
-    }
-
-    for (int t = idx; t < g_daw.num_tabs - 1; t++) {
-        memmove(&g_daw.tabs[t], &g_daw.tabs[t + 1], offsetof(ProjectTab, undo_mgr));
-        g_daw.tabs[t].undo_mgr.head = -1;
-        g_daw.tabs[t].undo_mgr.count = 0;
-    }
-    int vacated_slot = g_daw.num_tabs - 1;
-    daw_init_tab_defaults_main(vacated_slot, "Project");
-    g_daw.num_tabs--;
-
-    if (g_daw.active_tab > idx) {
-        g_daw.active_tab--;
-    } else if (g_daw.active_tab >= g_daw.num_tabs) {
-        g_daw.active_tab = g_daw.num_tabs - 1;
-    }
-    if (g_daw.active_tab < 0) g_daw.active_tab = 0;
-
-    if (g_daw.audio_device > 0) SDL_UnlockAudioDevice(g_daw.audio_device);
-
-    daw_shift_per_tab_arrays_on_close(idx, false);
-    daw_evict_unused_shared_peaks_after_tab_close();
-    g_engine_processing = false;
 }
 
-void daw_request_close_tab_main(int idx) {
-    if (idx < 0 || idx >= g_daw.num_tabs) return;
+bool daw_is_tab_unmodified_setup(int idx) {
+    if (idx < 0 || idx >= g_daw.num_tabs || idx >= MAX_TABS) return false;
+    return ((g_tab_needs_project_setup[idx] || g_daw.tabs[idx].project_path[0] == '\0') &&
+            g_daw.tabs[idx].num_items == 0);
+}
 
-    if ((g_tab_needs_project_setup[idx] || g_daw.tabs[idx].project_path[0] == '\0') &&
-        g_daw.tabs[idx].num_items == 0) {
-        g_daw.tabs[idx].is_dirty = false;
-    }
-
-    if (g_daw.tabs[idx].is_dirty) {
-        g_daw.active_tab = idx;
-        g_daw.save_prompt_open = true;
-        g_daw.save_prompt_tab_idx = idx;
-        g_daw.save_prompt_quit_app = false;
-        g_save_prompt_open_project_after = false;
-    } else {
-        daw_force_close_tab_main(idx);
-    }
+void daw_clear_open_project_after_save_flag(void) {
+    g_save_prompt_open_project_after = false;
 }
 
 // Requirement 1 & 2: Cleans up temporary and .cache files when a tab or the complete application closes
@@ -9128,45 +8725,6 @@ void daw_cleanup_temp_media_for_tab(int tab_idx, bool delete_all_temp_files) {
 
     if (delete_all_temp_files) {
         daw_purge_all_cache_folder();
-    }
-}
-
-void daw_handle_save_modal_choice_main(int choice, bool *running) {
-    int t_idx = g_daw.save_prompt_tab_idx;
-    bool quit_after = g_daw.save_prompt_quit_app;
-
-    g_daw.save_prompt_open = false;
-    g_daw.save_prompt_tab_idx = -1;
-    g_daw.save_prompt_quit_app = false;
-
-    if (choice == 1) {
-        if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
-            save_project_file();
-            g_daw.tabs[t_idx].is_dirty = false;
-        }
-    } else if (choice == 2) {
-        if (quit_after) {
-            if (t_idx >= 0 && t_idx < g_daw.num_tabs) {
-                g_daw.tabs[t_idx].is_dirty = false;
-            }
-            for (int t = 0; t < g_daw.num_tabs; t++) {
-                if ((g_tab_needs_project_setup[t] || g_daw.tabs[t].project_path[0] == '\0') &&
-                    g_daw.tabs[t].num_items == 0) {
-                    g_daw.tabs[t].is_dirty = false;
-                }
-                if (g_daw.tabs[t].is_dirty) {
-                    g_daw.active_tab = t;
-                    g_daw.save_prompt_open = true;
-                    g_daw.save_prompt_tab_idx = t;
-                    g_daw.save_prompt_quit_app = true;
-                    return;
-                }
-            }
-            daw_cleanup_temp_media_for_tab(-1, true);
-            if (running) *running = false;
-        } else {
-            daw_force_close_tab_main(t_idx);
-        }
     }
 }
 
@@ -11520,6 +11078,7 @@ static bool is_cursor_captured_by_popup_or_menu(ProjectTab *p, int mx, int my, S
 }
 
 int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return 1;
 
     SDL_Window *win = SDL_CreateWindow(
