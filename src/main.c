@@ -1881,6 +1881,14 @@ static void insert_new_track_below_selected(ProjectTab *p) {
     if (ins_idx < 0) ins_idx = 0;
     if (ins_idx > p->num_tracks) ins_idx = p->num_tracks;
 
+    // Inherit current vertical zoom track height from selected track (or existing tracks)
+    int cur_zoom_h = 84;
+    if (insert_after >= 0 && insert_after < p->num_tracks && p->track_heights[insert_after] >= 40) {
+        cur_zoom_h = p->track_heights[insert_after];
+    } else if (p->num_tracks > 0 && p->track_heights[0] >= 40) {
+        cur_zoom_h = p->track_heights[0];
+    }
+
     push_undo_state();
     for (int t = 0; t < p->num_tracks; t++) p->track_selected[t] = false;
 
@@ -1910,7 +1918,7 @@ static void insert_new_track_below_selected(ProjectTab *p) {
     p->tracks[ins_idx].id = ins_idx + 1;
     snprintf(p->track_names[ins_idx], 64, "Track %d", p->num_tracks);
     p->track_db[ins_idx] = 0.0f;
-    p->track_heights[ins_idx] = 84;
+    p->track_heights[ins_idx] = cur_zoom_h;
     p->track_selected[ins_idx] = true;
     g_track_hidden[tab][ins_idx] = false;
     g_track_color_idx[tab][ins_idx] = 0;
@@ -2983,6 +2991,13 @@ static void show_processing_wait_modal(SDL_Renderer *ren, SDL_Window *win, const
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_DROPFILE && ev.drop.file) SDL_free(ev.drop.file);
+        }
+        SDL_SetRenderTarget(ren, NULL);
+        SDL_RenderSetClipRect(ren, NULL);
+        SDL_SetRenderDrawColor(ren, 26, 26, 26, 255);
+        SDL_RenderClear(ren);
+        if (g_active_tl_cache_tex) {
+            SDL_RenderCopy(ren, g_active_tl_cache_tex, NULL, NULL);
         }
         render_processing_wait_overlay(ren, win);
         SDL_RenderPresent(ren);
@@ -4691,7 +4706,10 @@ static void sync_and_render_external_pinned_video_window(ProjectTab *p, SDL_Wind
         int gmx = 0, gmy = 0;
         Uint32 mbuttons = SDL_GetGlobalMouseState(&gmx, &gmy);
         if ((mbuttons & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0) {
-            SDL_SetWindowPosition(g_video_ext_win, gmx - g_video_ext_drag_off_x, gmy - g_video_ext_drag_off_y);
+            int new_wx = gmx - g_video_ext_drag_off_x;
+            int new_wy = gmy - g_video_ext_drag_off_y;
+            if (new_wy < 0) new_wy = 0;
+            SDL_SetWindowPosition(g_video_ext_win, new_wx, new_wy);
         } else {
             g_video_ext_dragging = false;
         }
@@ -4708,9 +4726,15 @@ static void sync_and_render_external_pinned_video_window(ProjectTab *p, SDL_Wind
 
     // Top control bar inside global pinned window
     SDL_Rect v_bar = { 0, 0, ew, 24 };
-    SDL_SetRenderDrawColor(g_video_ext_ren, 36, 36, 36, 255);
+    SDL_SetRenderDrawColor(g_video_ext_ren, 44, 38, 34, 255);
     SDL_RenderFillRect(g_video_ext_ren, &v_bar);
-    draw_brown_border_rect(g_video_ext_ren, &v_bar, false, false);
+    draw_brown_border_rect(g_video_ext_ren, &v_bar, true, false);
+    SDL_SetRenderDrawColor(g_video_ext_ren, c_accent.r, c_accent.g, c_accent.b, 255);
+    for (int gl = 0; gl < 3; gl++) {
+        int gy = 8 + gl * 4;
+        SDL_RenderDrawLine(g_video_ext_ren, 8, gy, 20, gy);
+    }
+    draw_text(g_video_ext_ren, "Video", 26, 6, c_white);
 
     // Pin button (active — click to unpin back into app)
     int pin_btn_x = ew - 68;
@@ -5434,7 +5458,7 @@ static bool render_range_to_wav_file(ProjectTab *p, SDL_Renderer *ren, const cha
         }
         written += (uint32_t)cur_n;
 
-        if ((written & 8191) == 0 || written == total_out_frames) {
+        if ((written & 2047) == 0 || written == total_out_frames) {
             int cur_p = render_pct_s + (int)(((double)written / (double)total_out_frames) * (pct_end - render_pct_s));
             update_export_progress_ui(ren, cur_p, two_pass ? "Pass 2/2: Rendering master audio stream..." : "Rendering audio stream...", false);
         }
@@ -5592,6 +5616,9 @@ static bool encode_wav_to_mp3_native_ffmpeg(SDL_Renderer *ren, const char *wav_s
     AVPacket *in_pkt = av_packet_alloc();
     AVPacket *out_pkt = av_packet_alloc();
     int64_t next_pts = 0;
+    int64_t mp3_pkt_cnt = 0;
+    int64_t est_tot_samples = (in_fmt->duration > 0) ? ((in_fmt->duration * enc_ctx->sample_rate) / AV_TIME_BASE) : (enc_ctx->sample_rate * 60);
+    if (est_tot_samples < 1) est_tot_samples = 1;
 
     while (av_read_frame(in_fmt, in_pkt) >= 0) {
         if (in_pkt->stream_index == a_idx) {
@@ -5612,6 +5639,13 @@ static bool encode_wav_to_mp3_native_ffmpeg(SDL_Renderer *ren, const char *wav_s
             }
         }
         av_packet_unref(in_pkt);
+        mp3_pkt_cnt++;
+        if ((mp3_pkt_cnt & 15) == 0) {
+            double frac = (double)next_pts / (double)est_tot_samples;
+            if (frac > 0.99) frac = 0.99;
+            int cur_p = pct_start + (int)(frac * (double)(pct_end - pct_start));
+            update_export_progress_ui(ren, cur_p, "Encoding MP3 audio stream...", false);
+        }
     }
 
     avcodec_send_frame(enc_ctx, NULL);
@@ -6149,7 +6183,7 @@ static bool render_timeline_mp4_native_ffmpeg(ProjectTab *p, SDL_Renderer *ren,
             drain_encoder_packets(v_ctx, v_st, oc, enc_pkt);
         }
 
-        if ((vf & 3) == 0 || vf + 1 == total_v_frames) {
+        if (true) {
             int cur_p = encode_pct_start + (int)(((double)(vf + 1) / (double)total_v_frames) * (v_pct_end - encode_pct_start));
             update_export_progress_ui(ren, cur_p,
                 two_pass ? "Pass 2/2: Encoding H.264 video & AAC audio..." : "Encoding H.264 video & AAC audio...",
@@ -6175,6 +6209,8 @@ static bool render_timeline_mp4_native_ffmpeg(ProjectTab *p, SDL_Renderer *ren,
 
         AVPacket *w_pkt = av_packet_alloc();
         int64_t a_pts = 0;
+        int64_t aac_pkt_cnt = 0;
+        int64_t est_aac_samples = (int64_t)(total_dur * (double)a_ctx->sample_rate + 1.0);
         while (av_read_frame(wav_fmt, w_pkt) >= 0) {
             if (w_pkt->stream_index == wav_st_idx) {
                 if (avcodec_send_packet(wav_dec_ctx, w_pkt) >= 0) {
@@ -6198,6 +6234,13 @@ static bool render_timeline_mp4_native_ffmpeg(ProjectTab *p, SDL_Renderer *ren,
                 }
             }
             av_packet_unref(w_pkt);
+            aac_pkt_cnt++;
+            if ((aac_pkt_cnt & 15) == 0) {
+                double frac = (double)a_pts / (double)est_aac_samples;
+                if (frac > 0.99) frac = 0.99;
+                int cur_p = v_pct_end + (int)(frac * (double)(pct_end - v_pct_end));
+                update_export_progress_ui(ren, cur_p, "Muxing AAC audio stream into MP4 container...", false);
+            }
         }
         avcodec_send_frame(a_ctx, NULL);
         drain_encoder_packets(a_ctx, a_st, oc, enc_pkt);
@@ -6692,6 +6735,14 @@ static void render_import_progress_popup(SDL_Renderer *ren, SDL_Window *win,
     int win_w = 1280, win_h = 720;
     SDL_GetWindowSize(win, &win_w, &win_h);
 
+    SDL_SetRenderTarget(ren, NULL);
+    SDL_RenderSetClipRect(ren, NULL);
+    SDL_SetRenderDrawColor(ren, 26, 26, 26, 255);
+    SDL_RenderClear(ren);
+    if (g_active_tl_cache_tex) {
+        SDL_RenderCopy(ren, g_active_tl_cache_tex, NULL, NULL);
+    }
+
     int pw = 460, ph = 152;
     int px = (win_w - pw) / 2;
     int py = (win_h - ph) / 2;
@@ -7134,7 +7185,17 @@ static void daw_poll_bg_prepared_media_on_main_thread(void) {
 // Ensures all clips in ProjectTab `p` have their .raw audio handles ready before offline Export / Glue / Reverse / Normalize
 static void daw_ensure_all_project_raw_audio_ready(ProjectTab *p, SDL_Renderer *ren, SDL_Window *win) {
     if (!p) return;
-    if (g_bg_media_running && g_bg_media_thread) {
+    if (g_bg_media_thread) {
+        while (g_bg_media_running) {
+            SDL_Event ev;
+            while (SDL_PollEvent(&ev)) {
+                if (ev.type == SDL_DROPFILE && ev.drop.file) SDL_free(ev.drop.file);
+            }
+            if (g_export.is_open && g_export.is_rendering && ren) {
+                update_export_progress_ui(ren, g_export.progress_pct, "Preparing audio streams for export...", false);
+            }
+            SDL_Delay(15);
+        }
         SDL_WaitThread(g_bg_media_thread, NULL);
         g_bg_media_thread = NULL;
     }
@@ -7144,13 +7205,20 @@ static void daw_ensure_all_project_raw_audio_ready(ProjectTab *p, SDL_Renderer *
         if (!it->raw_file_handle && it->raw_audio_path[0]) {
             it->raw_file_handle = daw_fopen_LockFreeRead(it->raw_audio_path);
             if (!it->raw_file_handle && it->file_path[0]) {
+                SDL_Event ev;
+                while (SDL_PollEvent(&ev)) {
+                    if (ev.type == SDL_DROPFILE && ev.drop.file) SDL_free(ev.drop.file);
+                }
+                if (g_export.is_open && g_export.is_rendering && ren) {
+                    update_export_progress_ui(ren, g_export.progress_pct, "Preparing clip audio cache...", true);
+                }
                 BgMediaPrepTask task;
                 memset(&task, 0, sizeof(task));
                 strncpy(task.file_path, it->file_path, sizeof(task.file_path) - 1);
                 strncpy(task.raw_audio_path, it->raw_audio_path, sizeof(task.raw_audio_path) - 1);
                 daw_build_project_pk_path(it->file_path, task.proj_pk_path, sizeof(task.proj_pk_path));
                 daw_build_pk_cache_path(hash_path(it->file_path), task.cache_pk_path, sizeof(task.cache_pk_path));
-                (void)ren; (void)win;
+                (void)win;
                 daw_bg_decode_single_media_task(&task);
                 it->raw_file_handle = daw_fopen_LockFreeRead(it->raw_audio_path);
             }
@@ -7809,9 +7877,6 @@ static int64_t get_file_byte_size_helper(const char *path) {
 static bool copy_binary_file_to_dest(const char *src_path, const char *dst_path) {
     if (!src_path || !src_path[0] || !dst_path || !dst_path[0]) return false;
     if (daw_paths_equal_norm(src_path, dst_path)) return true;
-#ifdef _WIN32
-    if (CopyFileA(src_path, dst_path, FALSE)) return true;
-#endif
     FILE *in = fopen(src_path, "rb");
     if (!in) return false;
     FILE *out = fopen(dst_path, "wb");
@@ -7819,13 +7884,21 @@ static bool copy_binary_file_to_dest(const char *src_path, const char *dst_path)
         fclose(in);
         return false;
     }
-    char buf[65536];
+    static char buf[262144];
     size_t n;
+    size_t chunks = 0;
     bool ok = true;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         if (fwrite(buf, 1, n, out) != n) {
             ok = false;
             break;
+        }
+        chunks++;
+        if ((chunks & 7) == 0) {
+            SDL_Event ev;
+            while (SDL_PollEvent(&ev)) {
+                if (ev.type == SDL_DROPFILE && ev.drop.file) SDL_free(ev.drop.file);
+            }
         }
     }
     fflush(out);
@@ -7923,8 +7996,9 @@ static void import_single_media_item(ProjectTab *p, SDL_Renderer *ren, SDL_Windo
     if (!p || !filepath || p->num_items >= MAX_ITEMS) return;
     if (target_trk < 0) target_trk = 0;
     while (target_trk >= p->num_tracks && p->num_tracks < MAX_TRACKS) {
+        int inherit_h = (p->num_tracks > 0 && p->track_heights[p->num_tracks - 1] >= 40) ? p->track_heights[p->num_tracks - 1] : 84;
         int nt = p->num_tracks++;
-        p->track_heights[nt] = 84;
+        p->track_heights[nt] = inherit_h;
         p->tracks[nt].id = nt + 1;
         p->tracks[nt].volume = 1.0f;
         snprintf(p->track_names[nt], 64, "Track %d", nt + 1);
@@ -7984,8 +8058,9 @@ static void execute_multi_media_import(ProjectTab *p, SDL_Renderer *ren, SDL_Win
         if (g_multi_import.mode == MULTI_IMPORT_SEPARATE_TRACKS) {
             trk = base_trk + k;
             while (trk >= p->num_tracks && p->num_tracks < MAX_TRACKS) {
+                int inherit_h = (p->num_tracks > 0 && p->track_heights[p->num_tracks - 1] >= 40) ? p->track_heights[p->num_tracks - 1] : 84;
                 int nt = p->num_tracks++;
-                p->track_heights[nt] = 84;
+                p->track_heights[nt] = inherit_h;
                 p->tracks[nt].id = nt + 1;
                 p->tracks[nt].volume = 1.0f;
                 snprintf(p->track_names[nt], 64, "Track %d", nt + 1);
@@ -11096,6 +11171,14 @@ int main(int argc, char *argv[]) {
     signal(SIGABRT, daw_fault_signal_handler);
 
 #ifdef _WIN32
+    {
+        HMODULE hUser32 = GetModuleHandleA("user32.dll");
+        if (hUser32) {
+            typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
+            SetProcessDPIAwareFn fnDPI = (SetProcessDPIAwareFn)(void*)GetProcAddress(hUser32, "SetProcessDPIAware");
+            if (fnDPI) fnDPI();
+        }
+    }
     SDL_SysWMinfo wmInfo;
     SDL_VERSION(&wmInfo.version);
     if (SDL_GetWindowWMInfo(win, &wmInfo)) {
@@ -11330,9 +11413,13 @@ int main(int argc, char *argv[]) {
                 if (is_any_popup_or_dropdown_open() || is_cursor_captured_by_popup_or_menu(p, mx, my, NULL)) continue;
                 SDL_Keymod mod = SDL_GetModState();
                 if (mod & KMOD_CTRL) {
-                    // Ctrl+Mousewheel: View: Zoom vertically (mousewheel)
-                    for (int t = 0; t < p->num_tracks; t++) {
-                        int nh = p->track_heights[t] + e.wheel.y * 10;
+                    // Ctrl+Mousewheel: View: Zoom vertically (mousewheel) and keep all track slots synchronized
+                    int base_h = (p->num_tracks > 0 && p->track_heights[0] >= 40) ? p->track_heights[0] : 84;
+                    int def_nh = base_h + e.wheel.y * 10;
+                    if (def_nh < 50) def_nh = 50;
+                    if (def_nh > 260) def_nh = 260;
+                    for (int t = 0; t < MAX_TRACKS; t++) {
+                        int nh = (t < p->num_tracks && p->track_heights[t] >= 40) ? (p->track_heights[t] + e.wheel.y * 10) : def_nh;
                         if (nh < 50) nh = 50;
                         if (nh > 260) nh = 260;
                         p->track_heights[t] = nh;
@@ -12243,6 +12330,13 @@ int main(int argc, char *argv[]) {
                             g_video_ext_drag_off_x = gmx - wx_p;
                             g_video_ext_drag_off_y = gmy - wy_p;
                         }
+                    } else if (!g_video_ext_maximized && mx > 10 && mx < ew - 10 && my > 24 && my < eh - 10) {
+                        int gmx = 0, gmy = 0, wx_p = 0, wy_p = 0;
+                        SDL_GetGlobalMouseState(&gmx, &gmy);
+                        SDL_GetWindowPosition(g_video_ext_win, &wx_p, &wy_p);
+                        g_video_ext_dragging = true;
+                        g_video_ext_drag_off_x = gmx - wx_p;
+                        g_video_ext_drag_off_y = gmy - wy_p;
                     }
                     continue;
                 }
@@ -13342,6 +13436,13 @@ int main(int argc, char *argv[]) {
 
                 if (p->video.is_open && !g_video_pinned_global) {
                     int v_tab = get_valid_tab_idx();
+                    if (!g_video_fullscreen[v_tab]) {
+                        int min_vid_y = 2;
+                        if (p->video.rect.y < min_vid_y) p->video.rect.y = min_vid_y;
+                        if (p->video.rect.y > win_h - 48) p->video.rect.y = win_h - 48;
+                        if (p->video.rect.x < 4) p->video.rect.x = 4;
+                        if (p->video.rect.x + p->video.rect.w > win_w - 4) p->video.rect.x = fmax(4, win_w - p->video.rect.w - 4);
+                    }
                     VideoResizeEdge hit_edge = g_video_fullscreen[v_tab]
                                                ? VID_RESIZE_NONE
                                                : hit_test_video_resize_edge(&p->video.rect, mx, my);
@@ -13382,9 +13483,14 @@ int main(int argc, char *argv[]) {
                                 } else {
                                     p->video.rect = (SDL_Rect){ 680, 110, 480, 294 };
                                 }
+                                if (p->video.rect.y < TABBAR_HEIGHT + TOPBAR_HEIGHT + 2) {
+                                    p->video.rect.y = TABBAR_HEIGHT + TOPBAR_HEIGHT + 2;
+                                }
                             }
-                        } else if (my <= p->video.rect.y + 24) {
-                            if (e.button.clicks >= 2) {
+                        } else {
+                            // Allow dragging the Video Monitor from either its top bar OR its video canvas body
+                            // (double-clicking the top bar toggles fullscreen)
+                            if (my <= p->video.rect.y + 24 && e.button.clicks >= 2) {
                                 if (!g_video_fullscreen[v_tab]) {
                                     g_video_saved_rect[v_tab] = p->video.rect;
                                     g_video_fullscreen[v_tab] = true;
@@ -13395,6 +13501,9 @@ int main(int argc, char *argv[]) {
                                         p->video.rect = g_video_saved_rect[v_tab];
                                     } else {
                                         p->video.rect = (SDL_Rect){ 680, 110, 480, 294 };
+                                    }
+                                    if (p->video.rect.y < 2) {
+                                        p->video.rect.y = 2;
                                     }
                                 }
                             } else if (!g_video_fullscreen[v_tab]) {
@@ -14719,8 +14828,15 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 if (p->video.is_dragging) {
-                    p->video.rect.x = mx - p->video.drag_x;
-                    p->video.rect.y = my - p->video.drag_y;
+                    int min_vid_y = 2;
+                    int nx = mx - p->video.drag_x;
+                    int ny = my - p->video.drag_y;
+                    if (ny < min_vid_y) ny = min_vid_y;
+                    if (ny > win_h - 48) ny = win_h - 48;
+                    if (nx < 4) nx = 4;
+                    if (nx + p->video.rect.w > win_w - 4) nx = fmax(4, win_w - p->video.rect.w - 4);
+                    p->video.rect.x = nx;
+                    p->video.rect.y = ny;
                     SDL_SetCursor(g_cursor_arrow);
                     continue;
                 }
@@ -15151,6 +15267,20 @@ int main(int argc, char *argv[]) {
         }
 
         // ================= RENDERING =================
+        static SDL_Texture *g_full_ui_backdrop_tex = NULL;
+        static int          g_full_ui_backdrop_w = 0;
+        static int          g_full_ui_backdrop_h = 0;
+        if (win_w > 0 && win_h > 0 && (!g_full_ui_backdrop_tex || g_full_ui_backdrop_w != win_w || g_full_ui_backdrop_h != win_h)) {
+            if (g_full_ui_backdrop_tex) SDL_DestroyTexture(g_full_ui_backdrop_tex);
+            g_full_ui_backdrop_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, win_w, win_h);
+            g_full_ui_backdrop_w = win_w;
+            g_full_ui_backdrop_h = win_h;
+        }
+        bool using_full_backdrop = (g_full_ui_backdrop_tex && SDL_SetRenderTarget(ren, g_full_ui_backdrop_tex) == 0);
+        if (using_full_backdrop) {
+            g_active_tl_cache_tex = g_full_ui_backdrop_tex;
+        }
+
         SDL_SetRenderDrawColor(ren, 26, 26, 26, 255);
         SDL_RenderClear(ren);
 
@@ -15653,7 +15783,7 @@ int main(int argc, char *argv[]) {
         if (win_w > 0 && win_h > 0 && (!g_timeline_cache_tex || g_timeline_cache_w != win_w || g_timeline_cache_h != win_h)) {
             if (g_timeline_cache_tex) SDL_DestroyTexture(g_timeline_cache_tex);
             g_timeline_cache_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, win_w, win_h);
-            g_active_tl_cache_tex = g_timeline_cache_tex;
+            if (!g_full_ui_backdrop_tex) g_active_tl_cache_tex = g_timeline_cache_tex;
             g_timeline_cache_w = win_w;
             g_timeline_cache_h = win_h;
             g_timeline_cache_hash = 0;
@@ -16154,7 +16284,7 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
         if (use_tl_target) {
             SDL_RenderSetClipRect(ren, NULL);
-            SDL_SetRenderTarget(ren, NULL);
+            SDL_SetRenderTarget(ren, using_full_backdrop ? g_full_ui_backdrop_tex : NULL);
             g_timeline_cache_hash = tl_hash;
         }
         } // end if (need_tl_redraw)
@@ -16311,6 +16441,14 @@ int main(int argc, char *argv[]) {
         SDL_SetRenderDrawColor(ren, 62, 48, 36, 255);
         SDL_RenderFillRect(ren, &thumb_v);
         draw_brown_border_rect(ren, &thumb_v, false, false);
+
+        if (using_full_backdrop) {
+            SDL_RenderSetClipRect(ren, NULL);
+            SDL_SetRenderTarget(ren, NULL);
+            SDL_SetRenderDrawColor(ren, 26, 26, 26, 255);
+            SDL_RenderClear(ren);
+            SDL_RenderCopy(ren, g_full_ui_backdrop_tex, NULL, NULL);
+        }
 
         // Marker Right-Click Context Menu ("Delete Marker") with Brown Border
         if (g_marker_context_menu_open && g_marker_context_target_idx >= 0 && g_marker_context_target_idx < p->num_markers) {
@@ -16553,15 +16691,35 @@ int main(int argc, char *argv[]) {
             } else {
                 if (p->video.rect.w < 240) p->video.rect.w = 480;
                 if (p->video.rect.h < 159) p->video.rect.h = 294;
-                SDL_Rect s_rect = { p->video.rect.x + 4, p->video.rect.y + 4, p->video.rect.w, p->video.rect.h };
-                SDL_SetRenderDrawColor(ren, 0, 0, 0, 140);
+                int min_vid_y = 2;
+                if (p->video.rect.y < min_vid_y) p->video.rect.y = min_vid_y;
+                if (p->video.rect.y > win_h - 48) p->video.rect.y = win_h - 48;
+                if (p->video.rect.x < 4) p->video.rect.x = 4;
+                if (p->video.rect.x + p->video.rect.w > win_w - 4) {
+                    p->video.rect.x = fmax(4, win_w - p->video.rect.w - 4);
+                }
+                SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+                SDL_Rect s_rect = { p->video.rect.x + 5, p->video.rect.y + 5, p->video.rect.w, p->video.rect.h };
+                SDL_SetRenderDrawColor(ren, 0, 0, 0, 165);
                 SDL_RenderFillRect(ren, &s_rect);
+                SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
             }
 
             SDL_Rect v_bar = { p->video.rect.x, p->video.rect.y, p->video.rect.w, 24 };
-            SDL_SetRenderDrawColor(ren, 36, 36, 36, 255);
+            uint8_t vhr, vhg, vhb;
+            get_theme_surface_rgb(44, 0.32f, &vhr, &vhg, &vhb);
+            SDL_SetRenderDrawColor(ren, vhr, vhg, vhb, 255);
             SDL_RenderFillRect(ren, &v_bar);
-            draw_brown_border_rect(ren, &v_bar, false, false);
+            draw_brown_border_rect(ren, &v_bar, true, false);
+
+            // Clear top-edge drag grip lines + "Video" title so top bar is always clearly visible and easy to grab
+            SDL_Color v_acc = get_theme_accent_sdl_color();
+            SDL_SetRenderDrawColor(ren, v_acc.r, v_acc.g, v_acc.b, 255);
+            for (int gl = 0; gl < 3; gl++) {
+                int gy = p->video.rect.y + 8 + gl * 4;
+                SDL_RenderDrawLine(ren, p->video.rect.x + 8, gy, p->video.rect.x + 20, gy);
+            }
+            draw_text(ren, "Video", p->video.rect.x + 26, p->video.rect.y + 6, c_white);
 
 
             // Requirement 7: Pin Symbol Button on Video Monitor (Pin Active = visible globally outside app)
@@ -16628,6 +16786,7 @@ int main(int argc, char *argv[]) {
                 SDL_RenderCopy(ren, p->video.texture, NULL, &dst_rect);
             }
             draw_brown_border_rect(ren, &v_canvas, false, false);
+            draw_brown_border_rect(ren, &p->video.rect, true, false);
 
         }
 
