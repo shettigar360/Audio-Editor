@@ -41,7 +41,7 @@ typedef struct {
     double duration;
     double file_total_duration;
     char file_path[512];        // Original media path reference
-    char raw_audio_path[512];   // Cached demuxed raw PCM in temp folder
+    char raw_audio_path[512];   // Cached demuxed raw PCM in OS engine cache folder
     char label[128];
     PeakBin *peaks;             // Shared visual peak array (zero duplication across splits/undo)
     int peak_count;
@@ -95,6 +95,111 @@ static inline FILE* daw_fopen_LockFreeRead(const char *path) {
         setvbuf(fp, NULL, _IOFBF, 65536);
     }
     return fp;
+}
+
+// Returns persistent OS Temp engine cache folder (%TEMP%/AudioTrack_EngineCache)
+// so the software installation directory stays 100% clean (0 MB) while saved projects reopen instantly!
+static inline const char* daw_get_engine_cache_dir(void) {
+    static char s_cache_dir[512] = {0};
+    if (s_cache_dir[0] != '\0') return s_cache_dir;
+#ifdef _WIN32
+    char tmp_base[MAX_PATH] = {0};
+    DWORD n = GetTempPathA(MAX_PATH, tmp_base);
+    if (n > 0 && n < MAX_PATH - 36) {
+        size_t len = strlen(tmp_base);
+        while (len > 0 && (tmp_base[len - 1] == '\\' || tmp_base[len - 1] == '/')) {
+            tmp_base[--len] = '\0';
+        }
+        snprintf(s_cache_dir, sizeof(s_cache_dir), "%s\\AudioTrack_EngineCache", tmp_base);
+        CreateDirectoryA(s_cache_dir, NULL);
+        return s_cache_dir;
+    }
+    strcpy(s_cache_dir, "AudioTrack_EngineCache");
+    CreateDirectoryA(s_cache_dir, NULL);
+#else
+    strcpy(s_cache_dir, "/tmp/AudioTrack_EngineCache");
+    mkdir(s_cache_dir, 0777);
+#endif
+    return s_cache_dir;
+}
+
+static inline void daw_build_raw_cache_path(unsigned int h, char *out_path, size_t max_len) {
+    if (!out_path || max_len == 0) return;
+#ifdef _WIN32
+    snprintf(out_path, max_len, "%s\\%u.raw", daw_get_engine_cache_dir(), h);
+#else
+    snprintf(out_path, max_len, "%s/%u.raw", daw_get_engine_cache_dir(), h);
+#endif
+}
+
+static inline void daw_build_pk_cache_path(unsigned int h, char *out_path, size_t max_len) {
+    if (!out_path || max_len == 0) return;
+#ifdef _WIN32
+    snprintf(out_path, max_len, "%s\\%u.pk", daw_get_engine_cache_dir(), h);
+#else
+    snprintf(out_path, max_len, "%s/%u.pk", daw_get_engine_cache_dir(), h);
+#endif
+}
+
+// Builds REAPER-style sidecar peak file path (<Project>/media/<clipname>.pk) right alongside the media file
+static inline void daw_build_project_pk_path(const char *media_filepath, char *out_path, size_t max_len) {
+    if (!out_path || max_len == 0) return;
+    if (!media_filepath || !media_filepath[0]) {
+        out_path[0] = '\0';
+        return;
+    }
+    snprintf(out_path, max_len, "%s.pk", media_filepath);
+}
+
+// Writes a compact REAPER-style .pk waveform peak cache file to disk
+static inline bool daw_save_pk_file(const char *pk_path, const PeakBin *peaks,
+                                    int peak_count, double duration, bool has_video) {
+    if (!pk_path || !pk_path[0] || peak_count < 0 || duration <= 0.0) return false;
+    FILE *f_pk = fopen(pk_path, "wb");
+    if (!f_pk) return false;
+    uint32_t magic = DAW_PK_CACHE_MAGIC;
+    int has_vid_i = has_video ? 1 : 0;
+    fwrite(&magic, sizeof(uint32_t), 1, f_pk);
+    fwrite(&duration, sizeof(double), 1, f_pk);
+    fwrite(&has_vid_i, sizeof(int), 1, f_pk);
+    fwrite(&peak_count, sizeof(int), 1, f_pk);
+    if (peak_count > 0 && peaks) {
+        fwrite(peaks, sizeof(PeakBin), (size_t)peak_count, f_pk);
+    }
+    fclose(f_pk);
+    return true;
+}
+
+// Loads a REAPER-style .pk waveform peak cache file from disk in < 1 millisecond
+static inline bool daw_load_pk_file(const char *pk_path, PeakBin **out_peaks,
+                                    int *out_peak_count, double *out_duration, bool *out_has_video) {
+    if (!pk_path || !pk_path[0] || !out_peaks) return false;
+    *out_peaks = NULL;
+    FILE *chk_pk = fopen(pk_path, "rb");
+    if (!chk_pk) return false;
+
+    uint32_t magic = 0;
+    double cached_dur = 0.0;
+    int has_vid_i = 0;
+    int pk_cnt = 0;
+    if (fread(&magic, sizeof(uint32_t), 1, chk_pk) == 1 && magic == DAW_PK_CACHE_MAGIC &&
+        fread(&cached_dur, sizeof(double), 1, chk_pk) == 1 &&
+        fread(&has_vid_i, sizeof(int), 1, chk_pk) == 1 &&
+        fread(&pk_cnt, sizeof(int), 1, chk_pk) == 1 &&
+        pk_cnt >= 0 && pk_cnt < 25000000 && cached_dur > 0.0) {
+        PeakBin *pk_buf = (pk_cnt > 0) ? (PeakBin *)calloc((size_t)pk_cnt, sizeof(PeakBin)) : NULL;
+        if (pk_cnt == 0 || (pk_buf && (int)fread(pk_buf, sizeof(PeakBin), (size_t)pk_cnt, chk_pk) == pk_cnt)) {
+            fclose(chk_pk);
+            *out_peaks = pk_buf;
+            if (out_peak_count) *out_peak_count = pk_cnt;
+            if (out_duration)   *out_duration   = cached_dur;
+            if (out_has_video)  *out_has_video  = (has_vid_i != 0);
+            return true;
+        }
+        if (pk_buf) free(pk_buf);
+    }
+    fclose(chk_pk);
+    return false;
 }
 
 static inline bool daw_is_pooled_peaks(const PeakBin *peaks) {
@@ -223,17 +328,7 @@ static inline PeakBin* daw_rebuild_peaks_from_raw_file(const char *raw_path, con
 
     double actual_dur = (double)total_frames / (double)SAMPLE_RATE;
     if (pk_cache_path && pk_cache_path[0]) {
-        FILE *f_pk = fopen(pk_cache_path, "wb");
-        if (f_pk) {
-            uint32_t magic = DAW_PK_CACHE_MAGIC;
-            int has_vid_i = has_video ? 1 : 0;
-            fwrite(&magic, sizeof(uint32_t), 1, f_pk);
-            fwrite(&actual_dur, sizeof(double), 1, f_pk);
-            fwrite(&has_vid_i, sizeof(int), 1, f_pk);
-            fwrite(&cur_bin, sizeof(int), 1, f_pk);
-            if (cur_bin > 0) fwrite(peaks, sizeof(PeakBin), (size_t)cur_bin, f_pk);
-            fclose(f_pk);
-        }
+        daw_save_pk_file(pk_cache_path, peaks, cur_bin, actual_dur, has_video);
     }
     peaks = daw_register_shared_peaks(raw_path, peaks, cur_bin, actual_dur, has_video);
     if (out_peak_count) *out_peak_count = cur_bin;
@@ -242,7 +337,7 @@ static inline PeakBin* daw_rebuild_peaks_from_raw_file(const char *raw_path, con
 }
 
 // Hashes canonical <lowercase_filename>_<filesize_bytes> so copying/moving a media clip
-// into <Project>/media/ never creates duplicate .raw/.pk cache files in .cache/!
+// into <Project>/media/ never creates duplicate .raw/.pk cache files!
 static inline unsigned int hash_path(const char *str) {
     if (!str || !str[0]) return 5381U;
     const char *base = strrchr(str, '\\');
@@ -280,15 +375,9 @@ static inline unsigned int hash_path(const char *str) {
     return hash;
 }
 
-// Demuxes and caches raw 48kHz stereo float PCM and shared peaks to .cache/ with minimal RAM overhead.
+// Demuxes and caches raw 48kHz stereo float PCM and shared peaks with minimal RAM overhead.
 static inline int process_media_cache(const char *filepath, AudioItem *item) {
     if (!filepath || !item) return -1;
-
-#ifdef _WIN32
-    CreateDirectoryA(".cache", NULL);
-#else
-    mkdir(".cache", 0777);
-#endif
 
     strncpy(item->file_path, filepath, sizeof(item->file_path) - 1);
     item->file_path[sizeof(item->file_path) - 1] = '\0';
@@ -298,7 +387,12 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
     snprintf(item->label, sizeof(item->label), "%s", name ? name + 1 : filepath);
 
     unsigned int h = hash_path(filepath);
-    snprintf(item->raw_audio_path, sizeof(item->raw_audio_path), ".cache/%u.raw", h);
+    daw_build_raw_cache_path(h, item->raw_audio_path, sizeof(item->raw_audio_path));
+
+    char pk_cache_path[512] = {0};
+    char proj_pk_path[512]  = {0};
+    daw_build_pk_cache_path(h, pk_cache_path, sizeof(pk_cache_path));
+    daw_build_project_pk_path(filepath, proj_pk_path, sizeof(proj_pk_path));
 
     // 1. Check in-RAM shared peak pool first (0 disk I/O, 0 RAM allocation)
     int pooled_cnt = 0;
@@ -320,10 +414,25 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
         }
     }
 
-    char pk_cache_path[512];
-    snprintf(pk_cache_path, sizeof(pk_cache_path), ".cache/%u.pk", h);
+    // 2. Check if .raw and .pk (in <Project>/media/<clip>.pk or engine cache) already exist on disk
     FILE *chk_raw = daw_fopen_LockFreeRead(item->raw_audio_path);
     if (chk_raw) {
+        PeakBin *loaded_pk = NULL;
+        int loaded_cnt = 0;
+        double loaded_dur = 0.0;
+        bool loaded_vid = false;
+        if (daw_load_pk_file(proj_pk_path, &loaded_pk, &loaded_cnt, &loaded_dur, &loaded_vid) ||
+            daw_load_pk_file(pk_cache_path, &loaded_pk, &loaded_cnt, &loaded_dur, &loaded_vid)) {
+            item->has_video = loaded_vid;
+            item->peaks = daw_register_shared_peaks(item->raw_audio_path, loaded_pk, loaded_cnt, loaded_dur, loaded_vid);
+            item->peak_count = loaded_cnt;
+            item->file_total_duration = loaded_dur;
+            item->duration = loaded_dur;
+            item->offset_in_file = 0.0;
+            item->is_selected = false;
+            item->raw_file_handle = chk_raw;
+            return 0;
+        }
         fclose(chk_raw);
         bool has_vid_guess = false;
         const char *ext_c = strrchr(filepath, '.');
@@ -334,6 +443,7 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
         double rb_dur = 0.0;
         PeakBin *rb_pk = daw_rebuild_peaks_from_raw_file(item->raw_audio_path, pk_cache_path, &rb_cnt, &rb_dur, has_vid_guess);
         if (rb_pk && rb_dur > 0.0) {
+            if (proj_pk_path[0]) daw_save_pk_file(proj_pk_path, rb_pk, rb_cnt, rb_dur, has_vid_guess);
             item->has_video = has_vid_guess;
             item->peaks = rb_pk;
             item->peak_count = rb_cnt;
@@ -666,6 +776,13 @@ static inline int process_media_cache(const char *filepath, AudioItem *item) {
     item->duration = actual_dur;
     item->offset_in_file = 0.0;
     item->is_selected = false;
+
+    if (item->peaks && current_bin > 0) {
+        daw_save_pk_file(pk_cache_path, item->peaks, current_bin, actual_dur, item->has_video);
+        if (proj_pk_path[0]) {
+            daw_save_pk_file(proj_pk_path, item->peaks, current_bin, actual_dur, item->has_video);
+        }
+    }
 
     item->raw_file_handle = daw_fopen_LockFreeRead(item->raw_audio_path);
     return 0;
